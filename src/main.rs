@@ -1,29 +1,17 @@
-use std::borrow::Cow;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
-use takumi::{
-    GlobalContext,
-    layout::{
-        Viewport,
-        node::Node,
-        style::{
-            AlignItems, BorderStyle, Color, ColorInput, Display, FlexDirection, FontWeight,
-            JustifyContent, Length::Px, Style, StyleDeclaration,
-        },
-    },
-    rendering::{RenderOptionsBuilder, render},
-};
+use costae::{GlobalContext, Workspace, load_fonts, render_frame};
 use x11rb::{
     connection::Connection,
     protocol::{randr::ConnectionExt as RandrExt, xproto::*},
     rust_connection::RustConnection,
 };
 
-const BAR_WIDTH: u32 = 300;
+const DEFAULT_BAR_WIDTH: u32 = 300;
 
 // --- i3 IPC ---
 
@@ -92,19 +80,19 @@ fn i3_dpi(conn: &RustConnection, root: Window, screen: &Screen) -> f32 {
     96.0
 }
 
-// Apply left gap = BAR_WIDTH physical pixels to the currently focused workspace.
+// Apply left gap equal to bar_width physical pixels to the currently focused workspace.
 // i3 internally calls logical_px(N) = ceil((dpi/96) * N) on every gap value,
-// so we send the inverse: floor(BAR_WIDTH * 96 / dpi).
+// so we send the inverse: floor(bar_width * 96 / dpi).
 // See libi3/dpi.c and src/commands.c in i3 source.
-fn apply_bar_gap(socket: &str, dpi: f32) {
+fn apply_bar_gap(socket: &str, dpi: f32, bar_width: u32) {
     match UnixStream::connect(socket) {
         Err(e) => eprintln!("[costae] gap: failed to connect to i3 socket: {e}"),
         Ok(mut s) => {
             // i3 only scales if dpi/96 >= 1.25 (logical_px threshold)
             let gap = if (dpi / 96.0) < 1.25 {
-                BAR_WIDTH
+                bar_width
             } else {
-                (BAR_WIDTH as f32 * 96.0 / dpi).floor() as u32
+                (bar_width as f32 * 96.0 / dpi).floor() as u32
             };
             let cmd = format!("gaps left current set {}", gap);
             eprintln!("[costae] gap: dpi={dpi:.1} sending '{cmd}'");
@@ -115,12 +103,6 @@ fn apply_bar_gap(socket: &str, dpi: f32) {
             }
         }
     }
-}
-
-#[derive(Clone)]
-struct Workspace {
-    name: String,
-    focused: bool,
 }
 
 fn fetch_workspaces(socket: &str, output: &str) -> std::io::Result<Vec<Workspace>> {
@@ -139,7 +121,7 @@ fn fetch_workspaces(socket: &str, output: &str) -> std::io::Result<Vec<Workspace
 }
 
 // Subscribe to workspace events; apply left gap and send updated lists on each change.
-fn spawn_i3_watcher(socket: String, output: String, dpi: f32, tx: mpsc::Sender<Vec<Workspace>>) {
+fn spawn_i3_watcher(socket: String, output: String, dpi: f32, bar_width: u32, tx: mpsc::Sender<Vec<Workspace>>) {
     thread::spawn(move || {
         let mut sub = match UnixStream::connect(&socket) {
             Ok(s) => s,
@@ -151,7 +133,7 @@ fn spawn_i3_watcher(socket: String, output: String, dpi: f32, tx: mpsc::Sender<V
         // Initial state: apply gap if focus is already on our output, then send list.
         if let Ok(ws) = fetch_workspaces(&socket, &output) {
             if ws.iter().any(|w| w.focused) {
-                apply_bar_gap(&socket, dpi);
+                apply_bar_gap(&socket, dpi, bar_width);
             }
             let _ = tx.send(ws);
         }
@@ -162,7 +144,7 @@ fn spawn_i3_watcher(socket: String, output: String, dpi: f32, tx: mpsc::Sender<V
                     // On focus events, apply gap if the new workspace landed on our output.
                     if let Ok(event) = serde_json::from_slice::<serde_json::Value>(&payload) {
                         if event["current"]["output"].as_str() == Some(output.as_str()) {
-                            apply_bar_gap(&socket, dpi);
+                            apply_bar_gap(&socket, dpi, bar_width);
                         }
                     }
                     if let Ok(ws) = fetch_workspaces(&socket, &output) {
@@ -178,75 +160,22 @@ fn spawn_i3_watcher(socket: String, output: String, dpi: f32, tx: mpsc::Sender<V
     });
 }
 
-// --- Rendering ---
-
-fn build_node(workspaces: &[Workspace], height: u32) -> Node {
-    let items: Vec<Node> = workspaces
-        .iter()
-        .map(|ws| {
-            Node::text(ws.name.clone()).with_style(
-                Style::default()
-                    .with(StyleDeclaration::font_size(Px(16.0).into()))
-                    .with(StyleDeclaration::font_weight(FontWeight::from(
-                        if ws.focused { 700.0 } else { 400.0 },
-                    )))
-                    .with(StyleDeclaration::color(ColorInput::Value(if ws.focused {
-                        Color([203, 166, 247, 255]) // #cba6f7 — active
-                    } else {
-                        Color([166, 173, 200, 255]) // #a6adc8 — inactive
-                    }))),
-            )
-        })
-        .collect();
-
-    Node::container(items).with_style(
-        Style::default()
-            .with(StyleDeclaration::width(Px(BAR_WIDTH as f32)))
-            .with(StyleDeclaration::height(Px(height as f32)))
-            .with(StyleDeclaration::background_color(ColorInput::Value(Color([
-                30, 30, 46, 255, // #1e1e2e
-            ]))))
-            .with(StyleDeclaration::display(Display::Flex))
-            .with(StyleDeclaration::flex_direction(FlexDirection::Column))
-            .with(StyleDeclaration::align_items(AlignItems::Center))
-            .with(StyleDeclaration::justify_content(JustifyContent::FlexStart))
-            .with(StyleDeclaration::row_gap(Px(8.0)))
-            .with(StyleDeclaration::padding_top(Px(16.0)))
-            .with(StyleDeclaration::border_top_width(Px(1.0)))
-            .with(StyleDeclaration::border_right_width(Px(1.0)))
-            .with(StyleDeclaration::border_bottom_width(Px(1.0)))
-            .with(StyleDeclaration::border_left_width(Px(1.0)))
-            .with(StyleDeclaration::border_style(BorderStyle::Solid))
-            .with(StyleDeclaration::border_color(ColorInput::Value(Color([
-                0, 255, 0, 255, // #00ff00
-            ])))),
-    )
-}
-
-fn render_frame(workspaces: &[Workspace], global: &GlobalContext, height: u32) -> Vec<u8> {
-    let node = build_node(workspaces, height);
-    let options = RenderOptionsBuilder::default()
-        .global(global)
-        .viewport(Viewport::new(Some(BAR_WIDTH), Some(height)))
-        .node(node)
-        .build()
-        .expect("build options");
-    let rgba = render(options).expect("render").into_raw();
-    let mut bgrx = Vec::with_capacity(rgba.len());
-    for px in rgba.chunks_exact(4) {
-        bgrx.extend_from_slice(&[px[2], px[1], px[0], 0x00]);
-    }
-    bgrx
-}
-
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config_path = costae::default_config_path();
-    if config_path.exists() {
+    let bar_width = if config_path.exists() {
         match costae::load_config(&config_path) {
-            Ok(cfg) => eprintln!("[costae] config loaded: width={}", cfg.config.width),
-            Err(e) => eprintln!("[costae] config error: {e}"),
+            Ok(cfg) => {
+                eprintln!("[costae] config loaded: width={}", cfg.config.width);
+                cfg.config.width
+            }
+            Err(e) => {
+                eprintln!("[costae] config error: {e}, using default width");
+                DEFAULT_BAR_WIDTH
+            }
         }
-    }
+    } else {
+        DEFAULT_BAR_WIDTH
+    };
 
     // Connect to X11, get primary monitor geometry via RandR
     let (conn, screen_num) = RustConnection::connect(None)?;
@@ -271,7 +200,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         screen.root,
         mon_x,
         mon_y,
-        BAR_WIDTH as u16,
+        bar_width as u16,
         mon_height as u16,
         0,
         WindowClass::INPUT_OUTPUT,
@@ -284,26 +213,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     conn.map_window(win_id)?;
     conn.flush()?;
 
-    // Load Regular + Bold fonts
     let mut global = GlobalContext::default();
-    for path in [
-        "/usr/share/fonts/TTF/JetBrainsMono-Regular.ttf",
-        "/usr/share/fonts/TTF/JetBrainsMono-Bold.ttf",
-    ] {
-        if let Ok(bytes) = std::fs::read(path) {
-            global.font_context.load_and_store(Cow::from(bytes), None, None)?;
-        }
-    }
+    load_fonts(&mut global);
 
     let gc = conn.generate_id()?;
     conn.create_gc(gc, win_id, &CreateGCAux::new())?;
 
     // Start i3 workspace watcher (also manages the left gap)
     let (tx, rx) = mpsc::channel::<Vec<Workspace>>();
-    spawn_i3_watcher(i3_socket_path(), output_name, dpi, tx);
+    spawn_i3_watcher(i3_socket_path(), output_name, dpi, bar_width, tx);
 
     let mut workspaces: Vec<Workspace> = Vec::new();
-    let mut bgrx = render_frame(&workspaces, &global, mon_height);
+    let mut bgrx = render_frame(&workspaces, &global, bar_width, mon_height);
 
     loop {
         // Drain workspace updates; re-render if anything changed
@@ -313,15 +234,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             changed = true;
         }
         if changed {
-            bgrx = render_frame(&workspaces, &global, mon_height);
-            conn.put_image(ImageFormat::Z_PIXMAP, win_id, gc, BAR_WIDTH as u16, mon_height as u16, 0, 0, 0, depth, &bgrx)?;
+            bgrx = render_frame(&workspaces, &global, bar_width, mon_height);
+            conn.put_image(ImageFormat::Z_PIXMAP, win_id, gc, bar_width as u16, mon_height as u16, 0, 0, 0, depth, &bgrx)?;
             conn.flush()?;
         }
 
         // Handle X11 events (non-blocking)
         while let Some(event) = conn.poll_for_event()? {
             if matches!(event, x11rb::protocol::Event::Expose(_)) {
-                conn.put_image(ImageFormat::Z_PIXMAP, win_id, gc, BAR_WIDTH as u16, mon_height as u16, 0, 0, 0, depth, &bgrx)?;
+                conn.put_image(ImageFormat::Z_PIXMAP, win_id, gc, bar_width as u16, mon_height as u16, 0, 0, 0, depth, &bgrx)?;
                 conn.flush()?;
             }
         }
