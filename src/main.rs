@@ -4,7 +4,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
-use costae::{GlobalContext, Workspace, load_fonts, render_frame};
+use costae::{GlobalContext, Workspace, find_modules, load_fonts, render_frame, spawn_module, substitute};
 use x11rb::{
     connection::Connection,
     protocol::{randr::ConnectionExt as RandrExt, xproto::*},
@@ -162,20 +162,39 @@ fn spawn_i3_watcher(socket: String, output: String, dpi: f32, bar_width: u32, tx
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config_path = costae::default_config_path();
-    let bar_width = if config_path.exists() {
+    let (bar_width, raw_layout) = if config_path.exists() {
         match costae::load_config(&config_path) {
             Ok(cfg) => {
                 eprintln!("[costae] config loaded: width={}", cfg.config.width);
-                cfg.config.width
+                (cfg.config.width, Some(cfg.layout))
             }
             Err(e) => {
-                eprintln!("[costae] config error: {e}, using default width");
-                DEFAULT_BAR_WIDTH
+                eprintln!("[costae] config error: {e}, using defaults");
+                (DEFAULT_BAR_WIDTH, None)
             }
         }
     } else {
-        DEFAULT_BAR_WIDTH
+        (DEFAULT_BAR_WIDTH, None)
     };
+
+    // Spawn modules found in the layout tree
+    let mut module_values: std::collections::HashMap<String, serde_json::Value> = std::collections::HashMap::new();
+    let (module_tx, module_rx) = mpsc::channel::<(String, String)>();
+
+    if let Some(ref layout) = raw_layout {
+        for m in find_modules(layout) {
+            let tx = module_tx.clone();
+            let path = m.path.clone();
+            let rx = spawn_module(&m.bin, m.script.as_deref());
+            thread::spawn(move || {
+                while let Ok(line) = rx.recv() {
+                    if tx.send((path.clone(), line)).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    }
 
     // Connect to X11, get primary monitor geometry via RandR
     let (conn, screen_num) = RustConnection::connect(None)?;
@@ -223,18 +242,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (tx, rx) = mpsc::channel::<Vec<Workspace>>();
     spawn_i3_watcher(i3_socket_path(), output_name, dpi, bar_width, tx);
 
+    let resolve_layout = |module_values: &std::collections::HashMap<String, serde_json::Value>| {
+        raw_layout.as_ref().and_then(|layout| {
+            let substituted = substitute(layout, module_values);
+            costae::parse_layout(&substituted)
+                .map_err(|e| eprintln!("[costae] layout parse error: {e}"))
+                .ok()
+        })
+    };
+
     let mut workspaces: Vec<Workspace> = Vec::new();
-    let mut bgrx = render_frame(&workspaces, &global, bar_width, mon_height);
+    let mut bgrx = render_frame(&workspaces, resolve_layout(&module_values), &global, bar_width, mon_height);
 
     loop {
-        // Drain workspace updates; re-render if anything changed
+        // Drain workspace and module updates; re-render if anything changed
         let mut changed = false;
         while let Ok(ws) = rx.try_recv() {
             workspaces = ws;
             changed = true;
         }
+        while let Ok((path, line)) = module_rx.try_recv() {
+            // Parse as JSON if possible, otherwise treat as a plain string
+            let value = serde_json::from_str(&line)
+                .unwrap_or(serde_json::Value::String(line));
+            module_values.insert(path, value);
+            changed = true;
+        }
         if changed {
-            bgrx = render_frame(&workspaces, &global, bar_width, mon_height);
+            bgrx = render_frame(&workspaces, resolve_layout(&module_values), &global, bar_width, mon_height);
             conn.put_image(ImageFormat::Z_PIXMAP, win_id, gc, bar_width as u16, mon_height as u16, 0, 0, 0, depth, &bgrx)?;
             conn.flush()?;
         }
