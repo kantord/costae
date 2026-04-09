@@ -23,6 +23,8 @@ use x11rb::{
     rust_connection::RustConnection,
 };
 
+const BAR_WIDTH: u32 = 300;
+
 // --- i3 IPC ---
 
 const I3_MAGIC: &[u8; 6] = b"i3-ipc";
@@ -54,6 +56,67 @@ fn i3_socket_path() -> String {
     })
 }
 
+// Mirror i3's DPI detection: Xft.dpi from RESOURCE_MANAGER, then physical screen dimensions.
+// See libi3/dpi.c in i3 source.
+fn i3_dpi(conn: &RustConnection, root: Window, screen: &Screen) -> f32 {
+    // Method 1: Xft.dpi from X11 RESOURCE_MANAGER (same priority as i3)
+    let from_xresources = (|| -> Option<f32> {
+        let atom = conn.intern_atom(false, b"RESOURCE_MANAGER").ok()?.reply().ok()?.atom;
+        let prop = conn
+            .get_property(false, root, atom, AtomEnum::ANY, 0, 65536)
+            .ok()?
+            .reply()
+            .ok()?;
+        let data = String::from_utf8_lossy(&prop.value).into_owned();
+        for line in data.lines() {
+            if let Some(val) = line.strip_prefix("Xft.dpi:") {
+                return val.trim().parse::<f32>().ok();
+            }
+        }
+        None
+    })();
+    if let Some(dpi) = from_xresources {
+        eprintln!("[costae] DPI {dpi:.1} (from Xft.dpi)");
+        return dpi;
+    }
+
+    // Method 2: Calculate from screen physical dimensions (same as i3's init_dpi_fallback)
+    if screen.height_in_millimeters > 0 {
+        let dpi = screen.height_in_pixels as f32 * 25.4
+            / screen.height_in_millimeters as f32;
+        eprintln!("[costae] DPI {dpi:.1} (from screen physical dimensions)");
+        return dpi;
+    }
+
+    eprintln!("[costae] DPI 96.0 (fallback)");
+    96.0
+}
+
+// Apply left gap = BAR_WIDTH physical pixels to the currently focused workspace.
+// i3 internally calls logical_px(N) = ceil((dpi/96) * N) on every gap value,
+// so we send the inverse: floor(BAR_WIDTH * 96 / dpi).
+// See libi3/dpi.c and src/commands.c in i3 source.
+fn apply_bar_gap(socket: &str, dpi: f32) {
+    match UnixStream::connect(socket) {
+        Err(e) => eprintln!("[costae] gap: failed to connect to i3 socket: {e}"),
+        Ok(mut s) => {
+            // i3 only scales if dpi/96 >= 1.25 (logical_px threshold)
+            let gap = if (dpi / 96.0) < 1.25 {
+                BAR_WIDTH
+            } else {
+                (BAR_WIDTH as f32 * 96.0 / dpi).floor() as u32
+            };
+            let cmd = format!("gaps left current set {}", gap);
+            eprintln!("[costae] gap: dpi={dpi:.1} sending '{cmd}'");
+            let _ = i3_send(&mut s, 0, cmd.as_bytes()); // RUN_COMMAND = 0
+            match i3_recv(&mut s) {
+                Ok((_, payload)) => eprintln!("[costae] gap: reply {}", String::from_utf8_lossy(&payload)),
+                Err(e) => eprintln!("[costae] gap: recv error: {e}"),
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 struct Workspace {
     name: String,
@@ -75,8 +138,8 @@ fn fetch_workspaces(socket: &str, output: &str) -> std::io::Result<Vec<Workspace
         .collect())
 }
 
-// Subscribe to workspace events; send updated lists on each change.
-fn spawn_i3_watcher(socket: String, output: String, tx: mpsc::Sender<Vec<Workspace>>) {
+// Subscribe to workspace events; apply left gap and send updated lists on each change.
+fn spawn_i3_watcher(socket: String, output: String, dpi: f32, tx: mpsc::Sender<Vec<Workspace>>) {
     thread::spawn(move || {
         let mut sub = match UnixStream::connect(&socket) {
             Ok(s) => s,
@@ -85,14 +148,23 @@ fn spawn_i3_watcher(socket: String, output: String, tx: mpsc::Sender<Vec<Workspa
         let _ = i3_send(&mut sub, 2, b"[\"workspace\"]"); // SUBSCRIBE = 2
         let _ = i3_recv(&mut sub); // consume success reply
 
+        // Initial state: apply gap if focus is already on our output, then send list.
         if let Ok(ws) = fetch_workspaces(&socket, &output) {
+            if ws.iter().any(|w| w.focused) {
+                apply_bar_gap(&socket, dpi);
+            }
             let _ = tx.send(ws);
         }
 
         loop {
             match i3_recv(&mut sub) {
-                Ok((0x80000000, _)) => {
-                    // workspace event — re-fetch full list
+                Ok((0x80000000, payload)) => {
+                    // On focus events, apply gap if the new workspace landed on our output.
+                    if let Ok(event) = serde_json::from_slice::<serde_json::Value>(&payload) {
+                        if event["current"]["output"].as_str() == Some(output.as_str()) {
+                            apply_bar_gap(&socket, dpi);
+                        }
+                    }
                     if let Ok(ws) = fetch_workspaces(&socket, &output) {
                         if tx.send(ws).is_err() {
                             break;
@@ -108,7 +180,7 @@ fn spawn_i3_watcher(socket: String, output: String, tx: mpsc::Sender<Vec<Workspa
 
 // --- Rendering ---
 
-fn build_node(workspaces: &[Workspace], width: u32, height: u32) -> Node {
+fn build_node(workspaces: &[Workspace], height: u32) -> Node {
     let items: Vec<Node> = workspaces
         .iter()
         .map(|ws| {
@@ -129,7 +201,7 @@ fn build_node(workspaces: &[Workspace], width: u32, height: u32) -> Node {
 
     Node::container(items).with_style(
         Style::default()
-            .with(StyleDeclaration::width(Px(width as f32)))
+            .with(StyleDeclaration::width(Px(BAR_WIDTH as f32)))
             .with(StyleDeclaration::height(Px(height as f32)))
             .with(StyleDeclaration::background_color(ColorInput::Value(Color([
                 30, 30, 46, 255, // #1e1e2e
@@ -151,11 +223,11 @@ fn build_node(workspaces: &[Workspace], width: u32, height: u32) -> Node {
     )
 }
 
-fn render_frame(workspaces: &[Workspace], global: &GlobalContext, width: u32, height: u32) -> Vec<u8> {
-    let node = build_node(workspaces, width, height);
+fn render_frame(workspaces: &[Workspace], global: &GlobalContext, height: u32) -> Vec<u8> {
+    let node = build_node(workspaces, height);
     let options = RenderOptionsBuilder::default()
         .global(global)
-        .viewport(Viewport::new(Some(width), Some(height)))
+        .viewport(Viewport::new(Some(BAR_WIDTH), Some(height)))
         .node(node)
         .build()
         .expect("build options");
@@ -173,6 +245,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let screen = &conn.setup().roots[screen_num];
     let depth = screen.root_depth;
 
+    let dpi = i3_dpi(&conn, screen.root, screen);
+
     let primary_output = conn.randr_get_output_primary(screen.root)?.reply()?.output;
     let output_info = conn.randr_get_output_info(primary_output, 0)?.reply()?;
     let output_name = String::from_utf8_lossy(&output_info.name).into_owned();
@@ -180,8 +254,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mon_x = crtc_info.x;
     let mon_y = crtc_info.y;
     let mon_height = crtc_info.height as u32;
-
-    const WIDTH: u32 = 300;
 
     // Create borderless window on the left of the primary monitor
     let win_id = conn.generate_id()?;
@@ -191,7 +263,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         screen.root,
         mon_x,
         mon_y,
-        WIDTH as u16,
+        BAR_WIDTH as u16,
         mon_height as u16,
         0,
         WindowClass::INPUT_OUTPUT,
@@ -218,12 +290,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let gc = conn.generate_id()?;
     conn.create_gc(gc, win_id, &CreateGCAux::new())?;
 
-    // Start i3 workspace watcher
+    // Start i3 workspace watcher (also manages the left gap)
     let (tx, rx) = mpsc::channel::<Vec<Workspace>>();
-    spawn_i3_watcher(i3_socket_path(), output_name, tx);
+    spawn_i3_watcher(i3_socket_path(), output_name, dpi, tx);
 
     let mut workspaces: Vec<Workspace> = Vec::new();
-    let mut bgrx = render_frame(&workspaces, &global, WIDTH, mon_height);
+    let mut bgrx = render_frame(&workspaces, &global, mon_height);
 
     loop {
         // Drain workspace updates; re-render if anything changed
@@ -233,15 +305,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             changed = true;
         }
         if changed {
-            bgrx = render_frame(&workspaces, &global, WIDTH, mon_height);
-            conn.put_image(ImageFormat::Z_PIXMAP, win_id, gc, WIDTH as u16, mon_height as u16, 0, 0, 0, depth, &bgrx)?;
+            bgrx = render_frame(&workspaces, &global, mon_height);
+            conn.put_image(ImageFormat::Z_PIXMAP, win_id, gc, BAR_WIDTH as u16, mon_height as u16, 0, 0, 0, depth, &bgrx)?;
             conn.flush()?;
         }
 
         // Handle X11 events (non-blocking)
         while let Some(event) = conn.poll_for_event()? {
             if matches!(event, x11rb::protocol::Event::Expose(_)) {
-                conn.put_image(ImageFormat::Z_PIXMAP, win_id, gc, WIDTH as u16, mon_height as u16, 0, 0, 0, depth, &bgrx)?;
+                conn.put_image(ImageFormat::Z_PIXMAP, win_id, gc, BAR_WIDTH as u16, mon_height as u16, 0, 0, 0, depth, &bgrx)?;
                 conn.flush()?;
             }
         }
