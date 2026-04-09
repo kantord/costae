@@ -4,7 +4,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
-use costae::{GlobalContext, Workspace, find_modules, load_fonts, parse_layout, render_frame, spawn_module, substitute};
+use costae::{GlobalContext, Workspace, find_modules, load_fonts, parse_layout, preload_layout_images, render_frame, spawn_module, substitute};
 use x11rb::{
     connection::Connection,
     protocol::{randr::ConnectionExt as RandrExt, xproto::*},
@@ -16,7 +16,12 @@ const DEFAULT_BAR_WIDTH: u32 = 300;
 fn resolve_layout(
     raw_layout: &Option<serde_json::Value>,
     module_values: &std::collections::HashMap<String, serde_json::Value>,
+    module_paths: &[String],
 ) -> Option<takumi::layout::node::Node> {
+    // Wait until every module has produced at least one value
+    if !module_paths.iter().all(|p| module_values.contains_key(p)) {
+        return None;
+    }
     raw_layout.as_ref().and_then(|layout| {
         let substituted = substitute(layout, module_values);
         parse_layout(&substituted)
@@ -214,13 +219,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut module_values: std::collections::HashMap<String, serde_json::Value> = std::collections::HashMap::new();
     let (module_tx, module_rx) = mpsc::channel::<(String, String)>();
     let mut module_children: Vec<std::process::Child> = Vec::new();
+    let mut module_paths: Vec<String> = Vec::new();
 
     let spawn_all_modules = |layout: &serde_json::Value,
                               tx: &mpsc::Sender<(String, String)>,
-                              children: &mut Vec<std::process::Child>| {
+                              children: &mut Vec<std::process::Child>,
+                              paths: &mut Vec<String>| {
+        paths.clear();
         for m in find_modules(layout) {
             let tx = tx.clone();
             let path = m.path.clone();
+            paths.push(path.clone());
             let (rx, child) = spawn_module(&m.bin, m.script.as_deref());
             children.push(child);
             thread::spawn(move || {
@@ -234,7 +243,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     if let Some(ref layout) = raw_layout {
-        spawn_all_modules(layout, &module_tx, &mut module_children);
+        spawn_all_modules(layout, &module_tx, &mut module_children, &mut module_paths);
     }
 
     // Connect to X11, get primary monitor geometry via RandR
@@ -275,6 +284,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut global = GlobalContext::default();
     load_fonts(&mut global);
+    if let Some(ref layout) = raw_layout {
+        preload_layout_images(layout, &global);
+    }
 
     let gc = conn.generate_id()?;
     conn.create_gc(gc, win_id, &CreateGCAux::new())?;
@@ -285,7 +297,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 
     let mut workspaces: Vec<Workspace> = Vec::new();
-    let mut bgrx = render_frame(&workspaces, resolve_layout(&raw_layout, &module_values), &global, bar_width, mon_height);
+    let mut bgrx = render_frame(&workspaces, resolve_layout(&raw_layout, &module_values, &module_paths), &global, bar_width, mon_height);
 
     loop {
         // Drain workspace and module updates; re-render if anything changed
@@ -303,7 +315,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 raw_layout = Some(cfg.layout);
             }
             if let Some(ref layout) = raw_layout {
-                spawn_all_modules(layout, &module_tx, &mut module_children);
+                preload_layout_images(layout, &global);
+                spawn_all_modules(layout, &module_tx, &mut module_children, &mut module_paths);
             }
             eprintln!("[costae] config reloaded");
             changed = true;
@@ -320,7 +333,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             changed = true;
         }
         if changed {
-            bgrx = render_frame(&workspaces, resolve_layout(&raw_layout, &module_values), &global, bar_width, mon_height);
+            bgrx = render_frame(&workspaces, resolve_layout(&raw_layout, &module_values, &module_paths), &global, bar_width, mon_height);
             conn.put_image(ImageFormat::Z_PIXMAP, win_id, gc, bar_width as u16, mon_height as u16, 0, 0, 0, depth, &bgrx)?;
             conn.flush()?;
         }

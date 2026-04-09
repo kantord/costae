@@ -246,6 +246,49 @@ pub fn spawn_module(bin: &str, script: Option<&str>) -> (mpsc::Receiver<String>,
     (rx, child)
 }
 
+pub fn preload_layout_images(layout: &serde_json::Value, global: &GlobalContext) {
+    fn walk(value: &serde_json::Value, srcs: &mut Vec<String>) {
+        match value {
+            serde_json::Value::Object(map) => {
+                if map.get("type").and_then(|t| t.as_str()) == Some("image") {
+                    if let Some(src) = map.get("src").and_then(|s| s.as_str()) {
+                        srcs.push(src.to_string());
+                    }
+                    return; // image nodes are terminal
+                }
+                for v in map.values() {
+                    walk(v, srcs);
+                }
+            }
+            serde_json::Value::Array(arr) => {
+                for v in arr {
+                    walk(v, srcs);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut srcs = Vec::new();
+    walk(layout, &mut srcs);
+
+    for src in srcs {
+        if src.starts_with("http://") || src.starts_with("https://") || src.starts_with("data:") {
+            continue;
+        }
+        if let Ok(bytes) = std::fs::read(&src) {
+            if let Ok(decoded) = takumi::image::load_from_memory(&bytes) {
+                global.persistent_image_store.insert(
+                    src,
+                    std::sync::Arc::new(takumi::resources::image::ImageSource::Bitmap(
+                        decoded.to_rgba8(),
+                    )),
+                );
+            }
+        }
+    }
+}
+
 pub fn load_fonts(global: &mut GlobalContext) {
     for path in [
         "/usr/share/fonts/TTF/JetBrainsMono-Regular.ttf",
