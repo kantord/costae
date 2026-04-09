@@ -1,0 +1,9 @@
+[package]
+name = "costae"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+takumi = "0.73"
+x11rb = { version = "0.13", features = ["allow-unsafe-code", "randr"] }
+serde_json = "1"
