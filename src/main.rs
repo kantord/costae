@@ -240,6 +240,14 @@ fn render_frame(workspaces: &[Workspace], global: &GlobalContext, height: u32) -
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let config_path = costae::default_config_path();
+    if config_path.exists() {
+        match costae::load_config(&config_path) {
+            Ok(cfg) => eprintln!("[costae] config loaded: width={}", cfg.config.width),
+            Err(e) => eprintln!("[costae] config error: {e}"),
+        }
+    }
+
     // Connect to X11, get primary monitor geometry via RandR
     let (conn, screen_num) = RustConnection::connect(None)?;
     let screen = &conn.setup().roots[screen_num];
