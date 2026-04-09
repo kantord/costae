@@ -60,13 +60,14 @@ struct Workspace {
     focused: bool,
 }
 
-fn fetch_workspaces(socket: &str) -> std::io::Result<Vec<Workspace>> {
+fn fetch_workspaces(socket: &str, output: &str) -> std::io::Result<Vec<Workspace>> {
     let mut s = UnixStream::connect(socket)?;
     i3_send(&mut s, 1, b"")?; // GET_WORKSPACES = 1
     let (_, payload) = i3_recv(&mut s)?;
     let arr: Vec<serde_json::Value> = serde_json::from_slice(&payload).unwrap_or_default();
     Ok(arr
         .iter()
+        .filter(|w| w["output"].as_str().unwrap_or("") == output)
         .map(|w| Workspace {
             name: w["name"].as_str().unwrap_or("?").to_string(),
             focused: w["focused"].as_bool().unwrap_or(false),
@@ -75,7 +76,7 @@ fn fetch_workspaces(socket: &str) -> std::io::Result<Vec<Workspace>> {
 }
 
 // Subscribe to workspace events; send updated lists on each change.
-fn spawn_i3_watcher(socket: String, tx: mpsc::Sender<Vec<Workspace>>) {
+fn spawn_i3_watcher(socket: String, output: String, tx: mpsc::Sender<Vec<Workspace>>) {
     thread::spawn(move || {
         let mut sub = match UnixStream::connect(&socket) {
             Ok(s) => s,
@@ -84,7 +85,7 @@ fn spawn_i3_watcher(socket: String, tx: mpsc::Sender<Vec<Workspace>>) {
         let _ = i3_send(&mut sub, 2, b"[\"workspace\"]"); // SUBSCRIBE = 2
         let _ = i3_recv(&mut sub); // consume success reply
 
-        if let Ok(ws) = fetch_workspaces(&socket) {
+        if let Ok(ws) = fetch_workspaces(&socket, &output) {
             let _ = tx.send(ws);
         }
 
@@ -92,7 +93,7 @@ fn spawn_i3_watcher(socket: String, tx: mpsc::Sender<Vec<Workspace>>) {
             match i3_recv(&mut sub) {
                 Ok((0x80000000, _)) => {
                     // workspace event — re-fetch full list
-                    if let Ok(ws) = fetch_workspaces(&socket) {
+                    if let Ok(ws) = fetch_workspaces(&socket, &output) {
                         if tx.send(ws).is_err() {
                             break;
                         }
@@ -174,6 +175,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let primary_output = conn.randr_get_output_primary(screen.root)?.reply()?.output;
     let output_info = conn.randr_get_output_info(primary_output, 0)?.reply()?;
+    let output_name = String::from_utf8_lossy(&output_info.name).into_owned();
     let crtc_info = conn.randr_get_crtc_info(output_info.crtc, 0)?.reply()?;
     let mon_x = crtc_info.x;
     let mon_y = crtc_info.y;
@@ -218,7 +220,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Start i3 workspace watcher
     let (tx, rx) = mpsc::channel::<Vec<Workspace>>();
-    spawn_i3_watcher(i3_socket_path(), tx);
+    spawn_i3_watcher(i3_socket_path(), output_name, tx);
 
     let mut workspaces: Vec<Workspace> = Vec::new();
     let mut bgrx = render_frame(&workspaces, &global, WIDTH, mon_height);
