@@ -203,41 +203,32 @@ pub fn render_frame(workspaces: &[Workspace], layout: Option<Node>, global: &Glo
     bgrx
 }
 
-pub fn spawn_module(bin: &str, script: Option<&str>) -> mpsc::Receiver<String> {
+pub fn spawn_module(bin: &str, script: Option<&str>) -> (mpsc::Receiver<String>, std::process::Child) {
     let (tx, rx) = mpsc::channel();
-    let bin = bin.to_string();
-    let script = script.map(str::to_string);
+    let mut cmd = std::process::Command::new(bin);
 
+    // If a script is provided, write it to a memfd and pass the path as argument
+    let _memfd_file = if let Some(content) = script {
+        let fd = unsafe {
+            libc::memfd_create(b"costae-script\0".as_ptr() as *const libc::c_char, 0)
+        };
+        let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+        let _ = file.write_all(content.as_bytes());
+        let _ = file.seek(SeekFrom::Start(0));
+        cmd.arg(format!("/proc/self/fd/{}", fd));
+        Some(file) // keep alive until after spawn so fd is inherited
+    } else {
+        None
+    };
+
+    let mut child = cmd
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to spawn module");
+    // _memfd_file can now be dropped — child has inherited the fd
+
+    let stdout = child.stdout.take().expect("no stdout");
     thread::spawn(move || {
-        let mut cmd = std::process::Command::new(&bin);
-
-        // If a script is provided, write it to a memfd and pass the path as argument
-        let _memfd_file = if let Some(ref content) = script {
-            let fd = unsafe {
-                libc::memfd_create(b"costae-script\0".as_ptr() as *const libc::c_char, 0)
-            };
-            if fd < 0 {
-                return;
-            }
-            let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
-            let _ = file.write_all(content.as_bytes());
-            let _ = file.seek(SeekFrom::Start(0));
-            cmd.arg(format!("/proc/self/fd/{}", fd));
-            Some(file) // keep alive until after spawn so fd is inherited
-        } else {
-            None
-        };
-
-        let mut child = match cmd.stdout(std::process::Stdio::piped()).spawn() {
-            Ok(c) => c,
-            Err(_) => return,
-        };
-        // _memfd_file can now be dropped — child has inherited the fd
-
-        let stdout = match child.stdout.take() {
-            Some(s) => s,
-            None => return,
-        };
         let reader = std::io::BufReader::new(stdout);
         use std::io::BufRead;
         for line in reader.lines() {
@@ -252,7 +243,7 @@ pub fn spawn_module(bin: &str, script: Option<&str>) -> mpsc::Receiver<String> {
         }
     });
 
-    rx
+    (rx, child)
 }
 
 pub fn load_fonts(global: &mut GlobalContext) {

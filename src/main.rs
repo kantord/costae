@@ -4,7 +4,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
-use costae::{GlobalContext, Workspace, find_modules, load_fonts, render_frame, spawn_module, substitute};
+use costae::{GlobalContext, Workspace, find_modules, load_fonts, parse_layout, render_frame, spawn_module, substitute};
 use x11rb::{
     connection::Connection,
     protocol::{randr::ConnectionExt as RandrExt, xproto::*},
@@ -12,6 +12,18 @@ use x11rb::{
 };
 
 const DEFAULT_BAR_WIDTH: u32 = 300;
+
+fn resolve_layout(
+    raw_layout: &Option<serde_json::Value>,
+    module_values: &std::collections::HashMap<String, serde_json::Value>,
+) -> Option<takumi::layout::node::Node> {
+    raw_layout.as_ref().and_then(|layout| {
+        let substituted = substitute(layout, module_values);
+        parse_layout(&substituted)
+            .map_err(|e| eprintln!("[costae] layout parse error: {e}"))
+            .ok()
+    })
+}
 
 // --- i3 IPC ---
 
@@ -162,7 +174,7 @@ fn spawn_i3_watcher(socket: String, output: String, dpi: f32, bar_width: u32, tx
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config_path = costae::default_config_path();
-    let (bar_width, raw_layout) = if config_path.exists() {
+    let (bar_width, mut raw_layout) = if config_path.exists() {
         match costae::load_config(&config_path) {
             Ok(cfg) => {
                 eprintln!("[costae] config loaded: width={}", cfg.config.width);
@@ -177,15 +189,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         (DEFAULT_BAR_WIDTH, None)
     };
 
+    // Watch config file for changes
+    let (reload_tx, reload_rx) = mpsc::channel::<()>();
+    {
+        let path = config_path.clone();
+        thread::spawn(move || {
+            let mut last_modified = std::fs::metadata(&path)
+                .and_then(|m| m.modified())
+                .ok();
+            loop {
+                thread::sleep(Duration::from_millis(500));
+                let modified = std::fs::metadata(&path)
+                    .and_then(|m| m.modified())
+                    .ok();
+                if modified != last_modified {
+                    last_modified = modified;
+                    let _ = reload_tx.send(());
+                }
+            }
+        });
+    }
+
     // Spawn modules found in the layout tree
     let mut module_values: std::collections::HashMap<String, serde_json::Value> = std::collections::HashMap::new();
     let (module_tx, module_rx) = mpsc::channel::<(String, String)>();
+    let mut module_children: Vec<std::process::Child> = Vec::new();
 
-    if let Some(ref layout) = raw_layout {
+    let spawn_all_modules = |layout: &serde_json::Value,
+                              tx: &mpsc::Sender<(String, String)>,
+                              children: &mut Vec<std::process::Child>| {
         for m in find_modules(layout) {
-            let tx = module_tx.clone();
+            let tx = tx.clone();
             let path = m.path.clone();
-            let rx = spawn_module(&m.bin, m.script.as_deref());
+            let (rx, child) = spawn_module(&m.bin, m.script.as_deref());
+            children.push(child);
             thread::spawn(move || {
                 while let Ok(line) = rx.recv() {
                     if tx.send((path.clone(), line)).is_err() {
@@ -194,6 +231,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             });
         }
+    };
+
+    if let Some(ref layout) = raw_layout {
+        spawn_all_modules(layout, &module_tx, &mut module_children);
     }
 
     // Connect to X11, get primary monitor geometry via RandR
@@ -242,21 +283,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (tx, rx) = mpsc::channel::<Vec<Workspace>>();
     spawn_i3_watcher(i3_socket_path(), output_name, dpi, bar_width, tx);
 
-    let resolve_layout = |module_values: &std::collections::HashMap<String, serde_json::Value>| {
-        raw_layout.as_ref().and_then(|layout| {
-            let substituted = substitute(layout, module_values);
-            costae::parse_layout(&substituted)
-                .map_err(|e| eprintln!("[costae] layout parse error: {e}"))
-                .ok()
-        })
-    };
 
     let mut workspaces: Vec<Workspace> = Vec::new();
-    let mut bgrx = render_frame(&workspaces, resolve_layout(&module_values), &global, bar_width, mon_height);
+    let mut bgrx = render_frame(&workspaces, resolve_layout(&raw_layout, &module_values), &global, bar_width, mon_height);
 
     loop {
         // Drain workspace and module updates; re-render if anything changed
         let mut changed = false;
+
+        // Handle config reload
+        if reload_rx.try_recv().is_ok() {
+            for child in &mut module_children {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            module_children.clear();
+            module_values.clear();
+            if let Ok(cfg) = costae::load_config(&config_path) {
+                raw_layout = Some(cfg.layout);
+            }
+            if let Some(ref layout) = raw_layout {
+                spawn_all_modules(layout, &module_tx, &mut module_children);
+            }
+            eprintln!("[costae] config reloaded");
+            changed = true;
+        }
         while let Ok(ws) = rx.try_recv() {
             workspaces = ws;
             changed = true;
@@ -269,7 +320,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             changed = true;
         }
         if changed {
-            bgrx = render_frame(&workspaces, resolve_layout(&module_values), &global, bar_width, mon_height);
+            bgrx = render_frame(&workspaces, resolve_layout(&raw_layout, &module_values), &global, bar_width, mon_height);
             conn.put_image(ImageFormat::Z_PIXMAP, win_id, gc, bar_width as u16, mon_height as u16, 0, 0, 0, depth, &bgrx)?;
             conn.flush()?;
         }
