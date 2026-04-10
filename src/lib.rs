@@ -8,14 +8,7 @@ use std::thread;
 use serde::Deserialize;
 pub use takumi::GlobalContext;
 use takumi::{
-    layout::{
-        Viewport,
-        node::Node,
-        style::{
-            BorderStyle, Color, ColorInput, Display, FlexDirection,
-            Length::Px, Style, StyleDeclaration,
-        },
-    },
+    layout::{Viewport, node::Node},
     rendering::{RenderOptionsBuilder, render},
 };
 
@@ -124,31 +117,8 @@ pub fn parse_layout(value: &serde_json::Value) -> Result<Node, serde_json::Error
     serde_json::from_value(value.clone())
 }
 
-pub fn build_node(layout: Option<Node>, width: u32, height: u32) -> Node {
-    let children: Vec<Node> = layout.into_iter().collect();
-
-    Node::container(children).with_style(
-        Style::default()
-            .with(StyleDeclaration::width(Px(width as f32)))
-            .with(StyleDeclaration::height(Px(height as f32)))
-            .with(StyleDeclaration::background_color(ColorInput::Value(Color([
-                30, 30, 46, 255,
-            ]))))
-            .with(StyleDeclaration::display(Display::Flex))
-            .with(StyleDeclaration::flex_direction(FlexDirection::Column))
-            .with(StyleDeclaration::border_top_width(Px(1.0)))
-            .with(StyleDeclaration::border_right_width(Px(1.0)))
-            .with(StyleDeclaration::border_bottom_width(Px(1.0)))
-            .with(StyleDeclaration::border_left_width(Px(1.0)))
-            .with(StyleDeclaration::border_style(BorderStyle::Solid))
-            .with(StyleDeclaration::border_color(ColorInput::Value(Color([
-                0, 255, 0, 255,
-            ])))),
-    )
-}
-
 pub fn render_frame(layout: Option<Node>, global: &GlobalContext, width: u32, height: u32) -> Vec<u8> {
-    let node = build_node(layout, width, height);
+    let node = layout.unwrap_or_else(|| Node::container(vec![]));
     let options = RenderOptionsBuilder::default()
         .global(global)
         .viewport(Viewport::new(Some(width), Some(height)))
