@@ -1,5 +1,7 @@
 use std::io::{BufRead, Read, Write};
 use std::os::unix::net::UnixStream;
+use std::sync::mpsc;
+use std::thread;
 
 // --- i3 IPC ---
 
@@ -46,6 +48,15 @@ fn apply_bar_gap(socket: &str, dpi: f32, bar_width: u32) {
     }
 }
 
+fn switch_workspace(socket: &str, name: &str) {
+    if let Ok(mut s) = UnixStream::connect(socket) {
+        let escaped = name.replace('"', "\\\"");
+        let cmd = format!("workspace \"{}\"", escaped);
+        let _ = i3_send(&mut s, 0, cmd.as_bytes());
+        let _ = i3_recv(&mut s);
+    }
+}
+
 // --- Workspace types ---
 
 pub struct Workspace {
@@ -79,7 +90,12 @@ pub fn build_workspace_node(workspaces: &[Workspace]) -> serde_json::Value {
             } else {
                 "text-[16px] text-[#a6adc8] text-center w-full"
             };
-            serde_json::json!({"type": "text", "tw": tw, "text": ws.name})
+            serde_json::json!({
+                "type": "text",
+                "tw": tw,
+                "text": ws.name,
+                "on_click": {"workspace": ws.name}
+            })
         })
         .collect();
 
@@ -110,25 +126,58 @@ pub fn parse_init_event(json: &str) -> Option<InitEvent> {
     })
 }
 
+/// Returns the workspace name from a click event, or None if not a workspace click.
+pub fn parse_click_event(val: &serde_json::Value) -> Option<String> {
+    if val["event"].as_str() != Some("click") {
+        return None;
+    }
+    val["data"]["workspace"].as_str().map(str::to_string)
+}
+
+// --- Unified event ---
+
+enum ModuleEvent {
+    I3(u32, Vec<u8>),
+    Stdin(serde_json::Value),
+}
+
 // --- Main ---
 
 fn main() {
-    let stdin = std::io::stdin();
-    let mut lines = stdin.lock().lines();
-
-    // Block until we receive the init event
-    let init = loop {
-        match lines.next() {
-            Some(Ok(line)) => {
-                if let Some(ev) = parse_init_event(&line) {
-                    break ev;
+    // Read init event then release the stdin lock before spawning threads
+    let init = {
+        let stdin = std::io::stdin();
+        let mut lines = stdin.lock().lines();
+        loop {
+            match lines.next() {
+                Some(Ok(line)) => {
+                    if let Some(ev) = parse_init_event(&line) {
+                        break ev;
+                    }
                 }
+                _ => return,
             }
-            _ => return,
         }
     };
 
     let socket = i3_socket_path();
+    let (event_tx, event_rx) = mpsc::channel::<ModuleEvent>();
+
+    // Thread: forward stdin lines as Stdin events
+    {
+        let event_tx = event_tx.clone();
+        thread::spawn(move || {
+            let stdin = std::io::stdin();
+            let mut lines = stdin.lock().lines();
+            while let Some(Ok(line)) = lines.next() {
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
+                    if event_tx.send(ModuleEvent::Stdin(val)).is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+    }
 
     // Emit initial workspace state
     if let Ok(ws) = fetch_workspaces(&socket, &init.output) {
@@ -138,19 +187,36 @@ fn main() {
         println!("{}", build_workspace_node(&ws));
     }
 
-    // Subscribe to workspace events
-    let mut sub = match UnixStream::connect(&socket) {
-        Ok(s) => s,
-        Err(_) => return,
-    };
-    let _ = i3_send(&mut sub, 2, b"[\"workspace\"]");
-    let _ = i3_recv(&mut sub);
+    // Thread: subscribe to i3 workspace events and forward as I3 events
+    {
+        let event_tx = event_tx.clone();
+        let socket_clone = socket.clone();
+        thread::spawn(move || {
+            let mut sub = match UnixStream::connect(&socket_clone) {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            let _ = i3_send(&mut sub, 2, b"[\"workspace\"]");
+            let _ = i3_recv(&mut sub);
+            loop {
+                match i3_recv(&mut sub) {
+                    Ok((typ, payload)) => {
+                        if event_tx.send(ModuleEvent::I3(typ, payload)).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+    }
 
-    loop {
-        match i3_recv(&mut sub) {
-            Ok((0x80000000, payload)) => {
-                if let Ok(event) = serde_json::from_slice::<serde_json::Value>(&payload) {
-                    if event["current"]["output"].as_str() == Some(init.output.as_str()) {
+    // Main event loop
+    while let Ok(event) = event_rx.recv() {
+        match event {
+            ModuleEvent::I3(0x80000000, payload) => {
+                if let Ok(ev) = serde_json::from_slice::<serde_json::Value>(&payload) {
+                    if ev["current"]["output"].as_str() == Some(init.output.as_str()) {
                         apply_bar_gap(&socket, init.dpi, init.bar_width);
                     }
                 }
@@ -158,8 +224,12 @@ fn main() {
                     println!("{}", build_workspace_node(&ws));
                 }
             }
-            Ok(_) => {}
-            Err(_) => break,
+            ModuleEvent::I3(_, _) => {}
+            ModuleEvent::Stdin(val) => {
+                if let Some(name) = parse_click_event(&val) {
+                    switch_workspace(&socket, &name);
+                }
+            }
         }
     }
 }
@@ -215,6 +285,18 @@ mod tests {
     }
 
     #[test]
+    fn build_workspace_node_each_child_has_on_click_with_workspace_name() {
+        let ws = vec![
+            Workspace { name: "1: web".into(), focused: false },
+            Workspace { name: "2: term".into(), focused: true },
+        ];
+        let node = build_workspace_node(&ws);
+        let children = node["children"].as_array().unwrap();
+        assert_eq!(children[0]["on_click"]["workspace"], "1: web");
+        assert_eq!(children[1]["on_click"]["workspace"], "2: term");
+    }
+
+    #[test]
     fn parse_init_event_extracts_output_and_config() {
         let json = r#"{"type":"init","output":"DP-1","config":{"width":200},"dpi":96.0}"#;
         let ev = parse_init_event(json).unwrap();
@@ -239,5 +321,23 @@ mod tests {
     #[test]
     fn parse_init_event_returns_none_for_invalid_json() {
         assert!(parse_init_event("not json").is_none());
+    }
+
+    #[test]
+    fn parse_click_event_extracts_workspace_name() {
+        let json = serde_json::json!({"event": "click", "data": {"workspace": "1: web"}});
+        assert_eq!(parse_click_event(&json).as_deref(), Some("1: web"));
+    }
+
+    #[test]
+    fn parse_click_event_returns_none_for_non_click_event() {
+        let json = serde_json::json!({"event": "hover", "data": {"workspace": "1: web"}});
+        assert!(parse_click_event(&json).is_none());
+    }
+
+    #[test]
+    fn parse_click_event_returns_none_when_no_workspace_data() {
+        let json = serde_json::json!({"event": "click", "data": {}});
+        assert!(parse_click_event(&json).is_none());
     }
 }

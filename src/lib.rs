@@ -7,6 +7,7 @@ use std::thread;
 
 use serde::Deserialize;
 pub use takumi::GlobalContext;
+pub use takumi::rendering::MeasuredNode;
 use takumi::{
     layout::{Viewport, node::Node},
     rendering::{RenderOptionsBuilder, render},
@@ -115,6 +116,51 @@ fn substitute_inner(
 
 pub fn parse_layout(value: &serde_json::Value) -> Result<Node, serde_json::Error> {
     serde_json::from_value(value.clone())
+}
+
+/// Walk the MeasuredNode and JSON trees in lockstep to find the deepest node
+/// under (click_x, click_y) that carries an `on_click` field.
+/// Returns (json_path, on_click_value) on hit, None otherwise.
+/// Transforms are relative to parent, so we accumulate them as we descend.
+pub fn hit_test(
+    measured: &MeasuredNode,
+    json: &serde_json::Value,
+    click_x: f32,
+    click_y: f32,
+) -> Option<(String, serde_json::Value)> {
+    hit_test_inner(measured, json, click_x, click_y, 0.0, 0.0, "")
+}
+
+fn hit_test_inner(
+    measured: &MeasuredNode,
+    json: &serde_json::Value,
+    click_x: f32,
+    click_y: f32,
+    parent_x: f32,
+    parent_y: f32,
+    path: &str,
+) -> Option<(String, serde_json::Value)> {
+    let node_x = parent_x + measured.transform[4];
+    let node_y = parent_y + measured.transform[5];
+
+    if click_x < node_x || click_x > node_x + measured.width
+        || click_y < node_y || click_y > node_y + measured.height
+    {
+        return None;
+    }
+
+    // Prefer deepest child hit first
+    if let Some(children_json) = json.get("children").and_then(|c| c.as_array()) {
+        for (i, (child_m, child_j)) in measured.children.iter().zip(children_json).enumerate() {
+            let child_path = format!("{}/children/{}", path, i);
+            if let Some(result) = hit_test_inner(child_m, child_j, click_x, click_y, node_x, node_y, &child_path) {
+                return Some(result);
+            }
+        }
+    }
+
+    // This node is the deepest hit — return it if it has on_click
+    json.get("on_click").map(|v| (path.to_string(), v.clone()))
 }
 
 pub fn render_frame(layout: Option<Node>, global: &GlobalContext, width: u32, height: u32) -> Vec<u8> {
