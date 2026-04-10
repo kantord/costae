@@ -2,7 +2,7 @@ use costae::{GlobalContext, preload_layout_images};
 
 fn write_temp_png() -> std::path::PathBuf {
     let path = std::env::temp_dir().join("costae_test_1x1.png");
-    let img = takumi::image::RgbaImage::from_pixel(1, 1, takumi::image::Rgba([255, 0, 0, 255]));
+    let img = image::RgbaImage::from_pixel(1, 1, image::Rgba([255, 0, 0, 255]));
     img.save(&path).unwrap();
     path
 }

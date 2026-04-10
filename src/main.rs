@@ -6,7 +6,7 @@ use std::time::Duration;
 use std::sync::Arc;
 
 use costae::{GlobalContext, RenderCache, find_modules, hit_test, load_fonts, parse_layout, preload_layout_images, render_frame, spawn_module, substitute, update_module_value};
-use takumi::{layout::Viewport, rendering::{RenderOptionsBuilder, measure_layout}};
+use takumi::{layout::Viewport, rendering::{RenderOptions, measure_layout}};
 use x11rb::{
     connection::Connection,
     protocol::{randr::ConnectionExt as RandrExt, xproto::*},
@@ -81,12 +81,11 @@ fn do_hit_test(
     };
     let substituted = substitute(layout_json, module_values);
 
-    let options = RenderOptionsBuilder::default()
+    let options = RenderOptions::builder()
         .global(global)
-        .viewport(Viewport::new(Some(bar_width), Some(mon_height)))
+        .viewport(Viewport::new((Some(bar_width), Some(mon_height))))
         .node(node)
-        .build()
-        .expect("build options");
+        .build();
     let measured = match measure_layout(options) {
         Ok(m) => m,
         Err(_) => return,

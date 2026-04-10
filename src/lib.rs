@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 use std::io::{Seek, SeekFrom, Write as IoWrite};
 use std::num::NonZeroUsize;
 use std::os::unix::io::FromRawFd;
@@ -23,11 +22,14 @@ impl RenderCache {
     where
         F: FnOnce() -> Vec<u8>,
     {
+        let t = std::time::Instant::now();
         let canonical = json_canon::to_string(key).unwrap_or_default();
         if let Some(cached) = self.cache.get(&canonical) {
+            eprintln!("[costae] render cache HIT  — {}µs ({} bytes)", t.elapsed().as_micros(), cached.len());
             return Arc::clone(cached);
         }
         let result = Arc::new(render());
+        eprintln!("[costae] render cache MISS — {}ms ({} bytes)", t.elapsed().as_millis(), result.len());
         self.cache.put(canonical, Arc::clone(&result));
         result
     }
@@ -38,7 +40,8 @@ pub use takumi::GlobalContext;
 pub use takumi::rendering::MeasuredNode;
 use takumi::{
     layout::{Viewport, node::Node},
-    rendering::{RenderOptionsBuilder, render},
+    rendering::{RenderOptions, render},
+    resources::{font::FontResource, image::ImageSource},
 };
 
 #[derive(Debug, Deserialize, PartialEq)]
@@ -260,12 +263,11 @@ pub fn update_module_value(
 
 pub fn render_frame(layout: Option<Node>, global: &GlobalContext, width: u32, height: u32) -> Vec<u8> {
     let node = layout.unwrap_or_else(|| Node::container(vec![]));
-    let options = RenderOptionsBuilder::default()
+    let options = RenderOptions::builder()
         .global(global)
-        .viewport(Viewport::new(Some(width), Some(height)))
+        .viewport(Viewport::new((Some(width), Some(height))))
         .node(node)
-        .build()
-        .expect("build options");
+        .build();
     let rgba = render(options).expect("render").into_raw();
     let mut bgrx = Vec::with_capacity(rgba.len());
     for px in rgba.chunks_exact(4) {
@@ -371,13 +373,8 @@ pub fn preload_layout_images(layout: &serde_json::Value, global: &GlobalContext)
             continue;
         }
         if let Ok(bytes) = std::fs::read(&src) {
-            if let Ok(decoded) = takumi::image::load_from_memory(&bytes) {
-                global.persistent_image_store.insert(
-                    src,
-                    std::sync::Arc::new(takumi::resources::image::ImageSource::Bitmap(
-                        decoded.to_rgba8(),
-                    )),
-                );
+            if let Ok(image) = ImageSource::from_bytes(&bytes) {
+                global.persistent_image_store.insert(src, image);
             }
         }
     }
@@ -389,7 +386,7 @@ pub fn load_fonts(global: &mut GlobalContext) {
         "/usr/share/fonts/TTF/JetBrainsMono-Bold.ttf",
     ] {
         if let Ok(bytes) = std::fs::read(path) {
-            let _ = global.font_context.load_and_store(Cow::from(bytes), None, None);
+            let _ = global.font_context.load_and_store(FontResource::new(bytes));
         }
     }
 }
