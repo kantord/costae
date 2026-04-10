@@ -5,12 +5,13 @@ use std::time::Duration;
 
 use std::sync::Arc;
 
-use costae::{GlobalContext, RenderCache, find_modules, hit_test, load_fonts, parse_layout, preload_layout_images, render_frame, spawn_module, substitute, update_module_value};
+use costae::{GlobalContext, RenderCache, find_modules, hit_test, inject_root_bg, load_fonts, parse_layout, preload_layout_images, render_frame, solid_color_rgba, spawn_module, substitute, update_module_value, x11_bgrx_to_rgba};
 use takumi::{layout::Viewport, rendering::{RenderOptions, measure_layout}};
 use x11rb::{
     connection::Connection,
     protocol::{randr::ConnectionExt as RandrExt, xproto::*},
     rust_connection::RustConnection,
+    wrapper::ConnectionExt as _,
 };
 
 const DEFAULT_BAR_WIDTH: u32 = 300;
@@ -29,6 +30,76 @@ fn resolve_layout(
             .map_err(|e| eprintln!("[costae] layout parse error: {e}"))
             .ok()
     })
+}
+
+fn sample_and_inject_root_bg(
+    conn: &RustConnection,
+    root: Window,
+    global: &GlobalContext,
+    mon_x: i16,
+    mon_y: i16,
+    width: u32,
+    height: u32,
+    xrootpmap_atom: Option<u32>,
+) {
+    let t = std::time::Instant::now();
+
+    // Tier 1: _XROOTPMAP_ID pixmap (set by feh/nitrogen for wallpapers).
+    // GetImage on a *pixmap* is immune to window stacking — it always returns
+    // the actual stored pixels regardless of what windows are on screen.
+    if let Some(atom) = xrootpmap_atom {
+        let pixmap = conn
+            .get_property(false, root, atom, AtomEnum::ANY, 0, 1).ok()
+            .and_then(|c| c.reply().ok())
+            .filter(|p| p.value.len() >= 4)
+            .and_then(|p| p.value[..4].try_into().ok().map(u32::from_ne_bytes));
+        if let Some(pixmap_id) = pixmap {
+            if let Some(img) = conn.get_image(ImageFormat::Z_PIXMAP, pixmap_id, mon_x, mon_y, width as u16, height as u16, !0)
+                .ok().and_then(|c| c.reply().ok())
+            {
+                let rgba = x11_bgrx_to_rgba(&img.data);
+                inject_root_bg(global, rgba, width, height);
+                eprintln!("[costae] root bg from _XROOTPMAP_ID pixmap in {}ms", t.elapsed().as_millis());
+                return;
+            }
+        }
+    }
+
+    // Tier 2: sample 1 pixel from just outside the bar area (one pixel to the right).
+    // This position is never covered by windows placed in the bar's own column, so for
+    // solid-color backgrounds (the common case when _XROOTPMAP_ID is absent) we get the
+    // correct color. We then fill the entire bar area with that single color via
+    // solid_color_rgba, which is far cheaper than a full GetImage on the bar region.
+    if let Some(img) = conn.get_image(
+        ImageFormat::Z_PIXMAP, root,
+        mon_x + width as i16, mon_y,
+        1, 1, !0,
+    ).ok().and_then(|c| c.reply().ok()) {
+        if img.data.len() >= 4 {
+            // BGRX: data[0]=B, data[1]=G, data[2]=R, data[3]=X
+            let pixel = ((img.data[2] as u32) << 16)
+                | ((img.data[1] as u32) << 8)
+                | (img.data[0] as u32);
+            let rgba = solid_color_rgba(pixel, width, height);
+            inject_root_bg(global, rgba, width, height);
+            eprintln!("[costae] root bg from adjacent pixel ({:#06x}) in {}ms", pixel, t.elapsed().as_millis());
+            return;
+        }
+    }
+
+    // Tier 3: GetImage on root window — last resort. Returns visible screen content,
+    // so it may capture overlying windows rather than the true background.
+    match conn.get_image(ImageFormat::Z_PIXMAP, root, mon_x, mon_y, width as u16, height as u16, !0) {
+        Err(e) => eprintln!("[costae] root bg send error: {e:?}"),
+        Ok(cookie) => match cookie.reply() {
+            Err(e) => eprintln!("[costae] root bg reply error: {e:?}"),
+            Ok(img) => {
+                let rgba = x11_bgrx_to_rgba(&img.data);
+                inject_root_bg(global, rgba, width, height);
+                eprintln!("[costae] root bg from root window (fallback) in {}ms", t.elapsed().as_millis());
+            }
+        }
+    }
 }
 
 fn i3_dpi(conn: &RustConnection, root: Window, screen: &Screen) -> f32 {
@@ -66,8 +137,9 @@ fn do_hit_test(
     module_paths: &[String],
     module_event_txs: &HashMap<String, mpsc::Sender<serde_json::Value>>,
     global: &GlobalContext,
-    bar_width: u32,
+    phys_bar_width: u32,
     mon_height: u32,
+    dpr: f32,
     click_x: f32,
     click_y: f32,
 ) {
@@ -83,7 +155,7 @@ fn do_hit_test(
 
     let options = RenderOptions::builder()
         .global(global)
-        .viewport(Viewport::new((Some(bar_width), Some(mon_height))))
+        .viewport(Viewport::new((Some(phys_bar_width), Some(mon_height))).with_device_pixel_ratio(dpr))
         .node(node)
         .build();
     let measured = match measure_layout(options) {
@@ -201,7 +273,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let crtc_info = conn.randr_get_crtc_info(output_info.crtc, 0)?.reply()?;
     let mon_x = crtc_info.x;
     let mon_y = crtc_info.y;
+    // mon_height is physical pixels (from CRTC); bar_width is logical pixels (from config).
+    // We match i3's scaling: dpr = dpi/96, so config px values have the same meaning as in i3.
     let mon_height = crtc_info.height as u32;
+    // Scale bar_width (logical CSS px from config) to physical pixels, matching i3's DPI scaling.
+    let dpr = dpi / 96.0;
+    let phys_bar_width = (bar_width as f32 * dpr).round() as u32;
 
     let win_id = conn.generate_id()?;
     conn.create_window(
@@ -210,7 +287,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         screen.root,
         mon_x,
         mon_y,
-        bar_width as u16,
+        phys_bar_width as u16,
         mon_height as u16,
         0,
         WindowClass::INPUT_OUTPUT,
@@ -220,22 +297,52 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .override_redirect(1)
             .event_mask(EventMask::EXPOSURE | EventMask::BUTTON_PRESS),
     )?;
-    conn.map_window(win_id)?;
-    conn.configure_window(win_id, &ConfigureWindowAux::new().stack_mode(StackMode::BELOW))?;
-    conn.flush()?;
-
     let mut global = GlobalContext::default();
     load_fonts(&mut global);
     if let Some(ref layout) = raw_layout {
         preload_layout_images(layout, &global);
     }
 
+    // Watch for wallpaper changes: wallpaper setters (feh, nitrogen, etc.) signal a new
+    // wallpaper by updating the _XROOTPMAP_ID property on the root window.
+    conn.change_window_attributes(
+        screen.root,
+        &ChangeWindowAttributesAux::new().event_mask(EventMask::PROPERTY_CHANGE),
+    )?;
+    // Cache the atom ID so PropertyNotify events can be matched cheaply in the event loop.
+    let xrootpmap_atom: Option<u32> = conn
+        .intern_atom(false, b"_XROOTPMAP_ID").ok()
+        .and_then(|c| c.reply().ok())
+        .map(|r| r.atom);
+
+    // Sample before mapping — X11 does not maintain a backing store for root window pixels
+    // once a window covers them (no compositor). Reading after map_window returns black.
+    eprintln!("[costae] sampling root bg at ({mon_x},{mon_y}) size {phys_bar_width}×{mon_height}");
+    sample_and_inject_root_bg(&conn, screen.root, &global, mon_x, mon_y, phys_bar_width, mon_height, xrootpmap_atom);
+
+    conn.map_window(win_id)?;
+    conn.configure_window(win_id, &ConfigureWindowAux::new().stack_mode(StackMode::BELOW))?;
+
+    // Tell i3 (and any EWMH-compliant WM) that we occupy the left edge of the monitor.
+    // This prevents tiling windows from appearing under the bar and may suppress the
+    // focused-workspace indicator border that otherwise shows at x=bar_width.
+    {
+        let strut_atom = conn.intern_atom(false, b"_NET_WM_STRUT_PARTIAL")?.reply()?.atom;
+        let strut_vals = costae::strut_partial_values(mon_x, mon_y, bar_width, mon_height);
+        conn.change_property32(PropMode::REPLACE, win_id, strut_atom, AtomEnum::CARDINAL, &strut_vals)?;
+        // Legacy _NET_WM_STRUT (first 4 values) for older WMs
+        let strut_legacy_atom = conn.intern_atom(false, b"_NET_WM_STRUT")?.reply()?.atom;
+        conn.change_property32(PropMode::REPLACE, win_id, strut_legacy_atom, AtomEnum::CARDINAL, &strut_vals[..4])?;
+    }
+
+    conn.flush()?;
+
     let gc = conn.generate_id()?;
     conn.create_gc(gc, win_id, &CreateGCAux::new())?;
 
     let init_event = serde_json::json!({
         "type": "init",
-        "config": {"width": bar_width},
+        "config": {"width": phys_bar_width},
         "output": output_name,
         "dpi": dpi
     });
@@ -276,7 +383,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut render_cache = RenderCache::new(30);
     let mut bgrx: Arc<Vec<u8>> = render_cache.get_or_render(
         &serde_json::to_value(&module_values).unwrap_or_default(),
-        || render_frame(resolve_layout(&raw_layout, &module_values, &module_paths), &global, bar_width, mon_height),
+        || render_frame(resolve_layout(&raw_layout, &module_values, &module_paths), &global, phys_bar_width, mon_height, dpr),
     );
 
     loop {
@@ -303,6 +410,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         if reload_rx.try_recv().is_ok() {
+            if let Ok(cfg) = costae::load_config(&config_path) {
+                if cfg.config.width != bar_width {
+                    // Bar width changed — the X11 window must be recreated at the new physical
+                    // size, so re-exec the process (same mechanism as binary hot-reload).
+                    eprintln!("[costae] bar width changed, restarting...");
+                    for child in &mut module_children {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                    }
+                    use std::os::unix::process::CommandExt;
+                    let _ = std::process::Command::new(&exe_path).exec();
+                    // exec failed — fall through to in-place reload
+                }
+                raw_layout = Some(cfg.layout);
+            }
             for child in &mut module_children {
                 let _ = child.kill();
                 let _ = child.wait();
@@ -311,9 +433,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             module_event_txs.clear();
             module_values.clear();
             render_cache = RenderCache::new(30);
-            if let Ok(cfg) = costae::load_config(&config_path) {
-                raw_layout = Some(cfg.layout);
-            }
             if let Some(ref layout) = raw_layout {
                 preload_layout_images(layout, &global);
                 spawn_all_modules(layout, &module_tx, &wake_tx, &init_event, &mut module_children, &mut module_event_txs, &mut module_paths);
@@ -330,30 +449,54 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        if changed {
-            let key = serde_json::to_value(&module_values).unwrap_or_default();
-            bgrx = render_cache.get_or_render(&key, || {
-                render_frame(resolve_layout(&raw_layout, &module_values, &module_paths), &global, bar_width, mon_height)
-            });
-            conn.put_image(ImageFormat::Z_PIXMAP, win_id, gc, bar_width as u16, mon_height as u16, 0, 0, 0, depth, &bgrx[..])?;
-            conn.flush()?;
-        }
-
+        // Process X11 events before rendering so PropertyNotify-triggered resamples
+        // are included in the same render pass.
         while let Some(event) = conn.poll_for_event()? {
             match event {
                 x11rb::protocol::Event::Expose(_) => {
-                    conn.put_image(ImageFormat::Z_PIXMAP, win_id, gc, bar_width as u16, mon_height as u16, 0, 0, 0, depth, &bgrx[..])?;
+                    conn.put_image(ImageFormat::Z_PIXMAP, win_id, gc, phys_bar_width as u16, mon_height as u16, 0, 0, 0, depth, &bgrx[..])?;
                     conn.flush()?;
                 }
                 x11rb::protocol::Event::ButtonPress(e) => {
                     do_hit_test(
                         &raw_layout, &module_values, &module_paths, &module_event_txs,
-                        &global, bar_width, mon_height,
+                        &global, phys_bar_width, mon_height, dpr,
                         e.event_x as f32, e.event_y as f32,
                     );
                 }
+                x11rb::protocol::Event::PropertyNotify(e) => {
+                    // Wallpaper changed — read from _XROOTPMAP_ID pixmap directly,
+                    // which feh/nitrogen set and which is independent of our window being on top.
+                    if xrootpmap_atom == Some(e.atom) {
+                        if let Some(atom) = xrootpmap_atom {
+                            let pixmap = conn
+                                .get_property(false, screen.root, atom, AtomEnum::ANY, 0, 1).ok()
+                                .and_then(|c| c.reply().ok())
+                                .filter(|p| p.value.len() >= 4)
+                                .and_then(|p| p.value[..4].try_into().ok().map(u32::from_ne_bytes));
+                            if let Some(pixmap_id) = pixmap {
+                                if let Some(img) = conn.get_image(ImageFormat::Z_PIXMAP, pixmap_id, mon_x, mon_y, bar_width as u16, mon_height as u16, !0).ok().and_then(|c| c.reply().ok()) {
+                                    let rgba = x11_bgrx_to_rgba(&img.data);
+                                    inject_root_bg(&global, rgba, bar_width, mon_height);
+                                    render_cache = RenderCache::new(30);
+                                    changed = true;
+                                    eprintln!("[costae] root bg updated from wallpaper change");
+                                }
+                            }
+                        }
+                    }
+                }
                 _ => {}
             }
+        }
+
+        if changed {
+            let key = serde_json::to_value(&module_values).unwrap_or_default();
+            bgrx = render_cache.get_or_render(&key, || {
+                render_frame(resolve_layout(&raw_layout, &module_values, &module_paths), &global, phys_bar_width, mon_height, dpr)
+            });
+            conn.put_image(ImageFormat::Z_PIXMAP, win_id, gc, phys_bar_width as u16, mon_height as u16, 0, 0, 0, depth, &bgrx[..])?;
+            conn.flush()?;
         }
 
         let _ = wake_rx.recv_timeout(Duration::from_millis(50));

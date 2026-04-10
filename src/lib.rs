@@ -7,6 +7,14 @@ use std::thread;
 
 use lru::LruCache;
 
+/// LRU cache of rendered frames keyed on the canonical JSON of `module_values`.
+///
+/// Canonical JSON (RFC 8785 via `json_canon`) normalises object key order so that
+/// `{"a":1,"b":2}` and `{"b":2,"a":1}` resolve to the same cache entry.
+///
+/// Frames are stored as `Arc<Vec<u8>>` so the caller can hold onto the current
+/// frame across loop iterations even after it has been evicted from the cache
+/// (e.g. the bar needs to repaint on Expose while the cache has already moved on).
 pub struct RenderCache {
     cache: LruCache<String, Arc<Vec<u8>>>,
 }
@@ -37,6 +45,36 @@ impl RenderCache {
 
 use serde::Deserialize;
 pub use takumi::GlobalContext;
+
+/// Convert X11 ZPixmap BGRX bytes (4 bytes per pixel, X padding ignored) to RGBA
+/// with alpha=255 (wallpaper is always fully opaque).
+pub fn x11_bgrx_to_rgba(bgrx: &[u8]) -> Vec<u8> {
+    let mut rgba = Vec::with_capacity(bgrx.len());
+    for px in bgrx.chunks_exact(4) {
+        rgba.push(px[2]); // R
+        rgba.push(px[1]); // G
+        rgba.push(px[0]); // B
+        rgba.push(0xFF);  // A
+    }
+    rgba
+}
+
+/// Store a raw RGBA wallpaper slice (already cropped to bar dimensions) in the
+/// persistent image store under the key `"root-bg"` so layout nodes can
+/// reference it via `backgroundImage: "url(root-bg)"` in the config.
+///
+/// Because takumi sees this as real pixel content behind elements in the render
+/// tree, CSS `backdrop-filter: blur()` on cards will correctly blur the wallpaper
+/// — the same effect that a compositor would produce, but in pure software.
+pub fn inject_root_bg(global: &GlobalContext, rgba: Vec<u8>, width: u32, height: u32) {
+    use tiny_skia::{IntSize, Pixmap};
+    use takumi::resources::image::ImageSource;
+    if let Some(size) = IntSize::from_wh(width, height) {
+        if let Some(pixmap) = Pixmap::from_vec(rgba, size) {
+            global.persistent_image_store.insert("root-bg".to_string(), ImageSource::from(pixmap));
+        }
+    }
+}
 pub use takumi::rendering::MeasuredNode;
 use takumi::{
     layout::{Viewport, node::Node},
@@ -261,11 +299,17 @@ pub fn update_module_value(
     true
 }
 
-pub fn render_frame(layout: Option<Node>, global: &GlobalContext, width: u32, height: u32) -> Vec<u8> {
+/// Render `layout` into a BGRX framebuffer.
+///
+/// `width` and `height` are **physical** pixels — the X11 window dimensions.
+/// `dpr = dpi / 96.0` scales CSS `px` units so that `1px` in the config equals
+/// one logical pixel regardless of display density, matching i3's own scaling.
+/// The returned buffer is always `width × height × 4` bytes (BGRX).
+pub fn render_frame(layout: Option<Node>, global: &GlobalContext, width: u32, height: u32, dpr: f32) -> Vec<u8> {
     let node = layout.unwrap_or_else(|| Node::container(vec![]));
     let options = RenderOptions::builder()
         .global(global)
-        .viewport(Viewport::new((Some(width), Some(height))))
+        .viewport(Viewport::new((Some(width), Some(height))).with_device_pixel_ratio(dpr))
         .node(node)
         .build();
     let rgba = render(options).expect("render").into_raw();
@@ -378,6 +422,34 @@ pub fn preload_layout_images(layout: &serde_json::Value, global: &GlobalContext)
             }
         }
     }
+}
+
+/// Compute `_NET_WM_STRUT_PARTIAL` values for a left-side bar.
+///
+/// The 12-element array follows the EWMH spec: left, right, top, bottom,
+/// then four pairs of start/end coordinates for each edge strut.
+/// We only populate the left strut; everything else is zero.
+pub fn strut_partial_values(mon_x: i16, mon_y: i16, bar_width: u32, mon_height: u32) -> [u32; 12] {
+    let mut v = [0u32; 12];
+    v[0] = mon_x as u32 + bar_width; // left: absolute pixels from screen left edge
+    v[4] = mon_y as u32;             // left_start_y
+    v[5] = mon_y as u32 + mon_height.saturating_sub(1); // left_end_y
+    v
+}
+
+/// Convert an X11 TrueColor pixel value (0x00RRGGBB for standard 24bpp visuals)
+/// to a flat RGBA buffer of `width × height` pixels, all the same solid color.
+/// Used as a fallback when no wallpaper pixmap is set (e.g. i3 solid background).
+pub fn solid_color_rgba(pixel: u32, width: u32, height: u32) -> Vec<u8> {
+    let r = ((pixel >> 16) & 0xFF) as u8;
+    let g = ((pixel >> 8) & 0xFF) as u8;
+    let b = (pixel & 0xFF) as u8;
+    let count = (width * height) as usize;
+    let mut rgba = Vec::with_capacity(count * 4);
+    for _ in 0..count {
+        rgba.extend_from_slice(&[r, g, b, 0xFF]);
+    }
+    rgba
 }
 
 pub fn load_fonts(global: &mut GlobalContext) {

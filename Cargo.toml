@@ -23,6 +23,7 @@ serde_yaml = "0.9"
 libc = "0.2"
 lru = "0.12"
 json-canon = "0.1"
+tiny-skia = "0.12"
 
 [dev-dependencies]
 image = "0.25"
