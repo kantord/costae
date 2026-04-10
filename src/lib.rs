@@ -1,22 +1,47 @@
-use std::borrow::Cow;
 use std::io::{Seek, SeekFrom, Write as IoWrite};
+use std::num::NonZeroUsize;
 use std::os::unix::io::FromRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 use std::thread;
+
+use lru::LruCache;
+
+pub struct RenderCache {
+    cache: LruCache<String, Arc<Vec<u8>>>,
+}
+
+impl RenderCache {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            cache: LruCache::new(NonZeroUsize::new(capacity).unwrap()),
+        }
+    }
+
+    pub fn get_or_render<F>(&mut self, key: &serde_json::Value, render: F) -> Arc<Vec<u8>>
+    where
+        F: FnOnce() -> Vec<u8>,
+    {
+        let t = std::time::Instant::now();
+        let canonical = json_canon::to_string(key).unwrap_or_default();
+        if let Some(cached) = self.cache.get(&canonical) {
+            eprintln!("[costae] render cache HIT  — {}µs ({} bytes)", t.elapsed().as_micros(), cached.len());
+            return Arc::clone(cached);
+        }
+        let result = Arc::new(render());
+        eprintln!("[costae] render cache MISS — {}ms ({} bytes)", t.elapsed().as_millis(), result.len());
+        self.cache.put(canonical, Arc::clone(&result));
+        result
+    }
+}
 
 use serde::Deserialize;
 pub use takumi::GlobalContext;
+pub use takumi::rendering::MeasuredNode;
 use takumi::{
-    layout::{
-        Viewport,
-        node::Node,
-        style::{
-            AlignItems, BorderStyle, Color, ColorInput, Display, FlexDirection, FontWeight,
-            JustifyContent, Length::Px, Style, StyleDeclaration,
-        },
-    },
-    rendering::{RenderOptionsBuilder, render},
+    layout::{Viewport, node::Node},
+    rendering::{RenderOptions, render},
+    resources::{font::FontResource, image::ImageSource},
 };
 
 #[derive(Debug, Deserialize, PartialEq)]
@@ -124,77 +149,125 @@ pub fn parse_layout(value: &serde_json::Value) -> Result<Node, serde_json::Error
     serde_json::from_value(value.clone())
 }
 
-#[derive(Clone)]
-pub struct Workspace {
-    pub name: String,
-    pub focused: bool,
+/// Returns true if the focused workspace on the given output has any fullscreen window.
+/// `tree` is the JSON from an i3 GET_TREE (type 4) response.
+///
+/// The real i3 tree nests workspaces inside a content container:
+///   root → output → content_container → workspace → windows
+/// We follow the `focus` array at each level until we reach a workspace node.
+pub fn has_fullscreen_on_output(tree: &serde_json::Value, output_name: &str) -> bool {
+    let outputs = match tree["nodes"].as_array() {
+        Some(a) => a,
+        None => return false,
+    };
+    for output in outputs {
+        if output["name"].as_str() != Some(output_name) {
+            continue;
+        }
+        return focused_workspace_has_fullscreen(output);
+    }
+    false
 }
 
-fn build_workspace_section(workspaces: &[Workspace], width: u32) -> Node {
-    let items: Vec<Node> = workspaces
-        .iter()
-        .map(|ws| {
-            Node::text(ws.name.clone()).with_style(
-                Style::default()
-                    .with(StyleDeclaration::font_size(Px(16.0).into()))
-                    .with(StyleDeclaration::font_weight(FontWeight::from(
-                        if ws.focused { 700.0 } else { 400.0 },
-                    )))
-                    .with(StyleDeclaration::color(ColorInput::Value(if ws.focused {
-                        Color([203, 166, 247, 255])
-                    } else {
-                        Color([166, 173, 200, 255])
-                    }))),
-            )
-        })
-        .collect();
-
-    Node::container(items).with_style(
-        Style::default()
-            .with(StyleDeclaration::width(Px(width as f32)))
-            .with(StyleDeclaration::display(Display::Flex))
-            .with(StyleDeclaration::flex_direction(FlexDirection::Column))
-            .with(StyleDeclaration::align_items(AlignItems::Center))
-            .with(StyleDeclaration::justify_content(JustifyContent::FlexStart))
-            .with(StyleDeclaration::row_gap(Px(8.0)))
-            .with(StyleDeclaration::padding_top(Px(16.0))),
-    )
+/// Follow the focus chain from `container` down to the focused workspace,
+/// then check if that workspace has any fullscreen window.
+fn focused_workspace_has_fullscreen(container: &serde_json::Value) -> bool {
+    if container["type"].as_str() == Some("workspace") {
+        return node_has_fullscreen(container);
+    }
+    let focused_id = container["focus"].as_array()
+        .and_then(|f| f.first())
+        .and_then(|id| id.as_u64());
+    if let (Some(fid), Some(nodes)) = (focused_id, container["nodes"].as_array()) {
+        for child in nodes {
+            if child["id"].as_u64() == Some(fid) {
+                return focused_workspace_has_fullscreen(child);
+            }
+        }
+    }
+    false
 }
 
-pub fn build_node(workspaces: &[Workspace], layout: Option<Node>, width: u32, height: u32) -> Node {
-    let mut children = vec![build_workspace_section(workspaces, width)];
-    if let Some(node) = layout {
-        children.push(node);
+fn node_has_fullscreen(node: &serde_json::Value) -> bool {
+    if node["fullscreen_mode"].as_u64().unwrap_or(0) > 0 {
+        return true;
+    }
+    for key in &["nodes", "floating_nodes"] {
+        if let Some(children) = node[key].as_array() {
+            if children.iter().any(node_has_fullscreen) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Walk the MeasuredNode and JSON trees in lockstep to find the deepest node
+/// under (click_x, click_y) that carries an `on_click` field.
+/// Returns (json_path, on_click_value) on hit, None otherwise.
+/// Transforms are relative to parent, so we accumulate them as we descend.
+pub fn hit_test(
+    measured: &MeasuredNode,
+    json: &serde_json::Value,
+    click_x: f32,
+    click_y: f32,
+) -> Option<(String, serde_json::Value)> {
+    hit_test_inner(measured, json, click_x, click_y, "")
+}
+
+fn hit_test_inner(
+    measured: &MeasuredNode,
+    json: &serde_json::Value,
+    click_x: f32,
+    click_y: f32,
+    path: &str,
+) -> Option<(String, serde_json::Value)> {
+    // Takumi stores absolute screen coordinates in transform[4/5]
+    let node_x = measured.transform[4];
+    let node_y = measured.transform[5];
+
+    if click_x < node_x || click_x > node_x + measured.width
+        || click_y < node_y || click_y > node_y + measured.height
+    {
+        return None;
     }
 
-    Node::container(children).with_style(
-        Style::default()
-            .with(StyleDeclaration::width(Px(width as f32)))
-            .with(StyleDeclaration::height(Px(height as f32)))
-            .with(StyleDeclaration::background_color(ColorInput::Value(Color([
-                30, 30, 46, 255,
-            ]))))
-            .with(StyleDeclaration::display(Display::Flex))
-            .with(StyleDeclaration::flex_direction(FlexDirection::Column))
-            .with(StyleDeclaration::border_top_width(Px(1.0)))
-            .with(StyleDeclaration::border_right_width(Px(1.0)))
-            .with(StyleDeclaration::border_bottom_width(Px(1.0)))
-            .with(StyleDeclaration::border_left_width(Px(1.0)))
-            .with(StyleDeclaration::border_style(BorderStyle::Solid))
-            .with(StyleDeclaration::border_color(ColorInput::Value(Color([
-                0, 255, 0, 255,
-            ])))),
-    )
+    // Prefer deepest child hit first
+    if let Some(children_json) = json.get("children").and_then(|c| c.as_array()) {
+        for (i, (child_m, child_j)) in measured.children.iter().zip(children_json).enumerate() {
+            let child_path = format!("{}/children/{}", path, i);
+            if let Some(result) = hit_test_inner(child_m, child_j, click_x, click_y, &child_path) {
+                return Some(result);
+            }
+        }
+    }
+
+    // This node is the deepest hit — return it if it has on_click
+    json.get("on_click").map(|v| (path.to_string(), v.clone()))
 }
 
-pub fn render_frame(workspaces: &[Workspace], layout: Option<Node>, global: &GlobalContext, width: u32, height: u32) -> Vec<u8> {
-    let node = build_node(workspaces, layout, width, height);
-    let options = RenderOptionsBuilder::default()
+/// Insert `new_value` at `path` in `values`. Returns `true` if the value actually changed
+/// (i.e. was absent or different), `false` if it was already identical. Use this to avoid
+/// unnecessary re-renders when a module emits the same output repeatedly.
+pub fn update_module_value(
+    values: &mut std::collections::HashMap<String, serde_json::Value>,
+    path: String,
+    new_value: serde_json::Value,
+) -> bool {
+    if values.get(&path) == Some(&new_value) {
+        return false;
+    }
+    values.insert(path, new_value);
+    true
+}
+
+pub fn render_frame(layout: Option<Node>, global: &GlobalContext, width: u32, height: u32) -> Vec<u8> {
+    let node = layout.unwrap_or_else(|| Node::container(vec![]));
+    let options = RenderOptions::builder()
         .global(global)
-        .viewport(Viewport::new(Some(width), Some(height)))
+        .viewport(Viewport::new((Some(width), Some(height))))
         .node(node)
-        .build()
-        .expect("build options");
+        .build();
     let rgba = render(options).expect("render").into_raw();
     let mut bgrx = Vec::with_capacity(rgba.len());
     for px in rgba.chunks_exact(4) {
@@ -203,7 +276,19 @@ pub fn render_frame(workspaces: &[Workspace], layout: Option<Node>, global: &Glo
     bgrx
 }
 
-pub fn spawn_module(bin: &str, script: Option<&str>) -> (mpsc::Receiver<String>, std::process::Child) {
+pub struct SpawnedModule {
+    pub rx: mpsc::Receiver<String>,
+    pub child: std::process::Child,
+    pub event_tx: mpsc::Sender<serde_json::Value>,
+}
+
+impl SpawnedModule {
+    pub fn send_event(&self, event: &serde_json::Value) {
+        let _ = self.event_tx.send(event.clone());
+    }
+}
+
+pub fn spawn_module(bin: &str, script: Option<&str>) -> SpawnedModule {
     let (tx, rx) = mpsc::channel();
     let mut cmd = std::process::Command::new(bin);
 
@@ -222,6 +307,7 @@ pub fn spawn_module(bin: &str, script: Option<&str>) -> (mpsc::Receiver<String>,
     };
 
     let mut child = cmd
+        .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .spawn()
         .expect("failed to spawn module");
@@ -243,7 +329,17 @@ pub fn spawn_module(bin: &str, script: Option<&str>) -> (mpsc::Receiver<String>,
         }
     });
 
-    (rx, child)
+    let mut stdin = child.stdin.take().expect("no stdin");
+    let (event_tx, event_rx) = mpsc::channel::<serde_json::Value>();
+    thread::spawn(move || {
+        while let Ok(event) = event_rx.recv() {
+            if writeln!(stdin, "{}", event).is_err() {
+                break;
+            }
+        }
+    });
+
+    SpawnedModule { rx, child, event_tx }
 }
 
 pub fn preload_layout_images(layout: &serde_json::Value, global: &GlobalContext) {
@@ -277,13 +373,8 @@ pub fn preload_layout_images(layout: &serde_json::Value, global: &GlobalContext)
             continue;
         }
         if let Ok(bytes) = std::fs::read(&src) {
-            if let Ok(decoded) = takumi::image::load_from_memory(&bytes) {
-                global.persistent_image_store.insert(
-                    src,
-                    std::sync::Arc::new(takumi::resources::image::ImageSource::Bitmap(
-                        decoded.to_rgba8(),
-                    )),
-                );
+            if let Ok(image) = ImageSource::from_bytes(&bytes) {
+                global.persistent_image_store.insert(src, image);
             }
         }
     }
@@ -295,7 +386,7 @@ pub fn load_fonts(global: &mut GlobalContext) {
         "/usr/share/fonts/TTF/JetBrainsMono-Bold.ttf",
     ] {
         if let Ok(bytes) = std::fs::read(path) {
-            let _ = global.font_context.load_and_store(Cow::from(bytes), None, None);
+            let _ = global.font_context.load_and_store(FontResource::new(bytes));
         }
     }
 }
