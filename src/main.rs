@@ -138,7 +138,7 @@ fn fetch_workspaces(socket: &str, output: &str) -> std::io::Result<Vec<Workspace
 }
 
 // Subscribe to workspace events; apply left gap and send updated lists on each change.
-fn spawn_i3_watcher(socket: String, output: String, dpi: f32, bar_width: u32, tx: mpsc::Sender<Vec<Workspace>>) {
+fn spawn_i3_watcher(socket: String, output: String, dpi: f32, bar_width: u32, tx: mpsc::Sender<Vec<Workspace>>, wake_tx: mpsc::SyncSender<()>) {
     thread::spawn(move || {
         let mut sub = match UnixStream::connect(&socket) {
             Ok(s) => s,
@@ -153,6 +153,7 @@ fn spawn_i3_watcher(socket: String, output: String, dpi: f32, bar_width: u32, tx
                 apply_bar_gap(&socket, dpi, bar_width);
             }
             let _ = tx.send(ws);
+            let _ = wake_tx.try_send(());
         }
 
         loop {
@@ -168,6 +169,7 @@ fn spawn_i3_watcher(socket: String, output: String, dpi: f32, bar_width: u32, tx
                         if tx.send(ws).is_err() {
                             break;
                         }
+                        let _ = wake_tx.try_send(());
                     }
                 }
                 Ok(_) => {}
@@ -194,10 +196,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         (DEFAULT_BAR_WIDTH, None)
     };
 
+    // Wake channel: any update source sends () here so the main loop unblocks immediately.
+    let (wake_tx, wake_rx) = mpsc::sync_channel::<()>(1);
+
     // Watch config file for changes
     let (reload_tx, reload_rx) = mpsc::channel::<()>();
     {
         let path = config_path.clone();
+        let wake_tx = wake_tx.clone();
         thread::spawn(move || {
             let mut last_modified = std::fs::metadata(&path)
                 .and_then(|m| m.modified())
@@ -210,6 +216,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if modified != last_modified {
                     last_modified = modified;
                     let _ = reload_tx.send(());
+                    let _ = wake_tx.try_send(());
                 }
             }
         });
@@ -223,11 +230,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let spawn_all_modules = |layout: &serde_json::Value,
                               tx: &mpsc::Sender<(String, String)>,
+                              wake_tx: &mpsc::SyncSender<()>,
                               children: &mut Vec<std::process::Child>,
                               paths: &mut Vec<String>| {
         paths.clear();
         for m in find_modules(layout) {
             let tx = tx.clone();
+            let wake_tx = wake_tx.clone();
             let path = m.path.clone();
             paths.push(path.clone());
             let (rx, child) = spawn_module(&m.bin, m.script.as_deref());
@@ -237,13 +246,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if tx.send((path.clone(), line)).is_err() {
                         break;
                     }
+                    let _ = wake_tx.try_send(());
                 }
             });
         }
     };
 
     if let Some(ref layout) = raw_layout {
-        spawn_all_modules(layout, &module_tx, &mut module_children, &mut module_paths);
+        spawn_all_modules(layout, &module_tx, &wake_tx, &mut module_children, &mut module_paths);
     }
 
     // Connect to X11, get primary monitor geometry via RandR
@@ -293,7 +303,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Start i3 workspace watcher (also manages the left gap)
     let (tx, rx) = mpsc::channel::<Vec<Workspace>>();
-    spawn_i3_watcher(i3_socket_path(), output_name, dpi, bar_width, tx);
+    spawn_i3_watcher(i3_socket_path(), output_name, dpi, bar_width, tx, wake_tx.clone());
 
 
     let mut workspaces: Vec<Workspace> = Vec::new();
@@ -316,7 +326,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             if let Some(ref layout) = raw_layout {
                 preload_layout_images(layout, &global);
-                spawn_all_modules(layout, &module_tx, &mut module_children, &mut module_paths);
+                spawn_all_modules(layout, &module_tx, &wake_tx, &mut module_children, &mut module_paths);
             }
             eprintln!("[costae] config reloaded");
             changed = true;
@@ -346,6 +356,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        thread::sleep(Duration::from_millis(50));
+        // Block until an update arrives (or 50ms timeout for X11 event polling)
+        let _ = wake_rx.recv_timeout(Duration::from_millis(50));
     }
 }
