@@ -3,7 +3,9 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
-use costae::{GlobalContext, find_modules, hit_test, load_fonts, parse_layout, preload_layout_images, render_frame, spawn_module, substitute};
+use std::sync::Arc;
+
+use costae::{GlobalContext, RenderCache, find_modules, hit_test, load_fonts, parse_layout, preload_layout_images, render_frame, spawn_module, substitute, update_module_value};
 use takumi::{layout::Viewport, rendering::{RenderOptionsBuilder, measure_layout}};
 use x11rb::{
     connection::Connection,
@@ -69,14 +71,13 @@ fn do_hit_test(
     click_x: f32,
     click_y: f32,
 ) {
-    eprintln!("[costae] click at ({click_x}, {click_y})");
     let layout_json = match raw_layout {
         Some(l) => l,
-        None => { eprintln!("[costae] hit_test: no raw_layout"); return; },
+        None => return,
     };
     let node = match resolve_layout(raw_layout, module_values, module_paths) {
         Some(n) => n,
-        None => { eprintln!("[costae] hit_test: layout not ready (missing module values)"); return; },
+        None => return,
     };
     let substituted = substitute(layout_json, module_values);
 
@@ -88,31 +89,30 @@ fn do_hit_test(
         .expect("build options");
     let measured = match measure_layout(options) {
         Ok(m) => m,
-        Err(e) => { eprintln!("[costae] hit_test: measure_layout failed: {e}"); return; },
+        Err(_) => return,
     };
 
     let (hit_path, on_click) = match hit_test(&measured, &substituted, click_x, click_y) {
         Some(r) => r,
-        None => { eprintln!("[costae] hit_test: no hit (nothing under cursor has on_click)"); return; },
+        None => return,
     };
-    eprintln!("[costae] hit at path={hit_path:?} on_click={on_click}");
 
-    // Walk up from hit_path to find the nearest module ancestor
     let mut path = hit_path.clone();
     loop {
         if let Some(tx) = module_event_txs.get(&path) {
-            eprintln!("[costae] routing click to module at {path:?}");
             let _ = tx.send(serde_json::json!({"event": "click", "data": on_click}));
             return;
         }
         match path.rfind('/') {
             Some(pos) => path.truncate(pos),
-            None => { eprintln!("[costae] hit_test: no module ancestor found for {hit_path:?}"); return; },
+            None => return,
         }
     }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let exe_path = std::env::current_exe().unwrap_or_default();
+
     let config_path = costae::default_config_path();
     let (bar_width, mut raw_layout) = if config_path.exists() {
         match costae::load_config(&config_path) {
@@ -147,6 +147,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if modified != last_modified {
                     last_modified = modified;
                     let _ = reload_tx.send(());
+                    let _ = wake_tx.try_send(());
+                }
+            }
+        });
+    }
+
+    // If we were exec'd by a previous instance, it passes the mtime it saw so we
+    // don't immediately re-trigger on the same installation.
+    let exe_baseline: Option<std::time::SystemTime> =
+        std::env::var("COSTAE_EXE_MTIME_NS")
+            .ok()
+            .and_then(|s| s.parse::<u128>().ok())
+            .and_then(|ns| {
+                std::time::UNIX_EPOCH.checked_add(std::time::Duration::from_nanos(ns as u64))
+            })
+            .or_else(|| std::fs::metadata(&exe_path).and_then(|m| m.modified()).ok());
+
+    let (bin_reload_tx, bin_reload_rx) = mpsc::channel::<()>();
+    if exe_path.exists() {
+        let path = exe_path.clone();
+        let wake_tx = wake_tx.clone();
+        thread::spawn(move || {
+            let mut last_modified = exe_baseline;
+            loop {
+                thread::sleep(Duration::from_millis(500));
+                let modified = std::fs::metadata(&path)
+                    .and_then(|m| m.modified())
+                    .ok();
+                if modified != last_modified {
+                    last_modified = modified;
+                    let _ = bin_reload_tx.send(());
                     let _ = wake_tx.try_send(());
                 }
             }
@@ -191,6 +222,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .event_mask(EventMask::EXPOSURE | EventMask::BUTTON_PRESS),
     )?;
     conn.map_window(win_id)?;
+    conn.configure_window(win_id, &ConfigureWindowAux::new().stack_mode(StackMode::BELOW))?;
     conn.flush()?;
 
     let mut global = GlobalContext::default();
@@ -242,10 +274,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         spawn_all_modules(layout, &module_tx, &wake_tx, &init_event, &mut module_children, &mut module_event_txs, &mut module_paths);
     }
 
-    let mut bgrx = render_frame(resolve_layout(&raw_layout, &module_values, &module_paths), &global, bar_width, mon_height);
+    let mut render_cache = RenderCache::new(30);
+    let mut bgrx: Arc<Vec<u8>> = render_cache.get_or_render(
+        &serde_json::to_value(&module_values).unwrap_or_default(),
+        || render_frame(resolve_layout(&raw_layout, &module_values, &module_paths), &global, bar_width, mon_height),
+    );
 
     loop {
         let mut changed = false;
+
+        if bin_reload_rx.try_recv().is_ok() {
+            eprintln!("[costae] binary changed, restarting...");
+            for child in &mut module_children {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            let _ = conn.destroy_window(win_id);
+            let _ = conn.flush();
+            use std::os::unix::process::CommandExt;
+            let mut cmd = std::process::Command::new(&exe_path);
+            // Tell the new process what mtime we saw so it doesn't re-trigger immediately
+            if let Ok(mtime) = std::fs::metadata(&exe_path).and_then(|m| m.modified()) {
+                if let Ok(dur) = mtime.duration_since(std::time::UNIX_EPOCH) {
+                    cmd.env("COSTAE_EXE_MTIME_NS", dur.as_nanos().to_string());
+                }
+            }
+            let _ = cmd.exec();
+            // exec failed — continue running
+        }
 
         if reload_rx.try_recv().is_ok() {
             for child in &mut module_children {
@@ -255,6 +311,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             module_children.clear();
             module_event_txs.clear();
             module_values.clear();
+            render_cache = RenderCache::new(30);
             if let Ok(cfg) = costae::load_config(&config_path) {
                 raw_layout = Some(cfg.layout);
             }
@@ -269,20 +326,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         while let Ok((path, line)) = module_rx.try_recv() {
             let value = serde_json::from_str(&line)
                 .unwrap_or(serde_json::Value::String(line));
-            module_values.insert(path, value);
-            changed = true;
+            if update_module_value(&mut module_values, path, value) {
+                changed = true;
+            }
         }
 
         if changed {
-            bgrx = render_frame(resolve_layout(&raw_layout, &module_values, &module_paths), &global, bar_width, mon_height);
-            conn.put_image(ImageFormat::Z_PIXMAP, win_id, gc, bar_width as u16, mon_height as u16, 0, 0, 0, depth, &bgrx)?;
+            let key = serde_json::to_value(&module_values).unwrap_or_default();
+            bgrx = render_cache.get_or_render(&key, || {
+                render_frame(resolve_layout(&raw_layout, &module_values, &module_paths), &global, bar_width, mon_height)
+            });
+            conn.put_image(ImageFormat::Z_PIXMAP, win_id, gc, bar_width as u16, mon_height as u16, 0, 0, 0, depth, &bgrx[..])?;
             conn.flush()?;
         }
 
         while let Some(event) = conn.poll_for_event()? {
             match event {
                 x11rb::protocol::Event::Expose(_) => {
-                    conn.put_image(ImageFormat::Z_PIXMAP, win_id, gc, bar_width as u16, mon_height as u16, 0, 0, 0, depth, &bgrx)?;
+                    conn.put_image(ImageFormat::Z_PIXMAP, win_id, gc, bar_width as u16, mon_height as u16, 0, 0, 0, depth, &bgrx[..])?;
                     conn.flush()?;
                 }
                 x11rb::protocol::Event::ButtonPress(e) => {

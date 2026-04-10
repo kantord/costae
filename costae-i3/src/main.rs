@@ -85,23 +85,31 @@ pub fn build_workspace_node(workspaces: &[Workspace]) -> serde_json::Value {
     let children: Vec<serde_json::Value> = workspaces
         .iter()
         .map(|ws| {
-            let tw = if ws.focused {
-                "text-[16px] text-[#cba6f7] font-bold text-center w-full"
+            let card_tw = if ws.focused {
+                "flex flex-col gap-[2px] px-3 py-2 rounded-lg border border-[#cba6f7] bg-[rgba(255,255,255,0.08)] backdrop-blur-md w-full"
             } else {
-                "text-[16px] text-[#a6adc8] text-center w-full"
+                "flex flex-col gap-[2px] px-3 py-2 rounded-lg border border-[rgba(255,255,255,0.2)] bg-[rgba(255,255,255,0.08)] backdrop-blur-md w-full"
+            };
+            let title_tw = if ws.focused {
+                "text-[18px] text-white font-bold"
+            } else {
+                "text-[18px] text-[rgba(255,255,255,0.95)]"
             };
             serde_json::json!({
-                "type": "text",
-                "tw": tw,
-                "text": ws.name,
-                "on_click": {"workspace": ws.name}
+                "type": "container",
+                "tw": card_tw,
+                "on_click": {"workspace": ws.name},
+                "children": [
+                    {"type": "text", "tw": title_tw, "text": ws.name},
+                    {"type": "text", "tw": "text-[11px] text-white truncate", "text": "Lorem ipsum dolor sit amet consectetur adipiscing elit"}
+                ]
             })
         })
         .collect();
 
     serde_json::json!({
         "type": "container",
-        "tw": "flex flex-col items-center gap-[8px] pt-[16px] w-full",
+        "tw": "flex flex-col gap-[8px] pt-[16px] w-full",
         "children": children
     })
 }
@@ -253,6 +261,14 @@ mod tests {
     }
 
     #[test]
+    fn build_workspace_node_each_card_is_a_container() {
+        let ws = vec![Workspace { name: "1".into(), focused: false }];
+        let node = build_workspace_node(&ws);
+        let children = node["children"].as_array().unwrap();
+        assert_eq!(children[0]["type"], "container");
+    }
+
+    #[test]
     fn build_workspace_node_contains_workspace_names() {
         let ws = vec![
             Workspace { name: "web".into(), focused: false },
@@ -260,8 +276,23 @@ mod tests {
         ];
         let node = build_workspace_node(&ws);
         let children = node["children"].as_array().unwrap();
-        assert_eq!(children[0]["text"], "web");
-        assert_eq!(children[1]["text"], "term");
+        // Title is the first child of each card container
+        assert_eq!(children[0]["children"][0]["text"], "web");
+        assert_eq!(children[1]["children"][0]["text"], "term");
+    }
+
+    #[test]
+    fn build_workspace_node_card_has_subtitle() {
+        let ws = vec![Workspace { name: "1".into(), focused: false }];
+        let node = build_workspace_node(&ws);
+        let card = &node["children"][0];
+        let subtitle = &card["children"][1];
+        assert_eq!(subtitle["type"], "text");
+        // Subtitle should have smaller text than the title
+        let title_tw = card["children"][0]["tw"].as_str().unwrap();
+        let subtitle_tw = subtitle["tw"].as_str().unwrap();
+        assert!(subtitle_tw.contains("text-[11px]") || subtitle_tw.contains("text-[10px]"));
+        assert!(!title_tw.contains("text-[11px]") && !title_tw.contains("text-[10px]"));
     }
 
     #[test]
@@ -272,8 +303,11 @@ mod tests {
         ];
         let node = build_workspace_node(&ws);
         let children = node["children"].as_array().unwrap();
-        assert!(children[0]["tw"].as_str().unwrap().contains("#cba6f7"));
-        assert!(!children[1]["tw"].as_str().unwrap().contains("#cba6f7"));
+        // Focused card title is white (max contrast), unfocused is dimmed
+        let focused_title_tw = children[0]["children"][0]["tw"].as_str().unwrap();
+        let unfocused_title_tw = children[1]["children"][0]["tw"].as_str().unwrap();
+        assert!(focused_title_tw.contains("text-white"));
+        assert!(!unfocused_title_tw.contains("text-white"));
     }
 
     #[test]
@@ -281,7 +315,8 @@ mod tests {
         let ws = vec![Workspace { name: "1".into(), focused: false }];
         let node = build_workspace_node(&ws);
         let children = node["children"].as_array().unwrap();
-        assert!(children[0]["tw"].as_str().unwrap().contains("#a6adc8"));
+        let title_tw = children[0]["children"][0]["tw"].as_str().unwrap();
+        assert!(title_tw.contains("rgba(255,255,255,0.8)"));
     }
 
     #[test]

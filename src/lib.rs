@@ -1,9 +1,37 @@
 use std::borrow::Cow;
 use std::io::{Seek, SeekFrom, Write as IoWrite};
+use std::num::NonZeroUsize;
 use std::os::unix::io::FromRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 use std::thread;
+
+use lru::LruCache;
+
+pub struct RenderCache {
+    cache: LruCache<String, Arc<Vec<u8>>>,
+}
+
+impl RenderCache {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            cache: LruCache::new(NonZeroUsize::new(capacity).unwrap()),
+        }
+    }
+
+    pub fn get_or_render<F>(&mut self, key: &serde_json::Value, render: F) -> Arc<Vec<u8>>
+    where
+        F: FnOnce() -> Vec<u8>,
+    {
+        let canonical = json_canon::to_string(key).unwrap_or_default();
+        if let Some(cached) = self.cache.get(&canonical) {
+            return Arc::clone(cached);
+        }
+        let result = Arc::new(render());
+        self.cache.put(canonical, Arc::clone(&result));
+        result
+    }
+}
 
 use serde::Deserialize;
 pub use takumi::GlobalContext;
@@ -118,6 +146,59 @@ pub fn parse_layout(value: &serde_json::Value) -> Result<Node, serde_json::Error
     serde_json::from_value(value.clone())
 }
 
+/// Returns true if the focused workspace on the given output has any fullscreen window.
+/// `tree` is the JSON from an i3 GET_TREE (type 4) response.
+///
+/// The real i3 tree nests workspaces inside a content container:
+///   root → output → content_container → workspace → windows
+/// We follow the `focus` array at each level until we reach a workspace node.
+pub fn has_fullscreen_on_output(tree: &serde_json::Value, output_name: &str) -> bool {
+    let outputs = match tree["nodes"].as_array() {
+        Some(a) => a,
+        None => return false,
+    };
+    for output in outputs {
+        if output["name"].as_str() != Some(output_name) {
+            continue;
+        }
+        return focused_workspace_has_fullscreen(output);
+    }
+    false
+}
+
+/// Follow the focus chain from `container` down to the focused workspace,
+/// then check if that workspace has any fullscreen window.
+fn focused_workspace_has_fullscreen(container: &serde_json::Value) -> bool {
+    if container["type"].as_str() == Some("workspace") {
+        return node_has_fullscreen(container);
+    }
+    let focused_id = container["focus"].as_array()
+        .and_then(|f| f.first())
+        .and_then(|id| id.as_u64());
+    if let (Some(fid), Some(nodes)) = (focused_id, container["nodes"].as_array()) {
+        for child in nodes {
+            if child["id"].as_u64() == Some(fid) {
+                return focused_workspace_has_fullscreen(child);
+            }
+        }
+    }
+    false
+}
+
+fn node_has_fullscreen(node: &serde_json::Value) -> bool {
+    if node["fullscreen_mode"].as_u64().unwrap_or(0) > 0 {
+        return true;
+    }
+    for key in &["nodes", "floating_nodes"] {
+        if let Some(children) = node[key].as_array() {
+            if children.iter().any(node_has_fullscreen) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Walk the MeasuredNode and JSON trees in lockstep to find the deepest node
 /// under (click_x, click_y) that carries an `on_click` field.
 /// Returns (json_path, on_click_value) on hit, None otherwise.
@@ -160,6 +241,21 @@ fn hit_test_inner(
 
     // This node is the deepest hit — return it if it has on_click
     json.get("on_click").map(|v| (path.to_string(), v.clone()))
+}
+
+/// Insert `new_value` at `path` in `values`. Returns `true` if the value actually changed
+/// (i.e. was absent or different), `false` if it was already identical. Use this to avoid
+/// unnecessary re-renders when a module emits the same output repeatedly.
+pub fn update_module_value(
+    values: &mut std::collections::HashMap<String, serde_json::Value>,
+    path: String,
+    new_value: serde_json::Value,
+) -> bool {
+    if values.get(&path) == Some(&new_value) {
+        return false;
+    }
+    values.insert(path, new_value);
+    true
 }
 
 pub fn render_frame(layout: Option<Node>, global: &GlobalContext, width: u32, height: u32) -> Vec<u8> {
