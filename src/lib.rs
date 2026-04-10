@@ -128,7 +128,7 @@ pub fn hit_test(
     click_x: f32,
     click_y: f32,
 ) -> Option<(String, serde_json::Value)> {
-    hit_test_inner(measured, json, click_x, click_y, 0.0, 0.0, "")
+    hit_test_inner(measured, json, click_x, click_y, "")
 }
 
 fn hit_test_inner(
@@ -136,12 +136,11 @@ fn hit_test_inner(
     json: &serde_json::Value,
     click_x: f32,
     click_y: f32,
-    parent_x: f32,
-    parent_y: f32,
     path: &str,
 ) -> Option<(String, serde_json::Value)> {
-    let node_x = parent_x + measured.transform[4];
-    let node_y = parent_y + measured.transform[5];
+    // Takumi stores absolute screen coordinates in transform[4/5]
+    let node_x = measured.transform[4];
+    let node_y = measured.transform[5];
 
     if click_x < node_x || click_x > node_x + measured.width
         || click_y < node_y || click_y > node_y + measured.height
@@ -153,7 +152,7 @@ fn hit_test_inner(
     if let Some(children_json) = json.get("children").and_then(|c| c.as_array()) {
         for (i, (child_m, child_j)) in measured.children.iter().zip(children_json).enumerate() {
             let child_path = format!("{}/children/{}", path, i);
-            if let Some(result) = hit_test_inner(child_m, child_j, click_x, click_y, node_x, node_y, &child_path) {
+            if let Some(result) = hit_test_inner(child_m, child_j, click_x, click_y, &child_path) {
                 return Some(result);
             }
         }

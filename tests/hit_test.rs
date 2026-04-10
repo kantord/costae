@@ -65,19 +65,20 @@ fn hit_falls_back_to_parent_when_child_has_no_on_click() {
 }
 
 #[test]
-fn child_transforms_are_relative_to_parent() {
-    // Parent at (50, 50), child at (10, 10) relative to parent = (60, 60) absolute
-    let child = node(10.0, 10.0, 20.0, 20.0, vec![]);
+fn child_uses_absolute_transform_for_hit_detection() {
+    // Takumi stores absolute screen coords in transform[4/5].
+    // Child at absolute (60, 60) — i.e. parent at (50,50) + child offset (10,10).
+    let child = node(60.0, 60.0, 20.0, 20.0, vec![]);
     let parent = node(50.0, 50.0, 100.0, 100.0, vec![child]);
     let json = serde_json::json!({
         "children": [{"on_click": {"action": "child"}, "children": []}]
     });
-    // Click at (65, 65) = inside child absolute position
+    // Click at (65, 65) is inside child's absolute bounds (60..80, 60..80)
     let result = hit_test(&parent, &json, 65.0, 65.0);
     assert!(result.is_some());
     assert_eq!(result.unwrap().1["action"], "child");
 
-    // Click at (55, 55) = inside parent but outside child
+    // Click at (55, 55) is inside parent but outside child
     assert!(hit_test(&parent, &json, 55.0, 55.0).is_none());
 }
 
