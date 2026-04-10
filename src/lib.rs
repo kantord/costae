@@ -7,6 +7,14 @@ use std::thread;
 
 use lru::LruCache;
 
+/// LRU cache of rendered frames keyed on the canonical JSON of `module_values`.
+///
+/// Canonical JSON (RFC 8785 via `json_canon`) normalises object key order so that
+/// `{"a":1,"b":2}` and `{"b":2,"a":1}` resolve to the same cache entry.
+///
+/// Frames are stored as `Arc<Vec<u8>>` so the caller can hold onto the current
+/// frame across loop iterations even after it has been evicted from the cache
+/// (e.g. the bar needs to repaint on Expose while the cache has already moved on).
 pub struct RenderCache {
     cache: LruCache<String, Arc<Vec<u8>>>,
 }
@@ -37,6 +45,36 @@ impl RenderCache {
 
 use serde::Deserialize;
 pub use takumi::GlobalContext;
+
+/// Convert X11 ZPixmap BGRX bytes (4 bytes per pixel, X padding ignored) to RGBA
+/// with alpha=255 (wallpaper is always fully opaque).
+pub fn x11_bgrx_to_rgba(bgrx: &[u8]) -> Vec<u8> {
+    let mut rgba = Vec::with_capacity(bgrx.len());
+    for px in bgrx.chunks_exact(4) {
+        rgba.push(px[2]); // R
+        rgba.push(px[1]); // G
+        rgba.push(px[0]); // B
+        rgba.push(0xFF);  // A
+    }
+    rgba
+}
+
+/// Store a raw RGBA wallpaper slice (already cropped to bar dimensions) in the
+/// persistent image store under the key `"root-bg"` so layout nodes can
+/// reference it via `backgroundImage: "url(root-bg)"` in the config.
+///
+/// Because takumi sees this as real pixel content behind elements in the render
+/// tree, CSS `backdrop-filter: blur()` on cards will correctly blur the wallpaper
+/// — the same effect that a compositor would produce, but in pure software.
+pub fn inject_root_bg(global: &GlobalContext, rgba: Vec<u8>, width: u32, height: u32) {
+    use tiny_skia::{IntSize, Pixmap};
+    use takumi::resources::image::ImageSource;
+    if let Some(size) = IntSize::from_wh(width, height) {
+        if let Some(pixmap) = Pixmap::from_vec(rgba, size) {
+            global.persistent_image_store.insert("root-bg".to_string(), ImageSource::from(pixmap));
+        }
+    }
+}
 pub use takumi::rendering::MeasuredNode;
 use takumi::{
     layout::{Viewport, node::Node},

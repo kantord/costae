@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use std::sync::Arc;
 
-use costae::{GlobalContext, RenderCache, find_modules, hit_test, load_fonts, parse_layout, preload_layout_images, render_frame, spawn_module, substitute, update_module_value};
+use costae::{GlobalContext, RenderCache, find_modules, hit_test, inject_root_bg, load_fonts, parse_layout, preload_layout_images, render_frame, spawn_module, substitute, update_module_value, x11_bgrx_to_rgba};
 use takumi::{layout::Viewport, rendering::{RenderOptions, measure_layout}};
 use x11rb::{
     connection::Connection,
@@ -29,6 +29,31 @@ fn resolve_layout(
             .map_err(|e| eprintln!("[costae] layout parse error: {e}"))
             .ok()
     })
+}
+
+fn sample_and_inject_root_bg(
+    conn: &RustConnection,
+    root: Window,
+    global: &GlobalContext,
+    mon_x: i16,
+    mon_y: i16,
+    width: u32,
+    height: u32,
+) {
+    let t = std::time::Instant::now();
+    // Read directly from the root window — works for solid colors and wallpapers alike,
+    // and always reflects exactly the pixels behind our bar's position on screen.
+    match conn.get_image(ImageFormat::Z_PIXMAP, root, mon_x, mon_y, width as u16, height as u16, !0) {
+        Err(e) => eprintln!("[costae] root bg send error: {e:?}"),
+        Ok(cookie) => match cookie.reply() {
+            Err(e) => eprintln!("[costae] root bg reply error: {e:?}"),
+            Ok(img) => {
+                let rgba = x11_bgrx_to_rgba(&img.data);
+                inject_root_bg(global, rgba, width, height);
+                eprintln!("[costae] root bg sampled in {}ms", t.elapsed().as_millis());
+            }
+        }
+    }
 }
 
 fn i3_dpi(conn: &RustConnection, root: Window, screen: &Screen) -> f32 {
@@ -220,15 +245,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .override_redirect(1)
             .event_mask(EventMask::EXPOSURE | EventMask::BUTTON_PRESS),
     )?;
-    conn.map_window(win_id)?;
-    conn.configure_window(win_id, &ConfigureWindowAux::new().stack_mode(StackMode::BELOW))?;
-    conn.flush()?;
-
     let mut global = GlobalContext::default();
     load_fonts(&mut global);
     if let Some(ref layout) = raw_layout {
         preload_layout_images(layout, &global);
     }
+
+    // Watch for wallpaper changes: wallpaper setters (feh, nitrogen, etc.) signal a new
+    // wallpaper by updating the _XROOTPMAP_ID property on the root window.
+    conn.change_window_attributes(
+        screen.root,
+        &ChangeWindowAttributesAux::new().event_mask(EventMask::PROPERTY_CHANGE),
+    )?;
+    // Cache the atom ID so PropertyNotify events can be matched cheaply in the event loop.
+    let xrootpmap_atom: Option<u32> = conn
+        .intern_atom(false, b"_XROOTPMAP_ID").ok()
+        .and_then(|c| c.reply().ok())
+        .map(|r| r.atom);
+
+    // Sample before mapping — X11 does not maintain a backing store for root window pixels
+    // once a window covers them (no compositor). Reading after map_window returns black.
+    eprintln!("[costae] sampling root bg at ({mon_x},{mon_y}) size {bar_width}×{mon_height}");
+    sample_and_inject_root_bg(&conn, screen.root, &global, mon_x, mon_y, bar_width, mon_height);
+
+    conn.map_window(win_id)?;
+    conn.configure_window(win_id, &ConfigureWindowAux::new().stack_mode(StackMode::BELOW))?;
+    conn.flush()?;
 
     let gc = conn.generate_id()?;
     conn.create_gc(gc, win_id, &CreateGCAux::new())?;
@@ -330,15 +372,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        if changed {
-            let key = serde_json::to_value(&module_values).unwrap_or_default();
-            bgrx = render_cache.get_or_render(&key, || {
-                render_frame(resolve_layout(&raw_layout, &module_values, &module_paths), &global, bar_width, mon_height)
-            });
-            conn.put_image(ImageFormat::Z_PIXMAP, win_id, gc, bar_width as u16, mon_height as u16, 0, 0, 0, depth, &bgrx[..])?;
-            conn.flush()?;
-        }
-
+        // Process X11 events before rendering so PropertyNotify-triggered resamples
+        // are included in the same render pass.
         while let Some(event) = conn.poll_for_event()? {
             match event {
                 x11rb::protocol::Event::Expose(_) => {
@@ -352,8 +387,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         e.event_x as f32, e.event_y as f32,
                     );
                 }
+                x11rb::protocol::Event::PropertyNotify(e) => {
+                    // Wallpaper changed — read from _XROOTPMAP_ID pixmap directly,
+                    // which feh/nitrogen set and which is independent of our window being on top.
+                    if xrootpmap_atom == Some(e.atom) {
+                        if let Some(atom) = xrootpmap_atom {
+                            let pixmap = conn
+                                .get_property(false, screen.root, atom, AtomEnum::ANY, 0, 1).ok()
+                                .and_then(|c| c.reply().ok())
+                                .filter(|p| p.value.len() >= 4)
+                                .and_then(|p| p.value[..4].try_into().ok().map(u32::from_ne_bytes));
+                            if let Some(pixmap_id) = pixmap {
+                                if let Some(img) = conn.get_image(ImageFormat::Z_PIXMAP, pixmap_id, mon_x, mon_y, bar_width as u16, mon_height as u16, !0).ok().and_then(|c| c.reply().ok()) {
+                                    let rgba = x11_bgrx_to_rgba(&img.data);
+                                    inject_root_bg(&global, rgba, bar_width, mon_height);
+                                    render_cache = RenderCache::new(30);
+                                    changed = true;
+                                    eprintln!("[costae] root bg updated from wallpaper change");
+                                }
+                            }
+                        }
+                    }
+                }
                 _ => {}
             }
+        }
+
+        if changed {
+            let key = serde_json::to_value(&module_values).unwrap_or_default();
+            bgrx = render_cache.get_or_render(&key, || {
+                render_frame(resolve_layout(&raw_layout, &module_values, &module_paths), &global, bar_width, mon_height)
+            });
+            conn.put_image(ImageFormat::Z_PIXMAP, win_id, gc, bar_width as u16, mon_height as u16, 0, 0, 0, depth, &bgrx[..])?;
+            conn.flush()?;
         }
 
         let _ = wake_rx.recv_timeout(Duration::from_millis(50));
