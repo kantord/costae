@@ -11,6 +11,7 @@ use x11rb::{
     connection::Connection,
     protocol::{randr::ConnectionExt as RandrExt, xproto::*},
     rust_connection::RustConnection,
+    wrapper::ConnectionExt as _,
 };
 
 const DEFAULT_BAR_WIDTH: u32 = 300;
@@ -270,6 +271,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     conn.map_window(win_id)?;
     conn.configure_window(win_id, &ConfigureWindowAux::new().stack_mode(StackMode::BELOW))?;
+
+    // Tell i3 (and any EWMH-compliant WM) that we occupy the left edge of the monitor.
+    // This prevents tiling windows from appearing under the bar and may suppress the
+    // focused-workspace indicator border that otherwise shows at x=bar_width.
+    {
+        let strut_atom = conn.intern_atom(false, b"_NET_WM_STRUT_PARTIAL")?.reply()?.atom;
+        let strut_vals = costae::strut_partial_values(mon_x, mon_y, bar_width, mon_height);
+        conn.change_property32(PropMode::REPLACE, win_id, strut_atom, AtomEnum::CARDINAL, &strut_vals)?;
+        // Legacy _NET_WM_STRUT (first 4 values) for older WMs
+        let strut_legacy_atom = conn.intern_atom(false, b"_NET_WM_STRUT")?.reply()?.atom;
+        conn.change_property32(PropMode::REPLACE, win_id, strut_legacy_atom, AtomEnum::CARDINAL, &strut_vals[..4])?;
+    }
+
     conn.flush()?;
 
     let gc = conn.generate_id()?;

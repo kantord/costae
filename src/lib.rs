@@ -418,6 +418,19 @@ pub fn preload_layout_images(layout: &serde_json::Value, global: &GlobalContext)
     }
 }
 
+/// Compute `_NET_WM_STRUT_PARTIAL` values for a left-side bar.
+///
+/// The 12-element array follows the EWMH spec: left, right, top, bottom,
+/// then four pairs of start/end coordinates for each edge strut.
+/// We only populate the left strut; everything else is zero.
+pub fn strut_partial_values(mon_x: i16, mon_y: i16, bar_width: u32, mon_height: u32) -> [u32; 12] {
+    let mut v = [0u32; 12];
+    v[0] = mon_x as u32 + bar_width; // left: absolute pixels from screen left edge
+    v[4] = mon_y as u32;             // left_start_y
+    v[5] = mon_y as u32 + mon_height.saturating_sub(1); // left_end_y
+    v
+}
+
 pub fn load_fonts(global: &mut GlobalContext) {
     for path in [
         "/usr/share/fonts/TTF/JetBrainsMono-Regular.ttf",
