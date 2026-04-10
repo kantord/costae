@@ -1,3 +1,7 @@
+[workspace]
+members = [".", "costae-i3"]
+resolver = "2"
+
 [package]
 name = "costae"
 version = "0.1.0"

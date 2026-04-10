@@ -12,8 +12,8 @@ use takumi::{
         Viewport,
         node::Node,
         style::{
-            AlignItems, BorderStyle, Color, ColorInput, Display, FlexDirection, FontWeight,
-            JustifyContent, Length::Px, Style, StyleDeclaration,
+            BorderStyle, Color, ColorInput, Display, FlexDirection,
+            Length::Px, Style, StyleDeclaration,
         },
     },
     rendering::{RenderOptionsBuilder, render},
@@ -124,48 +124,8 @@ pub fn parse_layout(value: &serde_json::Value) -> Result<Node, serde_json::Error
     serde_json::from_value(value.clone())
 }
 
-#[derive(Clone)]
-pub struct Workspace {
-    pub name: String,
-    pub focused: bool,
-}
-
-fn build_workspace_section(workspaces: &[Workspace], width: u32) -> Node {
-    let items: Vec<Node> = workspaces
-        .iter()
-        .map(|ws| {
-            Node::text(ws.name.clone()).with_style(
-                Style::default()
-                    .with(StyleDeclaration::font_size(Px(16.0).into()))
-                    .with(StyleDeclaration::font_weight(FontWeight::from(
-                        if ws.focused { 700.0 } else { 400.0 },
-                    )))
-                    .with(StyleDeclaration::color(ColorInput::Value(if ws.focused {
-                        Color([203, 166, 247, 255])
-                    } else {
-                        Color([166, 173, 200, 255])
-                    }))),
-            )
-        })
-        .collect();
-
-    Node::container(items).with_style(
-        Style::default()
-            .with(StyleDeclaration::width(Px(width as f32)))
-            .with(StyleDeclaration::display(Display::Flex))
-            .with(StyleDeclaration::flex_direction(FlexDirection::Column))
-            .with(StyleDeclaration::align_items(AlignItems::Center))
-            .with(StyleDeclaration::justify_content(JustifyContent::FlexStart))
-            .with(StyleDeclaration::row_gap(Px(8.0)))
-            .with(StyleDeclaration::padding_top(Px(16.0))),
-    )
-}
-
-pub fn build_node(workspaces: &[Workspace], layout: Option<Node>, width: u32, height: u32) -> Node {
-    let mut children = vec![build_workspace_section(workspaces, width)];
-    if let Some(node) = layout {
-        children.push(node);
-    }
+pub fn build_node(layout: Option<Node>, width: u32, height: u32) -> Node {
+    let children: Vec<Node> = layout.into_iter().collect();
 
     Node::container(children).with_style(
         Style::default()
@@ -187,8 +147,8 @@ pub fn build_node(workspaces: &[Workspace], layout: Option<Node>, width: u32, he
     )
 }
 
-pub fn render_frame(workspaces: &[Workspace], layout: Option<Node>, global: &GlobalContext, width: u32, height: u32) -> Vec<u8> {
-    let node = build_node(workspaces, layout, width, height);
+pub fn render_frame(layout: Option<Node>, global: &GlobalContext, width: u32, height: u32) -> Vec<u8> {
+    let node = build_node(layout, width, height);
     let options = RenderOptionsBuilder::default()
         .global(global)
         .viewport(Viewport::new(Some(width), Some(height)))
@@ -203,7 +163,19 @@ pub fn render_frame(workspaces: &[Workspace], layout: Option<Node>, global: &Glo
     bgrx
 }
 
-pub fn spawn_module(bin: &str, script: Option<&str>) -> (mpsc::Receiver<String>, std::process::Child) {
+pub struct SpawnedModule {
+    pub rx: mpsc::Receiver<String>,
+    pub child: std::process::Child,
+    pub event_tx: mpsc::Sender<serde_json::Value>,
+}
+
+impl SpawnedModule {
+    pub fn send_event(&self, event: &serde_json::Value) {
+        let _ = self.event_tx.send(event.clone());
+    }
+}
+
+pub fn spawn_module(bin: &str, script: Option<&str>) -> SpawnedModule {
     let (tx, rx) = mpsc::channel();
     let mut cmd = std::process::Command::new(bin);
 
@@ -222,6 +194,7 @@ pub fn spawn_module(bin: &str, script: Option<&str>) -> (mpsc::Receiver<String>,
     };
 
     let mut child = cmd
+        .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .spawn()
         .expect("failed to spawn module");
@@ -243,7 +216,17 @@ pub fn spawn_module(bin: &str, script: Option<&str>) -> (mpsc::Receiver<String>,
         }
     });
 
-    (rx, child)
+    let mut stdin = child.stdin.take().expect("no stdin");
+    let (event_tx, event_rx) = mpsc::channel::<serde_json::Value>();
+    thread::spawn(move || {
+        while let Ok(event) = event_rx.recv() {
+            if writeln!(stdin, "{}", event).is_err() {
+                break;
+            }
+        }
+    });
+
+    SpawnedModule { rx, child, event_tx }
 }
 
 pub fn preload_layout_images(layout: &serde_json::Value, global: &GlobalContext) {

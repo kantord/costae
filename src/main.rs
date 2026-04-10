@@ -1,10 +1,8 @@
-use std::io::{Read, Write};
-use std::os::unix::net::UnixStream;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
-use costae::{GlobalContext, Workspace, find_modules, load_fonts, parse_layout, preload_layout_images, render_frame, spawn_module, substitute};
+use costae::{GlobalContext, find_modules, load_fonts, parse_layout, preload_layout_images, render_frame, spawn_module, substitute};
 use x11rb::{
     connection::Connection,
     protocol::{randr::ConnectionExt as RandrExt, xproto::*},
@@ -30,41 +28,9 @@ fn resolve_layout(
     })
 }
 
-// --- i3 IPC ---
-
-const I3_MAGIC: &[u8; 6] = b"i3-ipc";
-
-fn i3_send(s: &mut UnixStream, msg_type: u32, payload: &[u8]) -> std::io::Result<()> {
-    s.write_all(I3_MAGIC)?;
-    s.write_all(&(payload.len() as u32).to_le_bytes())?;
-    s.write_all(&msg_type.to_le_bytes())?;
-    s.write_all(payload)
-}
-
-fn i3_recv(s: &mut UnixStream) -> std::io::Result<(u32, Vec<u8>)> {
-    let mut hdr = [0u8; 14]; // 6 magic + 4 len + 4 type
-    s.read_exact(&mut hdr)?;
-    let len = u32::from_le_bytes(hdr[6..10].try_into().unwrap()) as usize;
-    let typ = u32::from_le_bytes(hdr[10..14].try_into().unwrap());
-    let mut buf = vec![0u8; len];
-    s.read_exact(&mut buf)?;
-    Ok((typ, buf))
-}
-
-fn i3_socket_path() -> String {
-    std::env::var("I3SOCK").unwrap_or_else(|_| {
-        std::process::Command::new("i3")
-            .arg("--get-socketpath")
-            .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-            .unwrap_or_default()
-    })
-}
-
 // Mirror i3's DPI detection: Xft.dpi from RESOURCE_MANAGER, then physical screen dimensions.
 // See libi3/dpi.c in i3 source.
 fn i3_dpi(conn: &RustConnection, root: Window, screen: &Screen) -> f32 {
-    // Method 1: Xft.dpi from X11 RESOURCE_MANAGER (same priority as i3)
     let from_xresources = (|| -> Option<f32> {
         let atom = conn.intern_atom(false, b"RESOURCE_MANAGER").ok()?.reply().ok()?.atom;
         let prop = conn
@@ -84,99 +50,13 @@ fn i3_dpi(conn: &RustConnection, root: Window, screen: &Screen) -> f32 {
         eprintln!("[costae] DPI {dpi:.1} (from Xft.dpi)");
         return dpi;
     }
-
-    // Method 2: Calculate from screen physical dimensions (same as i3's init_dpi_fallback)
     if screen.height_in_millimeters > 0 {
-        let dpi = screen.height_in_pixels as f32 * 25.4
-            / screen.height_in_millimeters as f32;
+        let dpi = screen.height_in_pixels as f32 * 25.4 / screen.height_in_millimeters as f32;
         eprintln!("[costae] DPI {dpi:.1} (from screen physical dimensions)");
         return dpi;
     }
-
     eprintln!("[costae] DPI 96.0 (fallback)");
     96.0
-}
-
-// Apply left gap equal to bar_width physical pixels to the currently focused workspace.
-// i3 internally calls logical_px(N) = ceil((dpi/96) * N) on every gap value,
-// so we send the inverse: floor(bar_width * 96 / dpi).
-// See libi3/dpi.c and src/commands.c in i3 source.
-fn apply_bar_gap(socket: &str, dpi: f32, bar_width: u32) {
-    match UnixStream::connect(socket) {
-        Err(e) => eprintln!("[costae] gap: failed to connect to i3 socket: {e}"),
-        Ok(mut s) => {
-            // i3 only scales if dpi/96 >= 1.25 (logical_px threshold)
-            let gap = if (dpi / 96.0) < 1.25 {
-                bar_width
-            } else {
-                (bar_width as f32 * 96.0 / dpi).floor() as u32
-            };
-            let cmd = format!("gaps left current set {}", gap);
-            eprintln!("[costae] gap: dpi={dpi:.1} sending '{cmd}'");
-            let _ = i3_send(&mut s, 0, cmd.as_bytes()); // RUN_COMMAND = 0
-            match i3_recv(&mut s) {
-                Ok((_, payload)) => eprintln!("[costae] gap: reply {}", String::from_utf8_lossy(&payload)),
-                Err(e) => eprintln!("[costae] gap: recv error: {e}"),
-            }
-        }
-    }
-}
-
-fn fetch_workspaces(socket: &str, output: &str) -> std::io::Result<Vec<Workspace>> {
-    let mut s = UnixStream::connect(socket)?;
-    i3_send(&mut s, 1, b"")?; // GET_WORKSPACES = 1
-    let (_, payload) = i3_recv(&mut s)?;
-    let arr: Vec<serde_json::Value> = serde_json::from_slice(&payload).unwrap_or_default();
-    Ok(arr
-        .iter()
-        .filter(|w| w["output"].as_str().unwrap_or("") == output)
-        .map(|w| Workspace {
-            name: w["name"].as_str().unwrap_or("?").to_string(),
-            focused: w["focused"].as_bool().unwrap_or(false),
-        })
-        .collect())
-}
-
-// Subscribe to workspace events; apply left gap and send updated lists on each change.
-fn spawn_i3_watcher(socket: String, output: String, dpi: f32, bar_width: u32, tx: mpsc::Sender<Vec<Workspace>>, wake_tx: mpsc::SyncSender<()>) {
-    thread::spawn(move || {
-        let mut sub = match UnixStream::connect(&socket) {
-            Ok(s) => s,
-            Err(_) => return,
-        };
-        let _ = i3_send(&mut sub, 2, b"[\"workspace\"]"); // SUBSCRIBE = 2
-        let _ = i3_recv(&mut sub); // consume success reply
-
-        // Initial state: apply gap if focus is already on our output, then send list.
-        if let Ok(ws) = fetch_workspaces(&socket, &output) {
-            if ws.iter().any(|w| w.focused) {
-                apply_bar_gap(&socket, dpi, bar_width);
-            }
-            let _ = tx.send(ws);
-            let _ = wake_tx.try_send(());
-        }
-
-        loop {
-            match i3_recv(&mut sub) {
-                Ok((0x80000000, payload)) => {
-                    // On focus events, apply gap if the new workspace landed on our output.
-                    if let Ok(event) = serde_json::from_slice::<serde_json::Value>(&payload) {
-                        if event["current"]["output"].as_str() == Some(output.as_str()) {
-                            apply_bar_gap(&socket, dpi, bar_width);
-                        }
-                    }
-                    if let Ok(ws) = fetch_workspaces(&socket, &output) {
-                        if tx.send(ws).is_err() {
-                            break;
-                        }
-                        let _ = wake_tx.try_send(());
-                    }
-                }
-                Ok(_) => {}
-                Err(_) => break,
-            }
-        }
-    });
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -222,39 +102,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    // Spawn modules found in the layout tree
+    // Module state
     let mut module_values: std::collections::HashMap<String, serde_json::Value> = std::collections::HashMap::new();
     let (module_tx, module_rx) = mpsc::channel::<(String, String)>();
     let mut module_children: Vec<std::process::Child> = Vec::new();
+    let mut module_event_txs: Vec<mpsc::Sender<serde_json::Value>> = Vec::new();
     let mut module_paths: Vec<String> = Vec::new();
-
-    let spawn_all_modules = |layout: &serde_json::Value,
-                              tx: &mpsc::Sender<(String, String)>,
-                              wake_tx: &mpsc::SyncSender<()>,
-                              children: &mut Vec<std::process::Child>,
-                              paths: &mut Vec<String>| {
-        paths.clear();
-        for m in find_modules(layout) {
-            let tx = tx.clone();
-            let wake_tx = wake_tx.clone();
-            let path = m.path.clone();
-            paths.push(path.clone());
-            let (rx, child) = spawn_module(&m.bin, m.script.as_deref());
-            children.push(child);
-            thread::spawn(move || {
-                while let Ok(line) = rx.recv() {
-                    if tx.send((path.clone(), line)).is_err() {
-                        break;
-                    }
-                    let _ = wake_tx.try_send(());
-                }
-            });
-        }
-    };
-
-    if let Some(ref layout) = raw_layout {
-        spawn_all_modules(layout, &module_tx, &wake_tx, &mut module_children, &mut module_paths);
-    }
 
     // Connect to X11, get primary monitor geometry via RandR
     let (conn, screen_num) = RustConnection::connect(None)?;
@@ -301,16 +154,50 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let gc = conn.generate_id()?;
     conn.create_gc(gc, win_id, &CreateGCAux::new())?;
 
-    // Start i3 workspace watcher (also manages the left gap)
-    let (tx, rx) = mpsc::channel::<Vec<Workspace>>();
-    spawn_i3_watcher(i3_socket_path(), output_name, dpi, bar_width, tx, wake_tx.clone());
+    // Init event sent to every module on startup so they know display context
+    let init_event = serde_json::json!({
+        "type": "init",
+        "config": {"width": bar_width},
+        "output": output_name,
+        "dpi": dpi
+    });
 
+    let spawn_all_modules = |layout: &serde_json::Value,
+                              tx: &mpsc::Sender<(String, String)>,
+                              wake_tx: &mpsc::SyncSender<()>,
+                              init_event: &serde_json::Value,
+                              children: &mut Vec<std::process::Child>,
+                              event_txs: &mut Vec<mpsc::Sender<serde_json::Value>>,
+                              paths: &mut Vec<String>| {
+        paths.clear();
+        for m in find_modules(layout) {
+            let tx = tx.clone();
+            let wake_tx = wake_tx.clone();
+            let path = m.path.clone();
+            paths.push(path.clone());
+            let module = spawn_module(&m.bin, m.script.as_deref());
+            module.send_event(init_event);
+            event_txs.push(module.event_tx.clone());
+            children.push(module.child);
+            let rx = module.rx;
+            thread::spawn(move || {
+                while let Ok(line) = rx.recv() {
+                    if tx.send((path.clone(), line)).is_err() {
+                        break;
+                    }
+                    let _ = wake_tx.try_send(());
+                }
+            });
+        }
+    };
 
-    let mut workspaces: Vec<Workspace> = Vec::new();
-    let mut bgrx = render_frame(&workspaces, resolve_layout(&raw_layout, &module_values, &module_paths), &global, bar_width, mon_height);
+    if let Some(ref layout) = raw_layout {
+        spawn_all_modules(layout, &module_tx, &wake_tx, &init_event, &mut module_children, &mut module_event_txs, &mut module_paths);
+    }
+
+    let mut bgrx = render_frame(resolve_layout(&raw_layout, &module_values, &module_paths), &global, bar_width, mon_height);
 
     loop {
-        // Drain workspace and module updates; re-render if anything changed
         let mut changed = false;
 
         // Handle config reload
@@ -320,30 +207,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let _ = child.wait();
             }
             module_children.clear();
+            module_event_txs.clear();
             module_values.clear();
             if let Ok(cfg) = costae::load_config(&config_path) {
                 raw_layout = Some(cfg.layout);
             }
             if let Some(ref layout) = raw_layout {
                 preload_layout_images(layout, &global);
-                spawn_all_modules(layout, &module_tx, &wake_tx, &mut module_children, &mut module_paths);
+                spawn_all_modules(layout, &module_tx, &wake_tx, &init_event, &mut module_children, &mut module_event_txs, &mut module_paths);
             }
             eprintln!("[costae] config reloaded");
             changed = true;
         }
-        while let Ok(ws) = rx.try_recv() {
-            workspaces = ws;
-            changed = true;
-        }
+
         while let Ok((path, line)) = module_rx.try_recv() {
-            // Parse as JSON if possible, otherwise treat as a plain string
             let value = serde_json::from_str(&line)
                 .unwrap_or(serde_json::Value::String(line));
             module_values.insert(path, value);
             changed = true;
         }
+
         if changed {
-            bgrx = render_frame(&workspaces, resolve_layout(&raw_layout, &module_values, &module_paths), &global, bar_width, mon_height);
+            bgrx = render_frame(resolve_layout(&raw_layout, &module_values, &module_paths), &global, bar_width, mon_height);
             conn.put_image(ImageFormat::Z_PIXMAP, win_id, gc, bar_width as u16, mon_height as u16, 0, 0, 0, depth, &bgrx)?;
             conn.flush()?;
         }
