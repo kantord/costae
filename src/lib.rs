@@ -85,6 +85,8 @@ use takumi::{
 #[derive(Debug, Deserialize, PartialEq)]
 pub struct BarConfig {
     pub width: u32,
+    #[serde(default)]
+    pub outer_gap: u32,
 }
 
 #[derive(Debug, Deserialize)]

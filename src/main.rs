@@ -185,19 +185,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let exe_path = std::env::current_exe().unwrap_or_default();
 
     let config_path = costae::default_config_path();
-    let (bar_width, mut raw_layout) = if config_path.exists() {
+    let (bar_width, outer_gap, mut raw_layout) = if config_path.exists() {
         match costae::load_config(&config_path) {
             Ok(cfg) => {
-                eprintln!("[costae] config loaded: width={}", cfg.config.width);
-                (cfg.config.width, Some(cfg.layout))
+                eprintln!("[costae] config loaded: width={}, outer_gap={}", cfg.config.width, cfg.config.outer_gap);
+                (cfg.config.width, cfg.config.outer_gap, Some(cfg.layout))
             }
             Err(e) => {
                 eprintln!("[costae] config error: {e}, using defaults");
-                (DEFAULT_BAR_WIDTH, None)
+                (DEFAULT_BAR_WIDTH, 0, None)
             }
         }
     } else {
-        (DEFAULT_BAR_WIDTH, None)
+        (DEFAULT_BAR_WIDTH, 0, None)
     };
 
     let (wake_tx, wake_rx) = mpsc::sync_channel::<()>(1);
@@ -279,6 +279,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Scale bar_width (logical CSS px from config) to physical pixels, matching i3's DPI scaling.
     let dpr = dpi / 96.0;
     let phys_bar_width = (bar_width as f32 * dpr).round() as u32;
+    let phys_outer_gap = (outer_gap as f32 * dpr).round() as u32;
 
     let win_id = conn.generate_id()?;
     conn.create_window(
@@ -342,7 +343,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let init_event = serde_json::json!({
         "type": "init",
-        "config": {"width": phys_bar_width},
+        "config": {"width": phys_bar_width, "outer_gap": phys_outer_gap},
         "output": output_name,
         "dpi": dpi
     });
@@ -411,7 +412,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         if reload_rx.try_recv().is_ok() {
             if let Ok(cfg) = costae::load_config(&config_path) {
-                if cfg.config.width != bar_width {
+                if cfg.config.width != bar_width || cfg.config.outer_gap != outer_gap {
                     // Bar width changed — the X11 window must be recreated at the new physical
                     // size, so re-exec the process (same mechanism as binary hot-reload).
                     eprintln!("[costae] bar width changed, restarting...");

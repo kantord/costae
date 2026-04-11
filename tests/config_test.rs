@@ -11,7 +11,7 @@ fn fixture(name: &str) -> PathBuf {
 #[test]
 fn loads_bar_width_from_config_section() {
     let config = load_config(&fixture("config.yaml")).expect("should load config");
-    assert_eq!(config.config, BarConfig { width: 300 });
+    assert_eq!(config.config, BarConfig { width: 300, outer_gap: 0 });
 }
 
 #[test]
@@ -31,4 +31,16 @@ fn layout_preserves_at_module_reference() {
 fn missing_file_returns_error() {
     let result = load_config(&fixture("nonexistent.yaml"));
     assert!(result.is_err());
+}
+
+#[test]
+fn outer_gap_defaults_to_zero_when_absent() {
+    let config = load_config(&fixture("config.yaml")).expect("should load config");
+    assert_eq!(config.config.outer_gap, 0);
+}
+
+#[test]
+fn outer_gap_is_parsed_from_config_section() {
+    let config = load_config(&fixture("config_with_outer_gap.yaml")).expect("should load config");
+    assert_eq!(config.config.outer_gap, 8);
 }
