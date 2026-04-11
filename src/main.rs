@@ -410,6 +410,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         if reload_rx.try_recv().is_ok() {
+            if let Ok(cfg) = costae::load_config(&config_path) {
+                if cfg.config.width != bar_width {
+                    // Bar width changed — the X11 window must be recreated at the new physical
+                    // size, so re-exec the process (same mechanism as binary hot-reload).
+                    eprintln!("[costae] bar width changed, restarting...");
+                    for child in &mut module_children {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                    }
+                    use std::os::unix::process::CommandExt;
+                    let _ = std::process::Command::new(&exe_path).exec();
+                    // exec failed — fall through to in-place reload
+                }
+                raw_layout = Some(cfg.layout);
+            }
             for child in &mut module_children {
                 let _ = child.kill();
                 let _ = child.wait();
@@ -418,9 +433,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             module_event_txs.clear();
             module_values.clear();
             render_cache = RenderCache::new(30);
-            if let Ok(cfg) = costae::load_config(&config_path) {
-                raw_layout = Some(cfg.layout);
-            }
             if let Some(ref layout) = raw_layout {
                 preload_layout_images(layout, &global);
                 spawn_all_modules(layout, &module_tx, &wake_tx, &init_event, &mut module_children, &mut module_event_txs, &mut module_paths);
