@@ -191,7 +191,8 @@ fn substitute_inner(
 // ---
 
 pub fn parse_layout(value: &serde_json::Value) -> Result<Node, serde_json::Error> {
-    serde_json::from_value(value.clone())
+    use serde::Deserialize;
+    Node::deserialize(value)
 }
 
 /// Returns true if the focused workspace on the given output has any fullscreen window.

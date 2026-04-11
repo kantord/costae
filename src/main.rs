@@ -259,7 +259,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut stream_values: HashMap<String, String> = HashMap::new();
     let mut stream_children: HashMap<(String, Option<String>), std::process::Child> = HashMap::new();
     let (stream_tx, stream_rx) = mpsc::channel::<(String, Option<String>, String)>();
-    let mut layout_source: Option<String> = None;
+    let mut jsx_evaluator: Option<costae::jsx::JsxEvaluator> = None;
 
     let (conn, screen_num) = RustConnection::connect(None)?;
     let screen = &conn.setup().roots[screen_num];
@@ -356,23 +356,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         match std::fs::read_to_string(path) {
             Ok(source) => {
                 let t = std::time::Instant::now();
-                match costae::jsx::eval_jsx(&source, jsx_ctx.clone(), &stream_values) {
-                    Ok((value, stream_calls, module_calls)) => {
-                        eprintln!("[costae] jsx eval — {}ms", t.elapsed().as_millis());
-                        let (to_spawn, _) = reconcile_streams(&[], &stream_calls);
-                        for (bin, script) in to_spawn {
-                            let child = spawn_string_stream(&bin, script.as_deref(), stream_tx.clone(), wake_tx.clone());
-                            stream_children.insert((bin, script), child);
-                        }
-                        for bin in &module_calls {
-                            if !bi_stream_children.contains_key(bin) {
-                                let bi = spawn_bi_stream(bin, &init_event, stream_tx.clone(), wake_tx.clone());
-                                module_event_txs.insert(bin.clone(), bi.event_tx);
-                                bi_stream_children.insert(bin.clone(), bi.child);
+                match costae::jsx::JsxEvaluator::new(&source, jsx_ctx.clone()) {
+                    Ok(evaluator) => {
+                        match evaluator.eval(&stream_values) {
+                            Ok((value, stream_calls, module_calls)) => {
+                                eprintln!("[costae] jsx eval — {}ms", t.elapsed().as_millis());
+                                let (to_spawn, _) = reconcile_streams(&[], &stream_calls);
+                                for (bin, script) in to_spawn {
+                                    let child = spawn_string_stream(&bin, script.as_deref(), stream_tx.clone(), wake_tx.clone());
+                                    stream_children.insert((bin, script), child);
+                                }
+                                for bin in &module_calls {
+                                    if !bi_stream_children.contains_key(bin) {
+                                        let bi = spawn_bi_stream(bin, &init_event, stream_tx.clone(), wake_tx.clone());
+                                        module_event_txs.insert(bin.clone(), bi.event_tx);
+                                        bi_stream_children.insert(bin.clone(), bi.child);
+                                    }
+                                }
+                                raw_layout = Some(value);
+                                jsx_evaluator = Some(evaluator);
                             }
+                            Err(e) => { eprintln!("[costae] JSX eval error: {e}"); }
                         }
-                        raw_layout = Some(value);
-                        layout_source = Some(source);
                     }
                     Err(e) => { eprintln!("[costae] JSX eval error: {e}"); }
                 }
@@ -447,26 +452,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             module_event_txs.clear();
             stream_values.clear();
-            layout_source = None;
+            jsx_evaluator = None;
             if let Some(ref path) = layout_file {
                 match std::fs::read_to_string(path) {
-                    Ok(source) => match costae::jsx::eval_jsx(&source, jsx_ctx.clone(), &stream_values) {
-                        Ok((value, stream_calls, module_calls)) => {
-                            let (to_spawn, _) = reconcile_streams(&[], &stream_calls);
-                            for (bin, script) in to_spawn {
-                                let child = spawn_string_stream(&bin, script.as_deref(), stream_tx.clone(), wake_tx.clone());
-                                stream_children.insert((bin, script), child);
-                            }
-                            for bin in &module_calls {
-                                if !bi_stream_children.contains_key(bin) {
-                                    let bi = spawn_bi_stream(bin, &init_event, stream_tx.clone(), wake_tx.clone());
-                                    module_event_txs.insert(bin.clone(), bi.event_tx);
-                                    bi_stream_children.insert(bin.clone(), bi.child);
+                    Ok(source) => match costae::jsx::JsxEvaluator::new(&source, jsx_ctx.clone()) {
+                        Ok(evaluator) => match evaluator.eval(&stream_values) {
+                            Ok((value, stream_calls, module_calls)) => {
+                                let (to_spawn, _) = reconcile_streams(&[], &stream_calls);
+                                for (bin, script) in to_spawn {
+                                    let child = spawn_string_stream(&bin, script.as_deref(), stream_tx.clone(), wake_tx.clone());
+                                    stream_children.insert((bin, script), child);
                                 }
+                                for bin in &module_calls {
+                                    if !bi_stream_children.contains_key(bin) {
+                                        let bi = spawn_bi_stream(bin, &init_event, stream_tx.clone(), wake_tx.clone());
+                                        module_event_txs.insert(bin.clone(), bi.event_tx);
+                                        bi_stream_children.insert(bin.clone(), bi.child);
+                                    }
+                                }
+                                raw_layout = Some(value);
+                                jsx_evaluator = Some(evaluator);
                             }
-                            raw_layout = Some(value);
-                            layout_source = Some(source);
-                        }
+                            Err(e) => { eprintln!("[costae] JSX eval error: {e}"); }
+                        },
                         Err(e) => { eprintln!("[costae] JSX eval error: {e}"); }
                     },
                     Err(e) => { eprintln!("[costae] JSX file error: {e}"); }
@@ -480,39 +488,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             changed = true;
         }
 
+        let mut streams_updated = false;
         while let Ok((bin, script, value)) = stream_rx.try_recv() {
             let key = format!("{}\0{}", bin, script.as_deref().unwrap_or_default());
             if stream_values.get(&key).map(|s| s.as_str()) != Some(value.as_str()) {
                 stream_values.insert(key, value);
-                if let Some(ref source) = layout_source {
-                    let t = std::time::Instant::now();
-                    match costae::jsx::eval_jsx(source, jsx_ctx.clone(), &stream_values) {
-                        Ok((new_layout, new_calls, new_module_calls)) => {
-                            eprintln!("[costae] jsx re-eval — {}µs", t.elapsed().as_micros());
-                            let current_calls: Vec<_> = stream_children.keys().cloned().collect();
-                            let (to_spawn, to_kill) = reconcile_streams(&current_calls, &new_calls);
-                            for (b, s) in to_kill {
-                                if let Some(mut child) = stream_children.remove(&(b, s)) {
-                                    let _ = child.kill();
-                                    let _ = child.wait();
-                                }
+                streams_updated = true;
+            }
+        }
+        if streams_updated {
+            if let Some(ref evaluator) = jsx_evaluator {
+                let t = std::time::Instant::now();
+                match evaluator.eval(&stream_values) {
+                    Ok((new_layout, new_calls, new_module_calls)) => {
+                        eprintln!("[costae] jsx re-eval — {}µs", t.elapsed().as_micros());
+                        let current_calls: Vec<_> = stream_children.keys().cloned().collect();
+                        let (to_spawn, to_kill) = reconcile_streams(&current_calls, &new_calls);
+                        for (b, s) in to_kill {
+                            if let Some(mut child) = stream_children.remove(&(b, s)) {
+                                let _ = child.kill();
+                                let _ = child.wait();
                             }
-                            for (b, s) in to_spawn {
-                                let child = spawn_string_stream(&b, s.as_deref(), stream_tx.clone(), wake_tx.clone());
-                                stream_children.insert((b, s), child);
-                            }
-                            for b in &new_module_calls {
-                                if !bi_stream_children.contains_key(b) {
-                                    let bi = spawn_bi_stream(b, &init_event, stream_tx.clone(), wake_tx.clone());
-                                    module_event_txs.insert(b.clone(), bi.event_tx);
-                                    bi_stream_children.insert(b.clone(), bi.child);
-                                }
-                            }
-                            raw_layout = Some(new_layout);
-                            changed = true;
                         }
-                        Err(e) => { eprintln!("[costae] JSX re-eval error: {e}"); }
+                        for (b, s) in to_spawn {
+                            let child = spawn_string_stream(&b, s.as_deref(), stream_tx.clone(), wake_tx.clone());
+                            stream_children.insert((b, s), child);
+                        }
+                        for b in &new_module_calls {
+                            if !bi_stream_children.contains_key(b) {
+                                let bi = spawn_bi_stream(b, &init_event, stream_tx.clone(), wake_tx.clone());
+                                module_event_txs.insert(b.clone(), bi.event_tx);
+                                bi_stream_children.insert(b.clone(), bi.child);
+                            }
+                        }
+                        raw_layout = Some(new_layout);
+                        changed = true;
                     }
+                    Err(e) => { eprintln!("[costae] JSX re-eval error: {e}"); }
                 }
             }
         }
