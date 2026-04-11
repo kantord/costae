@@ -8,12 +8,13 @@ use oxc_semantic::SemanticBuilder;
 use oxc_span::SourceType;
 use oxc_transformer::{JsxOptions, JsxRuntime, TransformOptions, Transformer};
 
-pub fn eval_jsx(source: &str, ctx: serde_json::Value, stream_values: &std::collections::HashMap<String, String>) -> rquickjs::Result<(serde_json::Value, Vec<(String, Option<String>)>)> {
+pub fn eval_jsx(source: &str, ctx: serde_json::Value, stream_values: &std::collections::HashMap<String, String>) -> rquickjs::Result<(serde_json::Value, Vec<(String, Option<String>)>, Vec<String>)> {
     let js = transform_jsx(source);
     let runtime = rquickjs::Runtime::new()?;
     let qjs_ctx = rquickjs::Context::full(&runtime)?;
     let sv = Arc::new(stream_values.clone());
     let calls: Arc<Mutex<Vec<(String, Option<String>)>>> = Arc::new(Mutex::new(Vec::new()));
+    let module_calls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     qjs_ctx.with(|qjs_ctx| {
         qjs_ctx.eval::<(), _>(r#"
             globalThis._jsx = (tag, props, ...children) => {
@@ -29,8 +30,23 @@ pub fn eval_jsx(source: &str, ctx: serde_json::Value, stream_values: &std::colle
                 }
                 return { type: tag, ...props, children: children.flat() };
             };
-            globalThis.useJSONStream = (bin, script) => ({ "bin@": bin, script });
-            globalThis.Module = ({ bin, children, ...rest }) => ({ "bin@": bin, ...rest });
+            globalThis.useJSONStream = (bin, script) => {
+                const str = useStringStream(bin, script);
+                if (!str) return null;
+                try { return JSON.parse(str); } catch { return null; }
+            };
+            globalThis.Module = ({ bin, children, ...rest }) => {
+                const child = Array.isArray(children) ? children[0] : children;
+                if (typeof child === 'function') {
+                    registerModule(bin);
+                    const data = useJSONStream(bin);
+                    const events = new Proxy({}, {
+                        get: (_, type) => ({ __channel__: bin, type: String(type) })
+                    });
+                    return child(data, events);
+                }
+                return { "bin@": bin, ...rest };
+            };
         "#)?;
         {
             let sv = Arc::clone(&sv);
@@ -41,6 +57,16 @@ pub fn eval_jsx(source: &str, ctx: serde_json::Value, stream_values: &std::colle
                 sv.get(&key).cloned().unwrap_or_default()
             })?;
             qjs_ctx.globals().set("useStringStream", func)?;
+        }
+        {
+            let module_calls_inner = Arc::clone(&module_calls);
+            let func = rquickjs::Function::new(qjs_ctx.clone(), move |bin: String| {
+                let mut mc = module_calls_inner.lock().unwrap();
+                if !mc.contains(&bin) {
+                    mc.push(bin);
+                }
+            })?;
+            qjs_ctx.globals().set("registerModule", func)?;
         }
         if !ctx.is_null() {
             let json_string = serde_json::to_string(&ctx).map_err(|_| rquickjs::Error::Unknown)?;
@@ -53,7 +79,8 @@ pub fn eval_jsx(source: &str, ctx: serde_json::Value, stream_values: &std::colle
             .to_string()?;
         let json_value = serde_json::from_str(&json_str).map_err(|_| rquickjs::Error::Unknown)?;
         let recorded = calls.lock().unwrap().clone();
-        Ok((json_value, recorded))
+        let recorded_modules = module_calls.lock().unwrap().clone();
+        Ok((json_value, recorded, recorded_modules))
     })
 }
 
@@ -98,7 +125,7 @@ mod tests {
 
     #[test]
     fn eval_jsx_returns_tag_props_and_children() {
-        let (result, _) = eval_jsx(r#"<text tw="flex">{"hello"}</text>"#, serde_json::Value::Null, &std::collections::HashMap::new()).unwrap();
+        let (result, _, _) = eval_jsx(r#"<text tw="flex">{"hello"}</text>"#, serde_json::Value::Null, &std::collections::HashMap::new()).unwrap();
         assert_eq!(result["type"], "text");
         assert_eq!(result["tw"], "flex");
         assert_eq!(result["text"], "hello");
@@ -120,7 +147,7 @@ mod tests {
 
     #[test]
     fn eval_jsx_nested_tree_parses_to_node() {
-        let (result, _) = eval_jsx(
+        let (result, _, _) = eval_jsx(
             r#"<container tw="flex flex-col"><text tw="text-white">{"hello"}</text></container>"#,
             serde_json::Value::Null,
             &std::collections::HashMap::new(),
@@ -134,7 +161,7 @@ mod tests {
     fn use_string_stream_returns_injected_value() {
         let mut streams = std::collections::HashMap::new();
         streams.insert("/usr/bin/bash\0echo hi".to_string(), "hello".to_string());
-        let (result, _) = eval_jsx(
+        let (result, _, _) = eval_jsx(
             r#"<text tw="text-white">{useStringStream("/usr/bin/bash", "echo hi")}</text>"#,
             serde_json::Value::Null,
             &streams,
@@ -151,7 +178,7 @@ mod tests {
             "width": 250,
             "outer_gap": 8
         });
-        let (value, _) = eval_jsx(
+        let (value, _, _) = eval_jsx(
             r#"<text tw="text-white">{ctx.output}</text>"#,
             ctx,
             &std::collections::HashMap::new(),
@@ -163,7 +190,7 @@ mod tests {
 
     #[test]
     fn eval_jsx_records_stream_calls() {
-        let (_, streams_called) = eval_jsx(
+        let (_, streams_called, _) = eval_jsx(
             r#"<text tw="text-white">{useStringStream("/bin/bash", "script1")}{useStringStream("/bin/bash", "script2")}</text>"#,
             serde_json::Value::Null,
             &std::collections::HashMap::new(),
@@ -179,5 +206,39 @@ mod tests {
             "expected (\"/bin/bash\", Some(\"script2\")) in streams_called, got: {:?}",
             streams_called
         );
+    }
+
+    #[test]
+    fn module_render_prop_exposes_channel_in_events() {
+        let (result, _, _) = eval_jsx(
+            r#"<Module bin="/usr/bin/test">{(data, events) => <text tw="text-white">{events.doThing.__channel__}</text>}</Module>"#,
+            serde_json::Value::Null,
+            &std::collections::HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(result["text"], "/usr/bin/test");
+    }
+
+    #[test]
+    fn use_json_stream_parses_latest_json_output() {
+        let mut streams = std::collections::HashMap::new();
+        streams.insert("/usr/bin/test\0".to_string(), r#"{"name":"hello"}"#.to_string());
+        let (result, _, _) = eval_jsx(
+            r#"<text tw="text-white">{useJSONStream("/usr/bin/test").name}</text>"#,
+            serde_json::Value::Null,
+            &streams,
+        )
+        .unwrap();
+        assert_eq!(result["text"], "hello");
+    }
+
+    #[test]
+    fn module_component_records_module_call() {
+        let (_, _, module_calls) = eval_jsx(
+            r#"<Module bin="/usr/bin/test-module">{(data, events) => <text tw="text-white">hi</text>}</Module>"#,
+            serde_json::Value::Null,
+            &std::collections::HashMap::new(),
+        ).unwrap();
+        assert!(module_calls.contains(&"/usr/bin/test-module".to_string()));
     }
 }

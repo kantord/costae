@@ -92,38 +92,14 @@ fn fetch_workspaces(socket: &str, output: &str) -> std::io::Result<Vec<Workspace
         .collect())
 }
 
-// --- Node builder ---
+// --- Data builder ---
 
-pub fn build_workspace_node(workspaces: &[Workspace]) -> serde_json::Value {
-    let children: Vec<serde_json::Value> = workspaces
-        .iter()
-        .map(|ws| {
-            let card_tw = if ws.focused {
-                "flex flex-col gap-[2px] px-3 py-2 rounded-lg border border-[#cba6f7] bg-[rgba(255,255,255,0.08)] backdrop-blur-md w-full"
-            } else {
-                "flex flex-col gap-[2px] px-3 py-2 rounded-lg border border-[rgba(255,255,255,0.2)] bg-[rgba(255,255,255,0.08)] backdrop-blur-md w-full"
-            };
-            let title_tw = if ws.focused {
-                "text-[18px] text-white font-bold"
-            } else {
-                "text-[18px] text-[rgba(255,255,255,0.95)]"
-            };
-            serde_json::json!({
-                "type": "container",
-                "tw": card_tw,
-                "on_click": {"workspace": ws.name},
-                "children": [
-                    {"type": "text", "tw": title_tw, "text": ws.name},
-                    {"type": "text", "tw": "text-[11px] text-white truncate", "text": "Lorem ipsum dolor sit amet consectetur adipiscing elit"}
-                ]
-            })
-        })
-        .collect();
-
+pub fn build_workspace_data(workspaces: &[Workspace]) -> serde_json::Value {
     serde_json::json!({
-        "type": "container",
-        "tw": "flex flex-col gap-[8px] pt-[16px] w-full",
-        "children": children
+        "workspaces": workspaces.iter().map(|ws| serde_json::json!({
+            "name": ws.name,
+            "focused": ws.focused,
+        })).collect::<Vec<_>>()
     })
 }
 
@@ -207,7 +183,7 @@ fn main() {
         if ws.iter().any(|w| w.focused) {
             apply_bar_gap(&socket, init.dpi, init.bar_width, init.outer_gap);
         }
-        println!("{}", build_workspace_node(&ws));
+        println!("{}", build_workspace_data(&ws));
     }
 
     // Thread: subscribe to i3 workspace events and forward as I3 events
@@ -244,7 +220,7 @@ fn main() {
                     }
                 }
                 if let Ok(ws) = fetch_workspaces(&socket, &init.output) {
-                    println!("{}", build_workspace_node(&ws));
+                    println!("{}", build_workspace_data(&ws));
                 }
             }
             ModuleEvent::I3(_, _) => {}
@@ -264,86 +240,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn build_workspace_node_type_is_container() {
-        let node = build_workspace_node(&[]);
-        assert_eq!(node["type"], "container");
+    fn build_workspace_data_has_workspaces_array() {
+        let data = build_workspace_data(&[]);
+        assert!(data["workspaces"].is_array());
     }
 
     #[test]
-    fn build_workspace_node_empty_has_no_children() {
-        let node = build_workspace_node(&[]);
-        assert_eq!(node["children"].as_array().unwrap().len(), 0);
-    }
-
-    #[test]
-    fn build_workspace_node_each_card_is_a_container() {
-        let ws = vec![Workspace { name: "1".into(), focused: false }];
-        let node = build_workspace_node(&ws);
-        let children = node["children"].as_array().unwrap();
-        assert_eq!(children[0]["type"], "container");
-    }
-
-    #[test]
-    fn build_workspace_node_contains_workspace_names() {
-        let ws = vec![
-            Workspace { name: "web".into(), focused: false },
-            Workspace { name: "term".into(), focused: false },
-        ];
-        let node = build_workspace_node(&ws);
-        let children = node["children"].as_array().unwrap();
-        // Title is the first child of each card container
-        assert_eq!(children[0]["children"][0]["text"], "web");
-        assert_eq!(children[1]["children"][0]["text"], "term");
-    }
-
-    #[test]
-    fn build_workspace_node_card_has_subtitle() {
-        let ws = vec![Workspace { name: "1".into(), focused: false }];
-        let node = build_workspace_node(&ws);
-        let card = &node["children"][0];
-        let subtitle = &card["children"][1];
-        assert_eq!(subtitle["type"], "text");
-        // Subtitle should have smaller text than the title
-        let title_tw = card["children"][0]["tw"].as_str().unwrap();
-        let subtitle_tw = subtitle["tw"].as_str().unwrap();
-        assert!(subtitle_tw.contains("text-[11px]") || subtitle_tw.contains("text-[10px]"));
-        assert!(!title_tw.contains("text-[11px]") && !title_tw.contains("text-[10px]"));
-    }
-
-    #[test]
-    fn build_workspace_node_focused_workspace_has_highlight_color() {
+    fn build_workspace_data_includes_name_and_focused() {
         let ws = vec![
             Workspace { name: "1".into(), focused: true },
             Workspace { name: "2".into(), focused: false },
         ];
-        let node = build_workspace_node(&ws);
-        let children = node["children"].as_array().unwrap();
-        // Focused card title is white (max contrast), unfocused is dimmed
-        let focused_title_tw = children[0]["children"][0]["tw"].as_str().unwrap();
-        let unfocused_title_tw = children[1]["children"][0]["tw"].as_str().unwrap();
-        assert!(focused_title_tw.contains("text-white"));
-        assert!(!unfocused_title_tw.contains("text-white"));
-    }
-
-    #[test]
-    fn build_workspace_node_unfocused_workspace_has_muted_color() {
-        let ws = vec![Workspace { name: "1".into(), focused: false }];
-        let node = build_workspace_node(&ws);
-        let children = node["children"].as_array().unwrap();
-        let title_tw = children[0]["children"][0]["tw"].as_str().unwrap();
-        assert!(title_tw.contains("rgba(255,255,255,0.8)"));
-    }
-
-    #[test]
-    fn build_workspace_node_each_child_has_on_click_with_workspace_name() {
-        let ws = vec![
-            Workspace { name: "1: web".into(), focused: false },
-            Workspace { name: "2: term".into(), focused: true },
-        ];
-        let node = build_workspace_node(&ws);
-        let children = node["children"].as_array().unwrap();
-        assert_eq!(children[0]["on_click"]["workspace"], "1: web");
-        assert_eq!(children[1]["on_click"]["workspace"], "2: term");
+        let data = build_workspace_data(&ws);
+        let workspaces = data["workspaces"].as_array().unwrap();
+        assert_eq!(workspaces[0]["name"], "1");
+        assert_eq!(workspaces[0]["focused"], true);
+        assert_eq!(workspaces[1]["name"], "2");
+        assert_eq!(workspaces[1]["focused"], false);
     }
 
     #[test]
@@ -417,4 +330,5 @@ mod tests {
         let json = serde_json::json!({"event": "click", "data": {}});
         assert!(parse_click_event(&json).is_none());
     }
+
 }

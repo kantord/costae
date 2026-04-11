@@ -396,6 +396,33 @@ pub fn spawn_module(bin: &str, script: Option<&str>) -> SpawnedModule {
 /// Spawn a string-streaming subprocess (e.g. a bash script that prints one line per tick).
 /// Each line emitted by the process is sent to `tx` as `(bin, script, line)`.
 /// The returned `Child` must be kept alive; drop it to kill the process.
+pub struct SpawnedBiStream {
+    pub child: std::process::Child,
+    pub event_tx: mpsc::Sender<serde_json::Value>,
+}
+
+/// Spawn a bidirectional module subprocess (stdin for events, stdout for data).
+/// Sends the init event immediately, then forwards stdout lines to `tx` as `(bin, None, line)`.
+pub fn spawn_bi_stream(
+    bin: &str,
+    init_event: &serde_json::Value,
+    tx: mpsc::Sender<(String, Option<String>, String)>,
+    wake_tx: mpsc::SyncSender<()>,
+) -> SpawnedBiStream {
+    let spawned = spawn_module(bin, None);
+    spawned.send_event(init_event);
+    let bin_owned = bin.to_string();
+    thread::spawn(move || {
+        while let Ok(line) = spawned.rx.recv() {
+            if tx.send((bin_owned.clone(), None, line)).is_err() {
+                break;
+            }
+            let _ = wake_tx.try_send(());
+        }
+    });
+    SpawnedBiStream { child: spawned.child, event_tx: spawned.event_tx }
+}
+
 pub fn spawn_string_stream(
     bin: &str,
     script: Option<&str>,

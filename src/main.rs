@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use std::sync::Arc;
 
-use costae::{GlobalContext, RenderCache, find_modules, hit_test, inject_root_bg, load_fonts, parse_layout, preload_layout_images, reconcile_streams, render_frame, solid_color_rgba, spawn_module, spawn_string_stream, substitute, update_module_value, x11_bgrx_to_rgba};
+use costae::{GlobalContext, RenderCache, hit_test, inject_root_bg, load_fonts, parse_layout, preload_layout_images, reconcile_streams, render_frame, solid_color_rgba, spawn_bi_stream, spawn_string_stream, x11_bgrx_to_rgba};
 use takumi::{layout::Viewport, rendering::{RenderOptions, measure_layout}};
 use x11rb::{
     connection::Connection,
@@ -16,17 +16,9 @@ use x11rb::{
 
 const DEFAULT_BAR_WIDTH: u32 = 300;
 
-fn resolve_layout(
-    raw_layout: &Option<serde_json::Value>,
-    module_values: &HashMap<String, serde_json::Value>,
-    module_paths: &[String],
-) -> Option<takumi::layout::node::Node> {
-    if !module_paths.iter().all(|p| module_values.contains_key(p)) {
-        return None;
-    }
+fn resolve_layout(raw_layout: &Option<serde_json::Value>) -> Option<takumi::layout::node::Node> {
     raw_layout.as_ref().and_then(|layout| {
-        let substituted = substitute(layout, module_values);
-        parse_layout(&substituted)
+        parse_layout(layout)
             .map_err(|e| eprintln!("[costae] layout parse error: {e}"))
             .ok()
     })
@@ -133,8 +125,6 @@ fn i3_dpi(conn: &RustConnection, root: Window, screen: &Screen) -> f32 {
 
 fn do_hit_test(
     raw_layout: &Option<serde_json::Value>,
-    module_values: &HashMap<String, serde_json::Value>,
-    module_paths: &[String],
     module_event_txs: &HashMap<String, mpsc::Sender<serde_json::Value>>,
     global: &GlobalContext,
     phys_bar_width: u32,
@@ -147,11 +137,10 @@ fn do_hit_test(
         Some(l) => l,
         None => return,
     };
-    let node = match resolve_layout(raw_layout, module_values, module_paths) {
+    let node = match resolve_layout(raw_layout) {
         Some(n) => n,
         None => return,
     };
-    let substituted = substitute(layout_json, module_values);
 
     let options = RenderOptions::builder()
         .global(global)
@@ -163,10 +152,19 @@ fn do_hit_test(
         Err(_) => return,
     };
 
-    let (hit_path, on_click) = match hit_test(&measured, &substituted, click_x, click_y) {
+    let (hit_path, on_click) = match hit_test(&measured, layout_json, click_x, click_y) {
         Some(r) => r,
         None => return,
     };
+
+    if let Some(channel) = on_click.get("__channel__").and_then(|v| v.as_str()) {
+        if let Some(tx) = module_event_txs.get(channel) {
+            let mut payload = on_click.clone();
+            if let Some(obj) = payload.as_object_mut() { obj.remove("__channel__"); }
+            let _ = tx.send(serde_json::json!({"event": "click", "data": payload}));
+            return;
+        }
+    }
 
     let mut path = hit_path.clone();
     loop {
@@ -255,11 +253,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    let mut module_values: HashMap<String, serde_json::Value> = HashMap::new();
-    let (module_tx, module_rx) = mpsc::channel::<(String, String)>();
-    let mut module_children: Vec<std::process::Child> = Vec::new();
     let mut module_event_txs: HashMap<String, mpsc::Sender<serde_json::Value>> = HashMap::new();
-    let mut module_paths: Vec<String> = Vec::new();
+    let mut bi_stream_children: HashMap<String, std::process::Child> = HashMap::new();
 
     let mut stream_values: HashMap<String, String> = HashMap::new();
     let mut stream_children: HashMap<(String, Option<String>), std::process::Child> = HashMap::new();
@@ -362,12 +357,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(source) => {
                 let t = std::time::Instant::now();
                 match costae::jsx::eval_jsx(&source, jsx_ctx.clone(), &stream_values) {
-                    Ok((value, stream_calls)) => {
+                    Ok((value, stream_calls, module_calls)) => {
                         eprintln!("[costae] jsx eval — {}ms", t.elapsed().as_millis());
                         let (to_spawn, _) = reconcile_streams(&[], &stream_calls);
                         for (bin, script) in to_spawn {
                             let child = spawn_string_stream(&bin, script.as_deref(), stream_tx.clone(), wake_tx.clone());
                             stream_children.insert((bin, script), child);
+                        }
+                        for bin in &module_calls {
+                            if !bi_stream_children.contains_key(bin) {
+                                let bi = spawn_bi_stream(bin, &init_event, stream_tx.clone(), wake_tx.clone());
+                                module_event_txs.insert(bin.clone(), bi.event_tx);
+                                bi_stream_children.insert(bin.clone(), bi.child);
+                            }
                         }
                         raw_layout = Some(value);
                         layout_source = Some(source);
@@ -383,45 +385,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         preload_layout_images(layout, &global);
     }
 
-    let spawn_all_modules = |layout: &serde_json::Value,
-                              tx: &mpsc::Sender<(String, String)>,
-                              wake_tx: &mpsc::SyncSender<()>,
-                              init_event: &serde_json::Value,
-                              children: &mut Vec<std::process::Child>,
-                              event_txs: &mut HashMap<String, mpsc::Sender<serde_json::Value>>,
-                              paths: &mut Vec<String>| {
-        paths.clear();
-        for m in find_modules(layout) {
-            let tx = tx.clone();
-            let wake_tx = wake_tx.clone();
-            let path = m.path.clone();
-            paths.push(path.clone());
-            let module = spawn_module(&m.bin, m.script.as_deref());
-            module.send_event(init_event);
-            event_txs.insert(path.clone(), module.event_tx.clone());
-            children.push(module.child);
-            let rx = module.rx;
-            thread::spawn(move || {
-                while let Ok(line) = rx.recv() {
-                    if tx.send((path.clone(), line)).is_err() {
-                        break;
-                    }
-                    let _ = wake_tx.try_send(());
-                }
-            });
-        }
-    };
-
-    if let Some(ref layout) = raw_layout {
-        spawn_all_modules(layout, &module_tx, &wake_tx, &init_event, &mut module_children, &mut module_event_txs, &mut module_paths);
-    }
-
     let mut render_cache = RenderCache::new(30);
     let mut bgrx: Arc<Vec<u8>> = render_cache.get_or_render(
-        &serde_json::to_value(&module_values).unwrap_or_default(),
+        &serde_json::to_value(&stream_values).unwrap_or_default(),
         || {
             let t = std::time::Instant::now();
-            let layout = resolve_layout(&raw_layout, &module_values, &module_paths);
+            let layout = resolve_layout(&raw_layout);
             eprintln!("[costae] resolve_layout — {}µs", t.elapsed().as_micros());
             render_frame(layout, &global, phys_bar_width, mon_height, dpr)
         },
@@ -432,7 +401,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         if bin_reload_rx.try_recv().is_ok() {
             eprintln!("[costae] binary changed, restarting...");
-            for child in &mut module_children {
+            for child in stream_children.values_mut() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            for child in bi_stream_children.values_mut() {
                 let _ = child.kill();
                 let _ = child.wait();
             }
@@ -453,35 +426,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if reload_rx.try_recv().is_ok() {
             if let Ok(cfg) = costae::load_config(&config_path) {
                 if cfg.config.width != bar_width || cfg.config.outer_gap != outer_gap {
-                    // Bar width changed — the X11 window must be recreated at the new physical
-                    // size, so re-exec the process (same mechanism as binary hot-reload).
                     eprintln!("[costae] bar width changed, restarting...");
-                    for child in &mut module_children {
+                    for child in bi_stream_children.values_mut() {
                         let _ = child.kill();
                         let _ = child.wait();
                     }
                     use std::os::unix::process::CommandExt;
                     let _ = std::process::Command::new(&exe_path).exec();
-                    // exec failed — fall through to in-place reload
                 }
                 raw_layout = cfg.layout;
                 layout_file = cfg.layout_file.clone();
             }
-            // Kill all stream children before re-eval
             for (_, mut child) in stream_children.drain() {
                 let _ = child.kill();
                 let _ = child.wait();
             }
+            for (_, mut child) in bi_stream_children.drain() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            module_event_txs.clear();
             stream_values.clear();
             layout_source = None;
             if let Some(ref path) = layout_file {
                 match std::fs::read_to_string(path) {
                     Ok(source) => match costae::jsx::eval_jsx(&source, jsx_ctx.clone(), &stream_values) {
-                        Ok((value, stream_calls)) => {
+                        Ok((value, stream_calls, module_calls)) => {
                             let (to_spawn, _) = reconcile_streams(&[], &stream_calls);
                             for (bin, script) in to_spawn {
                                 let child = spawn_string_stream(&bin, script.as_deref(), stream_tx.clone(), wake_tx.clone());
                                 stream_children.insert((bin, script), child);
+                            }
+                            for bin in &module_calls {
+                                if !bi_stream_children.contains_key(bin) {
+                                    let bi = spawn_bi_stream(bin, &init_event, stream_tx.clone(), wake_tx.clone());
+                                    module_event_txs.insert(bin.clone(), bi.event_tx);
+                                    bi_stream_children.insert(bin.clone(), bi.child);
+                                }
                             }
                             raw_layout = Some(value);
                             layout_source = Some(source);
@@ -491,44 +472,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Err(e) => { eprintln!("[costae] JSX file error: {e}"); }
                 }
             }
-            for child in &mut module_children {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
-            module_children.clear();
-            module_event_txs.clear();
-            module_values.clear();
             render_cache = RenderCache::new(30);
             if let Some(ref layout) = raw_layout {
                 preload_layout_images(layout, &global);
-                spawn_all_modules(layout, &module_tx, &wake_tx, &init_event, &mut module_children, &mut module_event_txs, &mut module_paths);
             }
             eprintln!("[costae] config reloaded");
             changed = true;
         }
 
-        while let Ok((path, line)) = module_rx.try_recv() {
-            let value = serde_json::from_str(&line)
-                .unwrap_or(serde_json::Value::String(line));
-            if update_module_value(&mut module_values, path, value) {
-                changed = true;
-            }
-        }
-
         while let Ok((bin, script, value)) = stream_rx.try_recv() {
             let key = format!("{}\0{}", bin, script.as_deref().unwrap_or_default());
-            let prev = stream_values.get(&key).cloned();
-            stream_values.insert(key, value);
-            if prev.as_deref() != stream_values.get(&format!("{}\0{}", bin, script.as_deref().unwrap_or_default())).map(|s| s.as_str()) {
+            if stream_values.get(&key).map(|s| s.as_str()) != Some(value.as_str()) {
+                stream_values.insert(key, value);
                 if let Some(ref source) = layout_source {
                     let t = std::time::Instant::now();
                     match costae::jsx::eval_jsx(source, jsx_ctx.clone(), &stream_values) {
-                        Ok((new_layout, new_calls)) => {
+                        Ok((new_layout, new_calls, new_module_calls)) => {
                             eprintln!("[costae] jsx re-eval — {}µs", t.elapsed().as_micros());
                             let current_calls: Vec<_> = stream_children.keys().cloned().collect();
                             let (to_spawn, to_kill) = reconcile_streams(&current_calls, &new_calls);
                             for (b, s) in to_kill {
-                                if let Some(mut child) = stream_children.remove(&(b.clone(), s.clone())) {
+                                if let Some(mut child) = stream_children.remove(&(b, s)) {
                                     let _ = child.kill();
                                     let _ = child.wait();
                                 }
@@ -536,6 +500,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             for (b, s) in to_spawn {
                                 let child = spawn_string_stream(&b, s.as_deref(), stream_tx.clone(), wake_tx.clone());
                                 stream_children.insert((b, s), child);
+                            }
+                            for b in &new_module_calls {
+                                if !bi_stream_children.contains_key(b) {
+                                    let bi = spawn_bi_stream(b, &init_event, stream_tx.clone(), wake_tx.clone());
+                                    module_event_txs.insert(b.clone(), bi.event_tx);
+                                    bi_stream_children.insert(b.clone(), bi.child);
+                                }
                             }
                             raw_layout = Some(new_layout);
                             changed = true;
@@ -556,7 +527,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 x11rb::protocol::Event::ButtonPress(e) => {
                     do_hit_test(
-                        &raw_layout, &module_values, &module_paths, &module_event_txs,
+                        &raw_layout, &module_event_txs,
                         &global, phys_bar_width, mon_height, dpr,
                         e.event_x as f32, e.event_y as f32,
                     );
@@ -588,10 +559,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         if changed {
-            let key = serde_json::to_value(&module_values).unwrap_or_default();
+            let key = serde_json::to_value(&stream_values).unwrap_or_default();
             bgrx = render_cache.get_or_render(&key, || {
                 let t = std::time::Instant::now();
-                let layout = resolve_layout(&raw_layout, &module_values, &module_paths);
+                let layout = resolve_layout(&raw_layout);
                 eprintln!("[costae] resolve_layout — {}µs", t.elapsed().as_micros());
                 render_frame(layout, &global, phys_bar_width, mon_height, dpr)
             });
