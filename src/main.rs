@@ -353,10 +353,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "outer_gap": outer_gap,
         });
         match std::fs::read_to_string(path) {
-            Ok(source) => match costae::jsx::eval_jsx(&source, ctx) {
-                Ok(value) => { raw_layout = Some(value); }
-                Err(e) => { eprintln!("[costae] JSX eval error: {e}"); }
-            },
+            Ok(source) => {
+                let t = std::time::Instant::now();
+                match costae::jsx::eval_jsx(&source, ctx) {
+                    Ok(value) => {
+                        eprintln!("[costae] jsx eval — {}ms", t.elapsed().as_millis());
+                        raw_layout = Some(value);
+                    }
+                    Err(e) => { eprintln!("[costae] JSX eval error: {e}"); }
+                }
+            }
             Err(e) => { eprintln!("[costae] JSX file error: {e}"); }
         }
     }
@@ -401,7 +407,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut render_cache = RenderCache::new(30);
     let mut bgrx: Arc<Vec<u8>> = render_cache.get_or_render(
         &serde_json::to_value(&module_values).unwrap_or_default(),
-        || render_frame(resolve_layout(&raw_layout, &module_values, &module_paths), &global, phys_bar_width, mon_height, dpr),
+        || {
+            let t = std::time::Instant::now();
+            let layout = resolve_layout(&raw_layout, &module_values, &module_paths);
+            eprintln!("[costae] resolve_layout — {}µs", t.elapsed().as_micros());
+            render_frame(layout, &global, phys_bar_width, mon_height, dpr)
+        },
     );
 
     loop {
@@ -527,7 +538,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if changed {
             let key = serde_json::to_value(&module_values).unwrap_or_default();
             bgrx = render_cache.get_or_render(&key, || {
-                render_frame(resolve_layout(&raw_layout, &module_values, &module_paths), &global, phys_bar_width, mon_height, dpr)
+                let t = std::time::Instant::now();
+                let layout = resolve_layout(&raw_layout, &module_values, &module_paths);
+                eprintln!("[costae] resolve_layout — {}µs", t.elapsed().as_micros());
+                render_frame(layout, &global, phys_bar_width, mon_height, dpr)
             });
             conn.put_image(ImageFormat::Z_PIXMAP, win_id, gc, phys_bar_width as u16, mon_height as u16, 0, 0, 0, depth, &bgrx[..])?;
             conn.flush()?;
