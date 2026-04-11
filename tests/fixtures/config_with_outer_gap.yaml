@@ -1,7 +1,0 @@
-config:
-  width: 300
-  outer_gap: 8
-
-layout:
-  type: container
-  children: []

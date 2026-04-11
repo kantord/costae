@@ -3,7 +3,6 @@ pub mod jsx;
 use std::io::{Seek, SeekFrom, Write as IoWrite};
 use std::num::NonZeroUsize;
 use std::os::unix::io::FromRawFd;
-use std::path::{Path, PathBuf};
 use std::sync::{Arc, mpsc};
 use std::thread;
 
@@ -45,7 +44,6 @@ impl RenderCache {
     }
 }
 
-use serde::Deserialize;
 pub use takumi::GlobalContext;
 
 /// Convert X11 ZPixmap BGRX bytes (4 bytes per pixel, X padding ignored) to RGBA
@@ -83,32 +81,6 @@ use takumi::{
     rendering::{RenderOptions, render},
     resources::{font::FontResource, image::ImageSource},
 };
-
-#[derive(Debug, Deserialize, PartialEq)]
-pub struct BarConfig {
-    pub width: u32,
-    #[serde(default)]
-    pub outer_gap: u32,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct Config {
-    pub config: BarConfig,
-    #[serde(default)]
-    pub layout: Option<serde_json::Value>,
-    #[serde(default)]
-    pub layout_file: Option<String>,
-}
-
-pub fn default_config_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_default();
-    PathBuf::from(home).join(".config/costae/config.yaml")
-}
-
-pub fn load_config(path: &Path) -> Result<Config, Box<dyn std::error::Error>> {
-    let content = std::fs::read_to_string(path)?;
-    Ok(serde_yaml::from_str(&content)?)
-}
 
 // --- substitution ---
 
@@ -191,7 +163,8 @@ fn substitute_inner(
 // ---
 
 pub fn parse_layout(value: &serde_json::Value) -> Result<Node, serde_json::Error> {
-    serde_json::from_value(value.clone())
+    use serde::Deserialize;
+    Node::deserialize(value)
 }
 
 /// Returns true if the focused workspace on the given output has any fullscreen window.
@@ -393,6 +366,56 @@ pub fn spawn_module(bin: &str, script: Option<&str>) -> SpawnedModule {
     SpawnedModule { rx, child, event_tx }
 }
 
+/// Spawn a string-streaming subprocess (e.g. a bash script that prints one line per tick).
+/// Each line emitted by the process is sent to `tx` as `(bin, script, line)`.
+/// The returned `Child` must be kept alive; drop it to kill the process.
+pub struct SpawnedBiStream {
+    pub child: std::process::Child,
+    pub event_tx: mpsc::Sender<serde_json::Value>,
+}
+
+/// Spawn a bidirectional module subprocess (stdin for events, stdout for data).
+/// Sends the init event immediately, then forwards stdout lines to `tx` as `(bin, None, line)`.
+pub fn spawn_bi_stream(
+    bin: &str,
+    init_event: &serde_json::Value,
+    tx: mpsc::Sender<(String, Option<String>, String)>,
+    wake_tx: mpsc::SyncSender<()>,
+) -> SpawnedBiStream {
+    let spawned = spawn_module(bin, None);
+    spawned.send_event(init_event);
+    let bin_owned = bin.to_string();
+    thread::spawn(move || {
+        while let Ok(line) = spawned.rx.recv() {
+            if tx.send((bin_owned.clone(), None, line)).is_err() {
+                break;
+            }
+            let _ = wake_tx.try_send(());
+        }
+    });
+    SpawnedBiStream { child: spawned.child, event_tx: spawned.event_tx }
+}
+
+pub fn spawn_string_stream(
+    bin: &str,
+    script: Option<&str>,
+    tx: mpsc::Sender<(String, Option<String>, String)>,
+    wake_tx: mpsc::SyncSender<()>,
+) -> std::process::Child {
+    let spawned = spawn_module(bin, script);
+    let bin_owned = bin.to_string();
+    let script_owned = script.map(str::to_string);
+    thread::spawn(move || {
+        while let Ok(line) = spawned.rx.recv() {
+            if tx.send((bin_owned.clone(), script_owned.clone(), line)).is_err() {
+                break;
+            }
+            let _ = wake_tx.try_send(());
+        }
+    });
+    spawned.child
+}
+
 pub fn preload_layout_images(layout: &serde_json::Value, global: &GlobalContext) {
     fn walk(value: &serde_json::Value, srcs: &mut Vec<String>) {
         match value {
@@ -431,16 +454,48 @@ pub fn preload_layout_images(layout: &serde_json::Value, global: &GlobalContext)
     }
 }
 
-/// Compute `_NET_WM_STRUT_PARTIAL` values for a left-side bar.
+/// Compute `_NET_WM_STRUT_PARTIAL` values for a panel anchored to a screen edge.
 ///
-/// The 12-element array follows the EWMH spec: left, right, top, bottom,
-/// then four pairs of start/end coordinates for each edge strut.
-/// We only populate the left strut; everything else is zero.
-pub fn strut_partial_values(mon_x: i16, mon_y: i16, bar_width: u32, mon_height: u32) -> [u32; 12] {
+/// The 12-element array follows the EWMH spec:
+///   [0] left, [1] right, [2] top, [3] bottom,
+///   [4] left_start_y,  [5] left_end_y,
+///   [6] right_start_y, [7] right_end_y,
+///   [8] top_start_x,   [9] top_end_x,
+///   [10] bottom_start_x, [11] bottom_end_x
+///
+/// All values are in physical pixels, absolute from the screen origin.
+pub fn strut_partial_values_for_anchor(
+    anchor: PanelAnchor,
+    mon_x: i16,
+    mon_y: i16,
+    _mon_width: u32,
+    mon_height: u32,
+    phys_panel_width: u32,
+    phys_panel_height: u32,
+) -> [u32; 12] {
     let mut v = [0u32; 12];
-    v[0] = mon_x as u32 + bar_width; // left: absolute pixels from screen left edge
-    v[4] = mon_y as u32;             // left_start_y
-    v[5] = mon_y as u32 + mon_height.saturating_sub(1); // left_end_y
+    match anchor {
+        PanelAnchor::Left => {
+            v[0] = mon_x as u32 + phys_panel_width;
+            v[4] = mon_y as u32;
+            v[5] = mon_y as u32 + mon_height.saturating_sub(1);
+        }
+        PanelAnchor::Right => {
+            v[1] = phys_panel_width; // measured from right screen edge
+            v[6] = mon_y as u32;
+            v[7] = mon_y as u32 + mon_height.saturating_sub(1);
+        }
+        PanelAnchor::Top => {
+            v[2] = mon_y as u32 + phys_panel_height;
+            v[8] = mon_x as u32;
+            v[9] = mon_x as u32 + _mon_width.saturating_sub(1);
+        }
+        PanelAnchor::Bottom => {
+            v[3] = phys_panel_height; // measured from bottom screen edge
+            v[10] = mon_x as u32;
+            v[11] = mon_x as u32 + _mon_width.saturating_sub(1);
+        }
+    }
     v
 }
 
@@ -459,6 +514,132 @@ pub fn solid_color_rgba(pixel: u32, width: u32, height: u32) -> Vec<u8> {
     rgba
 }
 
+/// Which screen edge a panel is anchored to. Drives both window placement and EWMH strut
+/// reservation. Panels without an anchor are free-floating (no strut).
+#[derive(Debug, PartialEq, Clone)]
+pub enum PanelAnchor {
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
+impl PanelAnchor {
+    fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "left"   => Some(PanelAnchor::Left),
+            "right"  => Some(PanelAnchor::Right),
+            "top"    => Some(PanelAnchor::Top),
+            "bottom" => Some(PanelAnchor::Bottom),
+            _        => None,
+        }
+    }
+}
+
+/// Logical-pixel description of a `<panel>` node extracted from the JSX root.
+/// All dimensions are in logical pixels; the display backend scales to physical pixels.
+pub struct PanelSpec {
+    pub id: String,
+    pub anchor: Option<PanelAnchor>,
+    /// Logical width in CSS px (same unit as i3 config / Tailwind values).
+    pub width: u32,
+    pub height: u32,
+    pub x: i32,
+    pub y: i32,
+    /// i3-specific gap to reserve around the screen edges. Temporary until a
+    /// cleaner per-WM mechanism exists.
+    pub outer_gap: u32,
+    /// RandR output name to place this panel on (e.g. "DP-2"). None = primary output.
+    pub output: Option<String>,
+    /// When true the window is stacked above other windows (for floating overlays like
+    /// notifications). When false (default) the window sits below tiled content.
+    pub above: bool,
+    /// The layout subtree that lives inside this panel (first child of the panel node).
+    pub content: serde_json::Value,
+}
+
+/// Parse the JSX evaluator's output into a list of panel specs.
+///
+/// Expects the root value to be `{ type: "root", children: [...panels] }`. Each panel
+/// child must have at minimum `id`, `width`, and `height`. Returns an error string if
+/// the root type is wrong or a required field is missing.
+pub fn parse_root_node(root: &serde_json::Value) -> Result<Vec<PanelSpec>, String> {
+    if root.get("type").and_then(|t| t.as_str()) != Some("root") {
+        return Err(format!("expected root node, got {:?}", root.get("type")));
+    }
+    let children = root.get("children")
+        .and_then(|c| c.as_array())
+        .ok_or_else(|| "root node has no children array".to_string())?;
+
+    children.iter().enumerate().filter_map(|(i, panel)| {
+        if panel.get("type").and_then(|t| t.as_str()) != Some("panel") {
+            return None; // skip non-panel children silently
+        }
+        Some((|| -> Result<PanelSpec, String> {
+            let id = panel.get("id")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| format!("panel[{i}] missing id"))?
+                .to_string();
+            let width = panel.get("width")
+                .and_then(|v| v.as_u64())
+                .ok_or_else(|| format!("panel '{id}' missing width"))? as u32;
+            let height = panel.get("height")
+                .and_then(|v| v.as_u64())
+                .ok_or_else(|| format!("panel '{id}' missing height"))? as u32;
+            let anchor = panel.get("anchor")
+                .and_then(|v| v.as_str())
+                .and_then(PanelAnchor::from_str);
+            let x = panel.get("x").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+            let y = panel.get("y").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+            let outer_gap = panel.get("outer_gap")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u32;
+            let output = panel.get("output")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let above = panel.get("above")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            // The panel's layout content: first child (typically a root container).
+            let content = panel.get("children")
+                .and_then(|c| c.as_array())
+                .and_then(|c| c.first())
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            Ok(PanelSpec { id, anchor, width, height, x, y, outer_gap, output, above, content })
+        })())
+    }).collect()
+}
+
+/// Partition new panel specs against currently-live panel ids.
+///
+/// Returns `(to_create, to_update, to_destroy)` where:
+/// - `to_create`: specs whose id is not in `existing_ids` — a new X11 window must be created
+/// - `to_update`: specs whose id IS in `existing_ids` — re-render in the existing window
+/// - `to_destroy`: existing ids not present in `new_specs` — the X11 window must be destroyed
+pub fn reconcile_panels<'a>(
+    existing_ids: &[&str],
+    new_specs: &'a [PanelSpec],
+) -> (Vec<&'a PanelSpec>, Vec<&'a PanelSpec>, Vec<String>) {
+    let new_ids: std::collections::HashSet<&str> = new_specs.iter().map(|p| p.id.as_str()).collect();
+    let existing_set: std::collections::HashSet<&str> = existing_ids.iter().copied().collect();
+    let to_create = new_specs.iter().filter(|p| !existing_set.contains(p.id.as_str())).collect();
+    let to_update = new_specs.iter().filter(|p| existing_set.contains(p.id.as_str())).collect();
+    let to_destroy = existing_ids.iter().filter(|id| !new_ids.contains(*id)).map(|s| s.to_string()).collect();
+    (to_create, to_update, to_destroy)
+}
+
+pub fn reconcile_streams(
+    old: &[(String, Option<String>)],
+    new: &[(String, Option<String>)],
+) -> (Vec<(String, Option<String>)>, Vec<(String, Option<String>)>) {
+    let old_set: std::collections::HashSet<_> = old.iter().collect();
+    let new_set: std::collections::HashSet<_> = new.iter().collect();
+    let to_spawn = new.iter().filter(|x| !old_set.contains(x)).cloned().collect();
+    let to_kill = old.iter().filter(|x| !new_set.contains(x)).cloned().collect();
+    (to_spawn, to_kill)
+}
+
 pub fn load_fonts(global: &mut GlobalContext) {
     for path in [
         "/usr/share/fonts/TTF/JetBrainsMono-Regular.ttf",
@@ -467,5 +648,107 @@ pub fn load_fonts(global: &mut GlobalContext) {
         if let Ok(bytes) = std::fs::read(path) {
             let _ = global.font_context.load_and_store(FontResource::new(bytes));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_root_node_extracts_panel_specs() {
+        let root = serde_json::json!({
+            "type": "root",
+            "children": [{
+                "type": "panel",
+                "id": "sidebar",
+                "anchor": "left",
+                "width": 250,
+                "height": 2160,
+                "outer_gap": 8,
+                "children": [{ "type": "container" }]
+            }]
+        });
+        let panels = parse_root_node(&root).unwrap();
+        assert_eq!(panels.len(), 1);
+        assert_eq!(panels[0].id, "sidebar");
+        assert_eq!(panels[0].anchor, Some(PanelAnchor::Left));
+        assert_eq!(panels[0].width, 250);
+        assert_eq!(panels[0].height, 2160);
+        assert_eq!(panels[0].outer_gap, 8);
+    }
+
+    #[test]
+    fn parse_root_node_rejects_non_root_type() {
+        let node = serde_json::json!({ "type": "container" });
+        assert!(parse_root_node(&node).is_err());
+    }
+
+    #[test]
+    fn parse_root_node_defaults_x_y_outer_gap_to_zero() {
+        let root = serde_json::json!({
+            "type": "root",
+            "children": [{
+                "type": "panel",
+                "id": "sidebar",
+                "width": 250,
+                "height": 2160,
+                "children": []
+            }]
+        });
+        let panels = parse_root_node(&root).unwrap();
+        assert_eq!(panels[0].x, 0);
+        assert_eq!(panels[0].y, 0);
+        assert_eq!(panels[0].outer_gap, 0);
+        assert_eq!(panels[0].anchor, None);
+    }
+
+    #[test]
+    fn strut_for_anchor_left_sets_left_strut() {
+        let v = strut_partial_values_for_anchor(PanelAnchor::Left, 0, 0, 1920, 2160, 365, 2160);
+        assert_eq!(v[0], 365); // left strut
+        assert_eq!(v[1], 0);   // right strut
+        assert_eq!(v[2], 0);   // top strut
+        assert_eq!(v[3], 0);   // bottom strut
+        assert_eq!(v[4], 0);   // left_start_y
+        assert_eq!(v[5], 2159); // left_end_y
+    }
+
+    #[test]
+    fn strut_for_anchor_top_sets_top_strut() {
+        let v = strut_partial_values_for_anchor(PanelAnchor::Top, 0, 0, 1920, 2160, 1920, 32);
+        assert_eq!(v[0], 0);
+        assert_eq!(v[2], 32);  // top strut
+        assert_eq!(v[8], 0);   // top_start_x
+        assert_eq!(v[9], 1919); // top_end_x
+    }
+
+    #[test]
+    fn reconcile_panels_partitions_specs_into_create_update_destroy() {
+        fn spec(id: &str) -> PanelSpec {
+            PanelSpec { id: id.to_string(), anchor: None, width: 100, height: 100, x: 0, y: 0, outer_gap: 0, output: None, above: false, content: serde_json::Value::Null }
+        }
+        let new_specs = vec![spec("sidebar"), spec("topbar")];
+        let (to_create, to_update, to_destroy) = reconcile_panels(&["sidebar", "bottombar"], &new_specs);
+        assert_eq!(to_create.len(), 1);
+        assert_eq!(to_create[0].id, "topbar");
+        assert_eq!(to_update.len(), 1);
+        assert_eq!(to_update[0].id, "sidebar");
+        assert_eq!(to_destroy, vec!["bottombar".to_string()]);
+    }
+
+    #[test]
+    fn reconcile_streams_returns_additions_and_removals() {
+        let old = vec![
+            ("bash".to_string(), Some("script_a".to_string())),
+            ("bash".to_string(), Some("script_b".to_string())),
+        ];
+        let new_calls = vec![
+            ("bash".to_string(), Some("script_b".to_string())),
+            ("bash".to_string(), Some("script_c".to_string())),
+        ];
+        let (to_spawn, to_kill) = reconcile_streams(&old, &new_calls);
+        assert_eq!(to_spawn, vec![("bash".to_string(), Some("script_c".to_string()))]);
+        assert_eq!(to_kill, vec![("bash".to_string(), Some("script_a".to_string()))]);
     }
 }

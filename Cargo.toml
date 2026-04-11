@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "costae-i3", "costae-luax"]
+members = [".", "costae-i3", "costae-luax", "costae-notify"]
 resolver = "2"
 
 [package]
@@ -21,7 +21,6 @@ takumi = "1.0.1"
 x11rb = { version = "0.13", features = ["allow-unsafe-code", "randr"] }
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }
-serde_yaml = "0.9"
 libc = "0.2"
 lru = "0.12"
 json-canon = "0.1"
@@ -31,6 +30,7 @@ oxc_codegen = "0.124"
 oxc_allocator = "0.124"
 oxc_semantic = "0.124"
 oxc_span = "0.124"
+oxc_ast = "0.124"
 
 [dev-dependencies]
 image = "0.25"
