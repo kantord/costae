@@ -17,13 +17,13 @@ fn loads_bar_width_from_config_section() {
 #[test]
 fn layout_is_parsed_as_json_value() {
     let config = load_config(&fixture("config.yaml")).expect("should load config");
-    assert_eq!(config.layout["type"], "container");
+    assert_eq!(config.layout.as_ref().unwrap()["type"], "container");
 }
 
 #[test]
 fn layout_preserves_at_module_reference() {
     let config = load_config(&fixture("config.yaml")).expect("should load config");
-    let children = config.layout["children"].as_array().expect("children should be array");
+    let children = config.layout.as_ref().unwrap()["children"].as_array().expect("children should be array");
     assert_eq!(children[0]["type"], "@~/.config/costae/modules/workspaces");
 }
 

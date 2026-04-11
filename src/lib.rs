@@ -1,3 +1,5 @@
+pub mod jsx;
+
 use std::io::{Seek, SeekFrom, Write as IoWrite};
 use std::num::NonZeroUsize;
 use std::os::unix::io::FromRawFd;
@@ -92,7 +94,10 @@ pub struct BarConfig {
 #[derive(Debug, Deserialize)]
 pub struct Config {
     pub config: BarConfig,
-    pub layout: serde_json::Value,
+    #[serde(default)]
+    pub layout: Option<serde_json::Value>,
+    #[serde(default)]
+    pub layout_file: Option<String>,
 }
 
 pub fn default_config_path() -> PathBuf {

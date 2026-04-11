@@ -185,19 +185,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let exe_path = std::env::current_exe().unwrap_or_default();
 
     let config_path = costae::default_config_path();
-    let (bar_width, outer_gap, mut raw_layout) = if config_path.exists() {
+    let (bar_width, outer_gap, mut raw_layout, mut layout_file) = if config_path.exists() {
         match costae::load_config(&config_path) {
             Ok(cfg) => {
                 eprintln!("[costae] config loaded: width={}, outer_gap={}", cfg.config.width, cfg.config.outer_gap);
-                (cfg.config.width, cfg.config.outer_gap, Some(cfg.layout))
+                (cfg.config.width, cfg.config.outer_gap, cfg.layout, cfg.layout_file)
             }
             Err(e) => {
                 eprintln!("[costae] config error: {e}, using defaults");
-                (DEFAULT_BAR_WIDTH, 0, None)
+                (DEFAULT_BAR_WIDTH, 0, None, None)
             }
         }
     } else {
-        (DEFAULT_BAR_WIDTH, 0, None)
+        (DEFAULT_BAR_WIDTH, 0, None, None)
     };
 
     let (wake_tx, wake_rx) = mpsc::sync_channel::<()>(1);
@@ -300,9 +300,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     let mut global = GlobalContext::default();
     load_fonts(&mut global);
-    if let Some(ref layout) = raw_layout {
-        preload_layout_images(layout, &global);
-    }
 
     // Watch for wallpaper changes: wallpaper setters (feh, nitrogen, etc.) signal a new
     // wallpaper by updating the _XROOTPMAP_ID property on the root window.
@@ -347,6 +344,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "output": output_name,
         "dpi": dpi
     });
+
+    if let Some(ref path) = layout_file {
+        let ctx = serde_json::json!({
+            "output": output_name,
+            "dpi": dpi,
+            "width": bar_width,
+            "outer_gap": outer_gap,
+        });
+        match std::fs::read_to_string(path) {
+            Ok(source) => match costae::jsx::eval_jsx(&source, ctx) {
+                Ok(value) => { raw_layout = Some(value); }
+                Err(e) => { eprintln!("[costae] JSX eval error: {e}"); }
+            },
+            Err(e) => { eprintln!("[costae] JSX file error: {e}"); }
+        }
+    }
+
+    if let Some(ref layout) = raw_layout {
+        preload_layout_images(layout, &global);
+    }
 
     let spawn_all_modules = |layout: &serde_json::Value,
                               tx: &mpsc::Sender<(String, String)>,
@@ -424,7 +441,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let _ = std::process::Command::new(&exe_path).exec();
                     // exec failed — fall through to in-place reload
                 }
-                raw_layout = Some(cfg.layout);
+                raw_layout = cfg.layout;
+                layout_file = cfg.layout_file.clone();
+            }
+            if let Some(ref path) = layout_file {
+                let ctx = serde_json::json!({
+                    "output": output_name,
+                    "dpi": dpi,
+                    "width": bar_width,
+                    "outer_gap": outer_gap,
+                });
+                match std::fs::read_to_string(path) {
+                    Ok(source) => match costae::jsx::eval_jsx(&source, ctx) {
+                        Ok(value) => { raw_layout = Some(value); }
+                        Err(e) => { eprintln!("[costae] JSX eval error: {e}"); }
+                    },
+                    Err(e) => { eprintln!("[costae] JSX file error: {e}"); }
+                }
             }
             for child in &mut module_children {
                 let _ = child.kill();
