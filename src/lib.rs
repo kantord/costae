@@ -393,6 +393,29 @@ pub fn spawn_module(bin: &str, script: Option<&str>) -> SpawnedModule {
     SpawnedModule { rx, child, event_tx }
 }
 
+/// Spawn a string-streaming subprocess (e.g. a bash script that prints one line per tick).
+/// Each line emitted by the process is sent to `tx` as `(bin, script, line)`.
+/// The returned `Child` must be kept alive; drop it to kill the process.
+pub fn spawn_string_stream(
+    bin: &str,
+    script: Option<&str>,
+    tx: mpsc::Sender<(String, Option<String>, String)>,
+    wake_tx: mpsc::SyncSender<()>,
+) -> std::process::Child {
+    let spawned = spawn_module(bin, script);
+    let bin_owned = bin.to_string();
+    let script_owned = script.map(str::to_string);
+    thread::spawn(move || {
+        while let Ok(line) = spawned.rx.recv() {
+            if tx.send((bin_owned.clone(), script_owned.clone(), line)).is_err() {
+                break;
+            }
+            let _ = wake_tx.try_send(());
+        }
+    });
+    spawned.child
+}
+
 pub fn preload_layout_images(layout: &serde_json::Value, global: &GlobalContext) {
     fn walk(value: &serde_json::Value, srcs: &mut Vec<String>) {
         match value {
@@ -459,6 +482,17 @@ pub fn solid_color_rgba(pixel: u32, width: u32, height: u32) -> Vec<u8> {
     rgba
 }
 
+pub fn reconcile_streams(
+    old: &[(String, Option<String>)],
+    new: &[(String, Option<String>)],
+) -> (Vec<(String, Option<String>)>, Vec<(String, Option<String>)>) {
+    let old_set: std::collections::HashSet<_> = old.iter().collect();
+    let new_set: std::collections::HashSet<_> = new.iter().collect();
+    let to_spawn = new.iter().filter(|x| !old_set.contains(x)).cloned().collect();
+    let to_kill = old.iter().filter(|x| !new_set.contains(x)).cloned().collect();
+    (to_spawn, to_kill)
+}
+
 pub fn load_fonts(global: &mut GlobalContext) {
     for path in [
         "/usr/share/fonts/TTF/JetBrainsMono-Regular.ttf",
@@ -467,5 +501,25 @@ pub fn load_fonts(global: &mut GlobalContext) {
         if let Ok(bytes) = std::fs::read(path) {
             let _ = global.font_context.load_and_store(FontResource::new(bytes));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reconcile_streams_returns_additions_and_removals() {
+        let old = vec![
+            ("bash".to_string(), Some("script_a".to_string())),
+            ("bash".to_string(), Some("script_b".to_string())),
+        ];
+        let new_calls = vec![
+            ("bash".to_string(), Some("script_b".to_string())),
+            ("bash".to_string(), Some("script_c".to_string())),
+        ];
+        let (to_spawn, to_kill) = reconcile_streams(&old, &new_calls);
+        assert_eq!(to_spawn, vec![("bash".to_string(), Some("script_c".to_string()))]);
+        assert_eq!(to_kill, vec![("bash".to_string(), Some("script_a".to_string()))]);
     }
 }

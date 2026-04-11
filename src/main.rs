@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use std::sync::Arc;
 
-use costae::{GlobalContext, RenderCache, find_modules, hit_test, inject_root_bg, load_fonts, parse_layout, preload_layout_images, render_frame, solid_color_rgba, spawn_module, substitute, update_module_value, x11_bgrx_to_rgba};
+use costae::{GlobalContext, RenderCache, find_modules, hit_test, inject_root_bg, load_fonts, parse_layout, preload_layout_images, reconcile_streams, render_frame, solid_color_rgba, spawn_module, spawn_string_stream, substitute, update_module_value, x11_bgrx_to_rgba};
 use takumi::{layout::Viewport, rendering::{RenderOptions, measure_layout}};
 use x11rb::{
     connection::Connection,
@@ -261,6 +261,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut module_event_txs: HashMap<String, mpsc::Sender<serde_json::Value>> = HashMap::new();
     let mut module_paths: Vec<String> = Vec::new();
 
+    let mut stream_values: HashMap<String, String> = HashMap::new();
+    let mut stream_children: HashMap<(String, Option<String>), std::process::Child> = HashMap::new();
+    let (stream_tx, stream_rx) = mpsc::channel::<(String, Option<String>, String)>();
+    let mut layout_source: Option<String> = None;
+
     let (conn, screen_num) = RustConnection::connect(None)?;
     let screen = &conn.setup().roots[screen_num];
     let depth = screen.root_depth;
@@ -345,20 +350,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "dpi": dpi
     });
 
+    let jsx_ctx = serde_json::json!({
+        "output": output_name,
+        "dpi": dpi,
+        "width": bar_width,
+        "outer_gap": outer_gap,
+    });
+
     if let Some(ref path) = layout_file {
-        let ctx = serde_json::json!({
-            "output": output_name,
-            "dpi": dpi,
-            "width": bar_width,
-            "outer_gap": outer_gap,
-        });
         match std::fs::read_to_string(path) {
             Ok(source) => {
                 let t = std::time::Instant::now();
-                match costae::jsx::eval_jsx(&source, ctx) {
-                    Ok(value) => {
+                match costae::jsx::eval_jsx(&source, jsx_ctx.clone(), &stream_values) {
+                    Ok((value, stream_calls)) => {
                         eprintln!("[costae] jsx eval — {}ms", t.elapsed().as_millis());
+                        let (to_spawn, _) = reconcile_streams(&[], &stream_calls);
+                        for (bin, script) in to_spawn {
+                            let child = spawn_string_stream(&bin, script.as_deref(), stream_tx.clone(), wake_tx.clone());
+                            stream_children.insert((bin, script), child);
+                        }
                         raw_layout = Some(value);
+                        layout_source = Some(source);
                     }
                     Err(e) => { eprintln!("[costae] JSX eval error: {e}"); }
                 }
@@ -455,16 +467,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 raw_layout = cfg.layout;
                 layout_file = cfg.layout_file.clone();
             }
+            // Kill all stream children before re-eval
+            for (_, mut child) in stream_children.drain() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            stream_values.clear();
+            layout_source = None;
             if let Some(ref path) = layout_file {
-                let ctx = serde_json::json!({
-                    "output": output_name,
-                    "dpi": dpi,
-                    "width": bar_width,
-                    "outer_gap": outer_gap,
-                });
                 match std::fs::read_to_string(path) {
-                    Ok(source) => match costae::jsx::eval_jsx(&source, ctx) {
-                        Ok(value) => { raw_layout = Some(value); }
+                    Ok(source) => match costae::jsx::eval_jsx(&source, jsx_ctx.clone(), &stream_values) {
+                        Ok((value, stream_calls)) => {
+                            let (to_spawn, _) = reconcile_streams(&[], &stream_calls);
+                            for (bin, script) in to_spawn {
+                                let child = spawn_string_stream(&bin, script.as_deref(), stream_tx.clone(), wake_tx.clone());
+                                stream_children.insert((bin, script), child);
+                            }
+                            raw_layout = Some(value);
+                            layout_source = Some(source);
+                        }
                         Err(e) => { eprintln!("[costae] JSX eval error: {e}"); }
                     },
                     Err(e) => { eprintln!("[costae] JSX file error: {e}"); }
@@ -491,6 +512,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .unwrap_or(serde_json::Value::String(line));
             if update_module_value(&mut module_values, path, value) {
                 changed = true;
+            }
+        }
+
+        while let Ok((bin, script, value)) = stream_rx.try_recv() {
+            let key = format!("{}\0{}", bin, script.as_deref().unwrap_or_default());
+            let prev = stream_values.get(&key).cloned();
+            stream_values.insert(key, value);
+            if prev.as_deref() != stream_values.get(&format!("{}\0{}", bin, script.as_deref().unwrap_or_default())).map(|s| s.as_str()) {
+                if let Some(ref source) = layout_source {
+                    let t = std::time::Instant::now();
+                    match costae::jsx::eval_jsx(source, jsx_ctx.clone(), &stream_values) {
+                        Ok((new_layout, new_calls)) => {
+                            eprintln!("[costae] jsx re-eval — {}µs", t.elapsed().as_micros());
+                            let current_calls: Vec<_> = stream_children.keys().cloned().collect();
+                            let (to_spawn, to_kill) = reconcile_streams(&current_calls, &new_calls);
+                            for (b, s) in to_kill {
+                                if let Some(mut child) = stream_children.remove(&(b.clone(), s.clone())) {
+                                    let _ = child.kill();
+                                    let _ = child.wait();
+                                }
+                            }
+                            for (b, s) in to_spawn {
+                                let child = spawn_string_stream(&b, s.as_deref(), stream_tx.clone(), wake_tx.clone());
+                                stream_children.insert((b, s), child);
+                            }
+                            raw_layout = Some(new_layout);
+                            changed = true;
+                        }
+                        Err(e) => { eprintln!("[costae] JSX re-eval error: {e}"); }
+                    }
+                }
             }
         }
 
