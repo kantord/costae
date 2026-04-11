@@ -137,8 +137,9 @@ fn do_hit_test(
     module_paths: &[String],
     module_event_txs: &HashMap<String, mpsc::Sender<serde_json::Value>>,
     global: &GlobalContext,
-    bar_width: u32,
+    phys_bar_width: u32,
     mon_height: u32,
+    dpr: f32,
     click_x: f32,
     click_y: f32,
 ) {
@@ -154,7 +155,7 @@ fn do_hit_test(
 
     let options = RenderOptions::builder()
         .global(global)
-        .viewport(Viewport::new((Some(bar_width), Some(mon_height))))
+        .viewport(Viewport::new((Some(phys_bar_width), Some(mon_height))).with_device_pixel_ratio(dpr))
         .node(node)
         .build();
     let measured = match measure_layout(options) {
@@ -272,7 +273,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let crtc_info = conn.randr_get_crtc_info(output_info.crtc, 0)?.reply()?;
     let mon_x = crtc_info.x;
     let mon_y = crtc_info.y;
+    // mon_height is physical pixels (from CRTC); bar_width is logical pixels (from config).
+    // We match i3's scaling: dpr = dpi/96, so config px values have the same meaning as in i3.
     let mon_height = crtc_info.height as u32;
+    // Scale bar_width (logical CSS px from config) to physical pixels, matching i3's DPI scaling.
+    let dpr = dpi / 96.0;
+    let phys_bar_width = (bar_width as f32 * dpr).round() as u32;
 
     let win_id = conn.generate_id()?;
     conn.create_window(
@@ -281,7 +287,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         screen.root,
         mon_x,
         mon_y,
-        bar_width as u16,
+        phys_bar_width as u16,
         mon_height as u16,
         0,
         WindowClass::INPUT_OUTPUT,
@@ -311,8 +317,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Sample before mapping — X11 does not maintain a backing store for root window pixels
     // once a window covers them (no compositor). Reading after map_window returns black.
-    eprintln!("[costae] sampling root bg at ({mon_x},{mon_y}) size {bar_width}×{mon_height}");
-    sample_and_inject_root_bg(&conn, screen.root, &global, mon_x, mon_y, bar_width, mon_height, xrootpmap_atom);
+    eprintln!("[costae] sampling root bg at ({mon_x},{mon_y}) size {phys_bar_width}×{mon_height}");
+    sample_and_inject_root_bg(&conn, screen.root, &global, mon_x, mon_y, phys_bar_width, mon_height, xrootpmap_atom);
 
     conn.map_window(win_id)?;
     conn.configure_window(win_id, &ConfigureWindowAux::new().stack_mode(StackMode::BELOW))?;
@@ -336,7 +342,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let init_event = serde_json::json!({
         "type": "init",
-        "config": {"width": bar_width},
+        "config": {"width": phys_bar_width},
         "output": output_name,
         "dpi": dpi
     });
@@ -377,7 +383,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut render_cache = RenderCache::new(30);
     let mut bgrx: Arc<Vec<u8>> = render_cache.get_or_render(
         &serde_json::to_value(&module_values).unwrap_or_default(),
-        || render_frame(resolve_layout(&raw_layout, &module_values, &module_paths), &global, bar_width, mon_height),
+        || render_frame(resolve_layout(&raw_layout, &module_values, &module_paths), &global, phys_bar_width, mon_height, dpr),
     );
 
     loop {
@@ -436,13 +442,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         while let Some(event) = conn.poll_for_event()? {
             match event {
                 x11rb::protocol::Event::Expose(_) => {
-                    conn.put_image(ImageFormat::Z_PIXMAP, win_id, gc, bar_width as u16, mon_height as u16, 0, 0, 0, depth, &bgrx[..])?;
+                    conn.put_image(ImageFormat::Z_PIXMAP, win_id, gc, phys_bar_width as u16, mon_height as u16, 0, 0, 0, depth, &bgrx[..])?;
                     conn.flush()?;
                 }
                 x11rb::protocol::Event::ButtonPress(e) => {
                     do_hit_test(
                         &raw_layout, &module_values, &module_paths, &module_event_txs,
-                        &global, bar_width, mon_height,
+                        &global, phys_bar_width, mon_height, dpr,
                         e.event_x as f32, e.event_y as f32,
                     );
                 }
@@ -475,9 +481,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if changed {
             let key = serde_json::to_value(&module_values).unwrap_or_default();
             bgrx = render_cache.get_or_render(&key, || {
-                render_frame(resolve_layout(&raw_layout, &module_values, &module_paths), &global, bar_width, mon_height)
+                render_frame(resolve_layout(&raw_layout, &module_values, &module_paths), &global, phys_bar_width, mon_height, dpr)
             });
-            conn.put_image(ImageFormat::Z_PIXMAP, win_id, gc, bar_width as u16, mon_height as u16, 0, 0, 0, depth, &bgrx[..])?;
+            conn.put_image(ImageFormat::Z_PIXMAP, win_id, gc, phys_bar_width as u16, mon_height as u16, 0, 0, 0, depth, &bgrx[..])?;
             conn.flush()?;
         }
 

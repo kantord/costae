@@ -299,11 +299,17 @@ pub fn update_module_value(
     true
 }
 
-pub fn render_frame(layout: Option<Node>, global: &GlobalContext, width: u32, height: u32) -> Vec<u8> {
+/// Render `layout` into a BGRX framebuffer.
+///
+/// `width` and `height` are **physical** pixels — the X11 window dimensions.
+/// `dpr = dpi / 96.0` scales CSS `px` units so that `1px` in the config equals
+/// one logical pixel regardless of display density, matching i3's own scaling.
+/// The returned buffer is always `width × height × 4` bytes (BGRX).
+pub fn render_frame(layout: Option<Node>, global: &GlobalContext, width: u32, height: u32, dpr: f32) -> Vec<u8> {
     let node = layout.unwrap_or_else(|| Node::container(vec![]));
     let options = RenderOptions::builder()
         .global(global)
-        .viewport(Viewport::new((Some(width), Some(height))))
+        .viewport(Viewport::new((Some(width), Some(height))).with_device_pixel_ratio(dpr))
         .node(node)
         .build();
     let rgba = render(options).expect("render").into_raw();
