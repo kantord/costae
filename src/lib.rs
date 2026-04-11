@@ -431,6 +431,21 @@ pub fn strut_partial_values(mon_x: i16, mon_y: i16, bar_width: u32, mon_height: 
     v
 }
 
+/// Convert an X11 TrueColor pixel value (0x00RRGGBB for standard 24bpp visuals)
+/// to a flat RGBA buffer of `width × height` pixels, all the same solid color.
+/// Used as a fallback when no wallpaper pixmap is set (e.g. i3 solid background).
+pub fn solid_color_rgba(pixel: u32, width: u32, height: u32) -> Vec<u8> {
+    let r = ((pixel >> 16) & 0xFF) as u8;
+    let g = ((pixel >> 8) & 0xFF) as u8;
+    let b = (pixel & 0xFF) as u8;
+    let count = (width * height) as usize;
+    let mut rgba = Vec::with_capacity(count * 4);
+    for _ in 0..count {
+        rgba.extend_from_slice(&[r, g, b, 0xFF]);
+    }
+    rgba
+}
+
 pub fn load_fonts(global: &mut GlobalContext) {
     for path in [
         "/usr/share/fonts/TTF/JetBrainsMono-Regular.ttf",

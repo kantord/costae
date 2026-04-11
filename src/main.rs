@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use std::sync::Arc;
 
-use costae::{GlobalContext, RenderCache, find_modules, hit_test, inject_root_bg, load_fonts, parse_layout, preload_layout_images, render_frame, spawn_module, substitute, update_module_value, x11_bgrx_to_rgba};
+use costae::{GlobalContext, RenderCache, find_modules, hit_test, inject_root_bg, load_fonts, parse_layout, preload_layout_images, render_frame, solid_color_rgba, spawn_module, substitute, update_module_value, x11_bgrx_to_rgba};
 use takumi::{layout::Viewport, rendering::{RenderOptions, measure_layout}};
 use x11rb::{
     connection::Connection,
@@ -40,10 +40,55 @@ fn sample_and_inject_root_bg(
     mon_y: i16,
     width: u32,
     height: u32,
+    xrootpmap_atom: Option<u32>,
 ) {
     let t = std::time::Instant::now();
-    // Read directly from the root window — works for solid colors and wallpapers alike,
-    // and always reflects exactly the pixels behind our bar's position on screen.
+
+    // Tier 1: _XROOTPMAP_ID pixmap (set by feh/nitrogen for wallpapers).
+    // GetImage on a *pixmap* is immune to window stacking — it always returns
+    // the actual stored pixels regardless of what windows are on screen.
+    if let Some(atom) = xrootpmap_atom {
+        let pixmap = conn
+            .get_property(false, root, atom, AtomEnum::ANY, 0, 1).ok()
+            .and_then(|c| c.reply().ok())
+            .filter(|p| p.value.len() >= 4)
+            .and_then(|p| p.value[..4].try_into().ok().map(u32::from_ne_bytes));
+        if let Some(pixmap_id) = pixmap {
+            if let Some(img) = conn.get_image(ImageFormat::Z_PIXMAP, pixmap_id, mon_x, mon_y, width as u16, height as u16, !0)
+                .ok().and_then(|c| c.reply().ok())
+            {
+                let rgba = x11_bgrx_to_rgba(&img.data);
+                inject_root_bg(global, rgba, width, height);
+                eprintln!("[costae] root bg from _XROOTPMAP_ID pixmap in {}ms", t.elapsed().as_millis());
+                return;
+            }
+        }
+    }
+
+    // Tier 2: sample 1 pixel from just outside the bar area (one pixel to the right).
+    // This position is never covered by windows placed in the bar's own column, so for
+    // solid-color backgrounds (the common case when _XROOTPMAP_ID is absent) we get the
+    // correct color. We then fill the entire bar area with that single color via
+    // solid_color_rgba, which is far cheaper than a full GetImage on the bar region.
+    if let Some(img) = conn.get_image(
+        ImageFormat::Z_PIXMAP, root,
+        mon_x + width as i16, mon_y,
+        1, 1, !0,
+    ).ok().and_then(|c| c.reply().ok()) {
+        if img.data.len() >= 4 {
+            // BGRX: data[0]=B, data[1]=G, data[2]=R, data[3]=X
+            let pixel = ((img.data[2] as u32) << 16)
+                | ((img.data[1] as u32) << 8)
+                | (img.data[0] as u32);
+            let rgba = solid_color_rgba(pixel, width, height);
+            inject_root_bg(global, rgba, width, height);
+            eprintln!("[costae] root bg from adjacent pixel ({:#06x}) in {}ms", pixel, t.elapsed().as_millis());
+            return;
+        }
+    }
+
+    // Tier 3: GetImage on root window — last resort. Returns visible screen content,
+    // so it may capture overlying windows rather than the true background.
     match conn.get_image(ImageFormat::Z_PIXMAP, root, mon_x, mon_y, width as u16, height as u16, !0) {
         Err(e) => eprintln!("[costae] root bg send error: {e:?}"),
         Ok(cookie) => match cookie.reply() {
@@ -51,7 +96,7 @@ fn sample_and_inject_root_bg(
             Ok(img) => {
                 let rgba = x11_bgrx_to_rgba(&img.data);
                 inject_root_bg(global, rgba, width, height);
-                eprintln!("[costae] root bg sampled in {}ms", t.elapsed().as_millis());
+                eprintln!("[costae] root bg from root window (fallback) in {}ms", t.elapsed().as_millis());
             }
         }
     }
@@ -267,7 +312,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Sample before mapping — X11 does not maintain a backing store for root window pixels
     // once a window covers them (no compositor). Reading after map_window returns black.
     eprintln!("[costae] sampling root bg at ({mon_x},{mon_y}) size {bar_width}×{mon_height}");
-    sample_and_inject_root_bg(&conn, screen.root, &global, mon_x, mon_y, bar_width, mon_height);
+    sample_and_inject_root_bg(&conn, screen.root, &global, mon_x, mon_y, bar_width, mon_height, xrootpmap_atom);
 
     conn.map_window(win_id)?;
     conn.configure_window(win_id, &ConfigureWindowAux::new().stack_mode(StackMode::BELOW))?;

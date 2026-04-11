@@ -1,4 +1,4 @@
-use costae::x11_bgrx_to_rgba;
+use costae::{solid_color_rgba, x11_bgrx_to_rgba};
 
 #[test]
 fn converts_bgrx_pixel_to_rgba() {
@@ -30,4 +30,23 @@ fn always_sets_alpha_to_255() {
 #[test]
 fn empty_input_returns_empty() {
     assert_eq!(x11_bgrx_to_rgba(&[]), Vec::<u8>::new());
+}
+
+#[test]
+fn solid_color_rgba_fills_correctly() {
+    // i3 client.background #0e101a → TrueColor pixel 0x0e101a
+    let rgba = solid_color_rgba(0x0e_10_1a, 2, 1);
+    assert_eq!(rgba, vec![0x0e, 0x10, 0x1a, 0xFF, 0x0e, 0x10, 0x1a, 0xFF]);
+}
+
+#[test]
+fn solid_color_rgba_black() {
+    let rgba = solid_color_rgba(0x000000, 1, 1);
+    assert_eq!(rgba, vec![0x00, 0x00, 0x00, 0xFF]);
+}
+
+#[test]
+fn solid_color_rgba_white() {
+    let rgba = solid_color_rgba(0xFFFFFF, 1, 2);
+    assert_eq!(rgba, vec![0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
 }
