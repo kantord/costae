@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use std::sync::Arc;
 
-use costae::{GlobalContext, RenderCache, hit_test, inject_root_bg, load_fonts, parse_layout, preload_layout_images, reconcile_streams, render_frame, solid_color_rgba, spawn_bi_stream, spawn_string_stream, x11_bgrx_to_rgba};
+use costae::{GlobalContext, RenderCache, hit_test, inject_root_bg, load_fonts, parse_layout, preload_layout_images, reconcile_panels, reconcile_streams, render_frame, solid_color_rgba, spawn_bi_stream, spawn_string_stream, x11_bgrx_to_rgba};
 use takumi::{layout::Viewport, rendering::{RenderOptions, measure_layout}};
 use x11rb::{
     connection::Connection,
@@ -13,8 +13,6 @@ use x11rb::{
     rust_connection::RustConnection,
     wrapper::ConnectionExt as _,
 };
-
-const DEFAULT_BAR_WIDTH: u32 = 300;
 
 fn resolve_layout(raw_layout: &Option<serde_json::Value>) -> Option<takumi::layout::node::Node> {
     raw_layout.as_ref().and_then(|layout| {
@@ -58,17 +56,12 @@ fn sample_and_inject_root_bg(
     }
 
     // Tier 2: sample 1 pixel from just outside the bar area (one pixel to the right).
-    // This position is never covered by windows placed in the bar's own column, so for
-    // solid-color backgrounds (the common case when _XROOTPMAP_ID is absent) we get the
-    // correct color. We then fill the entire bar area with that single color via
-    // solid_color_rgba, which is far cheaper than a full GetImage on the bar region.
     if let Some(img) = conn.get_image(
         ImageFormat::Z_PIXMAP, root,
         mon_x + width as i16, mon_y,
         1, 1, !0,
     ).ok().and_then(|c| c.reply().ok()) {
         if img.data.len() >= 4 {
-            // BGRX: data[0]=B, data[1]=G, data[2]=R, data[3]=X
             let pixel = ((img.data[2] as u32) << 16)
                 | ((img.data[1] as u32) << 8)
                 | (img.data[0] as u32);
@@ -79,8 +72,7 @@ fn sample_and_inject_root_bg(
         }
     }
 
-    // Tier 3: GetImage on root window — last resort. Returns visible screen content,
-    // so it may capture overlying windows rather than the true background.
+    // Tier 3: GetImage on root window — last resort.
     match conn.get_image(ImageFormat::Z_PIXMAP, root, mon_x, mon_y, width as u16, height as u16, !0) {
         Err(e) => eprintln!("[costae] root bg send error: {e:?}"),
         Ok(cookie) => match cookie.reply() {
@@ -127,8 +119,8 @@ fn do_hit_test(
     raw_layout: &Option<serde_json::Value>,
     module_event_txs: &HashMap<String, mpsc::Sender<serde_json::Value>>,
     global: &GlobalContext,
-    phys_bar_width: u32,
-    mon_height: u32,
+    phys_width: u32,
+    phys_height: u32,
     dpr: f32,
     click_x: f32,
     click_y: f32,
@@ -144,7 +136,7 @@ fn do_hit_test(
 
     let options = RenderOptions::builder()
         .global(global)
-        .viewport(Viewport::new((Some(phys_bar_width), Some(mon_height))).with_device_pixel_ratio(dpr))
+        .viewport(Viewport::new((Some(phys_width), Some(phys_height))).with_device_pixel_ratio(dpr))
         .node(node)
         .build();
     let measured = match measure_layout(options) {
@@ -179,30 +171,120 @@ fn do_hit_test(
     }
 }
 
+/// A live X11 panel window, created from a `PanelSpec` at runtime.
+struct Panel {
+    id: String,
+    win_id: u32,
+    gc: u32,
+    phys_width: u32,
+    phys_height: u32,
+    raw_layout: Option<serde_json::Value>,
+    render_cache: RenderCache,
+    bgrx: Arc<Vec<u8>>,
+}
+
+struct X11Context<'a> {
+    conn: &'a RustConnection,
+    screen: &'a Screen,
+    depth: u8,
+    global: &'a GlobalContext,
+    dpr: f32,
+    mon_x: i16,
+    mon_y: i16,
+    mon_width: u32,
+    mon_height: u32,
+    xrootpmap_atom: Option<u32>,
+    strut_atom: u32,
+    strut_legacy_atom: u32,
+}
+
+fn create_panel(
+    spec: &costae::PanelSpec,
+    x11: &X11Context,
+) -> Result<Panel, Box<dyn std::error::Error>> {
+    let phys_width = (spec.width as f32 * x11.dpr).round() as u32;
+    let phys_height = (spec.height as f32 * x11.dpr).round() as u32;
+
+    // outer_gap is informational (passed to modules so they can tell i3 about tiling gaps),
+    // not a window position offset. Anchored windows sit flush at the monitor edge.
+    let (win_x, win_y) = match &spec.anchor {
+        Some(costae::PanelAnchor::Left)  => (x11.mon_x, x11.mon_y),
+        Some(costae::PanelAnchor::Right) => (x11.mon_x + x11.mon_width as i16 - phys_width as i16, x11.mon_y),
+        Some(costae::PanelAnchor::Top)   => (x11.mon_x, x11.mon_y),
+        Some(costae::PanelAnchor::Bottom)=> (x11.mon_x, x11.mon_y + x11.mon_height as i16 - phys_height as i16),
+        None => (x11.mon_x + spec.x as i16, x11.mon_y + spec.y as i16),
+    };
+
+    let win_id = x11.conn.generate_id()?;
+    x11.conn.create_window(
+        x11rb::COPY_DEPTH_FROM_PARENT,
+        win_id,
+        x11.screen.root,
+        win_x,
+        win_y,
+        phys_width as u16,
+        phys_height as u16,
+        0,
+        WindowClass::INPUT_OUTPUT,
+        x11.screen.root_visual,
+        &CreateWindowAux::new()
+            .background_pixel(x11.screen.black_pixel)
+            .override_redirect(1)
+            .event_mask(EventMask::EXPOSURE | EventMask::BUTTON_PRESS),
+    )?;
+
+    sample_and_inject_root_bg(x11.conn, x11.screen.root, x11.global, win_x, win_y, phys_width, phys_height, x11.xrootpmap_atom);
+
+    x11.conn.map_window(win_id)?;
+    x11.conn.configure_window(win_id, &ConfigureWindowAux::new().stack_mode(StackMode::BELOW))?;
+
+    if let Some(anchor) = spec.anchor.clone() {
+        let strut_vals = costae::strut_partial_values_for_anchor(
+            anchor, x11.mon_x, x11.mon_y, x11.mon_width, x11.mon_height, phys_width, phys_height,
+        );
+        x11.conn.change_property32(PropMode::REPLACE, win_id, x11.strut_atom, AtomEnum::CARDINAL, &strut_vals)?;
+        x11.conn.change_property32(PropMode::REPLACE, win_id, x11.strut_legacy_atom, AtomEnum::CARDINAL, &strut_vals[..4])?;
+    }
+
+    let gc = x11.conn.generate_id()?;
+    x11.conn.create_gc(gc, win_id, &CreateGCAux::new())?;
+
+    x11.conn.flush()?;
+
+    let bgrx = Arc::new(render_frame(None, x11.global, phys_width, phys_height, x11.dpr));
+    x11.conn.put_image(ImageFormat::Z_PIXMAP, win_id, gc, phys_width as u16, phys_height as u16, 0, 0, 0, x11.depth, &bgrx[..])?;
+    x11.conn.flush()?;
+
+    Ok(Panel {
+        id: spec.id.clone(),
+        win_id,
+        gc,
+        phys_width,
+        phys_height,
+        raw_layout: None,
+        render_cache: RenderCache::new(30),
+        bgrx,
+    })
+}
+
+fn destroy_panel(panel: Panel, conn: &RustConnection) {
+    let _ = conn.free_gc(panel.gc);
+    let _ = conn.destroy_window(panel.win_id);
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let exe_path = std::env::current_exe().unwrap_or_default();
 
-    let config_path = costae::default_config_path();
-    let (bar_width, outer_gap, mut raw_layout, mut layout_file) = if config_path.exists() {
-        match costae::load_config(&config_path) {
-            Ok(cfg) => {
-                eprintln!("[costae] config loaded: width={}, outer_gap={}", cfg.config.width, cfg.config.outer_gap);
-                (cfg.config.width, cfg.config.outer_gap, cfg.layout, cfg.layout_file)
-            }
-            Err(e) => {
-                eprintln!("[costae] config error: {e}, using defaults");
-                (DEFAULT_BAR_WIDTH, 0, None, None)
-            }
-        }
-    } else {
-        (DEFAULT_BAR_WIDTH, 0, None, None)
+    let layout_jsx_path = {
+        let home = std::env::var("HOME").unwrap_or_default();
+        std::path::PathBuf::from(home).join(".config/costae/layout.jsx")
     };
 
     let (wake_tx, wake_rx) = mpsc::sync_channel::<()>(1);
 
     let (reload_tx, reload_rx) = mpsc::channel::<()>();
     {
-        let path = config_path.clone();
+        let path = layout_jsx_path.clone();
         let wake_tx = wake_tx.clone();
         thread::spawn(move || {
             let mut last_modified = std::fs::metadata(&path)
@@ -273,31 +355,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let crtc_info = conn.randr_get_crtc_info(output_info.crtc, 0)?.reply()?;
     let mon_x = crtc_info.x;
     let mon_y = crtc_info.y;
-    // mon_height is physical pixels (from CRTC); bar_width is logical pixels (from config).
-    // We match i3's scaling: dpr = dpi/96, so config px values have the same meaning as in i3.
     let mon_height = crtc_info.height as u32;
-    // Scale bar_width (logical CSS px from config) to physical pixels, matching i3's DPI scaling.
+    let mon_width = crtc_info.width as u32;
     let dpr = dpi / 96.0;
-    let phys_bar_width = (bar_width as f32 * dpr).round() as u32;
-    let phys_outer_gap = (outer_gap as f32 * dpr).round() as u32;
 
-    let win_id = conn.generate_id()?;
-    conn.create_window(
-        x11rb::COPY_DEPTH_FROM_PARENT,
-        win_id,
-        screen.root,
-        mon_x,
-        mon_y,
-        phys_bar_width as u16,
-        mon_height as u16,
-        0,
-        WindowClass::INPUT_OUTPUT,
-        screen.root_visual,
-        &CreateWindowAux::new()
-            .background_pixel(screen.black_pixel)
-            .override_redirect(1)
-            .event_mask(EventMask::EXPOSURE | EventMask::BUTTON_PRESS),
-    )?;
     let mut global = GlobalContext::default();
     load_fonts(&mut global);
 
@@ -307,53 +368,110 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         screen.root,
         &ChangeWindowAttributesAux::new().event_mask(EventMask::PROPERTY_CHANGE),
     )?;
-    // Cache the atom ID so PropertyNotify events can be matched cheaply in the event loop.
     let xrootpmap_atom: Option<u32> = conn
         .intern_atom(false, b"_XROOTPMAP_ID").ok()
         .and_then(|c| c.reply().ok())
         .map(|r| r.atom);
 
-    // Sample before mapping — X11 does not maintain a backing store for root window pixels
-    // once a window covers them (no compositor). Reading after map_window returns black.
-    eprintln!("[costae] sampling root bg at ({mon_x},{mon_y}) size {phys_bar_width}×{mon_height}");
-    sample_and_inject_root_bg(&conn, screen.root, &global, mon_x, mon_y, phys_bar_width, mon_height, xrootpmap_atom);
+    let strut_atom = conn.intern_atom(false, b"_NET_WM_STRUT_PARTIAL")?.reply()?.atom;
+    let strut_legacy_atom = conn.intern_atom(false, b"_NET_WM_STRUT")?.reply()?.atom;
 
-    conn.map_window(win_id)?;
-    conn.configure_window(win_id, &ConfigureWindowAux::new().stack_mode(StackMode::BELOW))?;
+    let x11 = X11Context {
+        conn: &conn,
+        screen,
+        depth,
+        global: &global,
+        dpr,
+        mon_x,
+        mon_y,
+        mon_width,
+        mon_height,
+        xrootpmap_atom,
+        strut_atom,
+        strut_legacy_atom,
+    };
 
-    // Tell i3 (and any EWMH-compliant WM) that we occupy the left edge of the monitor.
-    // This prevents tiling windows from appearing under the bar and may suppress the
-    // focused-workspace indicator border that otherwise shows at x=bar_width.
-    {
-        let strut_atom = conn.intern_atom(false, b"_NET_WM_STRUT_PARTIAL")?.reply()?.atom;
-        let strut_vals = costae::strut_partial_values(mon_x, mon_y, bar_width, mon_height);
-        conn.change_property32(PropMode::REPLACE, win_id, strut_atom, AtomEnum::CARDINAL, &strut_vals)?;
-        // Legacy _NET_WM_STRUT (first 4 values) for older WMs
-        let strut_legacy_atom = conn.intern_atom(false, b"_NET_WM_STRUT")?.reply()?.atom;
-        conn.change_property32(PropMode::REPLACE, win_id, strut_legacy_atom, AtomEnum::CARDINAL, &strut_vals[..4])?;
-    }
-
-    conn.flush()?;
-
-    let gc = conn.generate_id()?;
-    conn.create_gc(gc, win_id, &CreateGCAux::new())?;
-
-    let init_event = serde_json::json!({
-        "type": "init",
-        "config": {"width": phys_bar_width, "outer_gap": phys_outer_gap},
-        "output": output_name,
-        "dpi": dpi
-    });
+    // Express screen dimensions in logical CSS px (physical ÷ DPR) so that layout code
+    // can use ctx.screen_height directly in panel height props without double-scaling.
+    // create_panel multiplies by DPR to recover physical pixels.
+    let screen_width_logical = (mon_width as f32 / dpr).round() as u32;
+    let screen_height_logical = (mon_height as f32 / dpr).round() as u32;
 
     let jsx_ctx = serde_json::json!({
         "output": output_name,
         "dpi": dpi,
-        "width": bar_width,
-        "outer_gap": outer_gap,
+        "screen_width": screen_width_logical,
+        "screen_height": screen_height_logical,
     });
 
-    if let Some(ref path) = layout_file {
-        match std::fs::read_to_string(path) {
+    let mut panels: Vec<Panel> = Vec::new();
+
+    // Build the init_event that is sent to bi-stream modules (e.g. costae-i3).
+    // Uses the left-anchored panel spec so costae-i3 gets the correct bar_width for
+    // its i3 gap command. Falls back to first spec if no left-anchored panel exists.
+    let make_mod_init = |specs: &[costae::PanelSpec]| -> serde_json::Value {
+        let spec = specs.iter()
+            .find(|p| p.anchor == Some(costae::PanelAnchor::Left))
+            .or_else(|| specs.first());
+        let (bar_w, og) = spec
+            .map(|p| (
+                (p.width as f32 * dpr).round() as u32,
+                (p.outer_gap as f32 * dpr).round() as u32,
+            ))
+            .unwrap_or((250, 0));
+        serde_json::json!({
+            "type": "init",
+            "config": {"width": bar_w, "outer_gap": og},
+            "output": output_name,
+            "dpi": dpi,
+            "screen_width": screen_width_logical,
+            "screen_height": screen_height_logical,
+        })
+    };
+
+    // Helper: apply a new set of PanelSpecs — create/destroy panels and update raw_layout.
+    // Module spawning is done by the caller before invoking this.
+    let apply_panel_specs = |panels: &mut Vec<Panel>, specs: Vec<costae::PanelSpec>| {
+        let existing_ids: Vec<&str> = panels.iter().map(|p| p.id.as_str()).collect();
+        let (to_create, to_update, to_destroy) = reconcile_panels(&existing_ids, &specs);
+
+        for id in &to_destroy {
+            if let Some(pos) = panels.iter().position(|p| &p.id == id) {
+                let panel = panels.remove(pos);
+                let _ = conn.free_gc(panel.gc);
+                let _ = conn.destroy_window(panel.win_id);
+            }
+        }
+
+        for spec in &to_create {
+            match create_panel(spec, &x11) {
+                Ok(mut panel) => {
+                    let content = specs.iter().find(|s| s.id == spec.id).map(|s| s.content.clone()).unwrap_or_default();
+                    if !content.is_null() {
+                        preload_layout_images(&content, &global);
+                        panel.raw_layout = Some(content);
+                    }
+                    panels.push(panel);
+                }
+                Err(e) => eprintln!("[costae] failed to create panel '{}': {e}", spec.id),
+            }
+        }
+
+        for spec in &to_update {
+            if let Some(panel) = panels.iter_mut().find(|p| p.id == spec.id) {
+                let content = specs.iter().find(|s| s.id == spec.id).map(|s| s.content.clone()).unwrap_or_default();
+                if !content.is_null() {
+                    preload_layout_images(&content, &global);
+                    panel.raw_layout = Some(content);
+                    panel.render_cache = RenderCache::new(30);
+                }
+            }
+        }
+    };
+
+    // Initial JSX load
+    if layout_jsx_path.exists() {
+        match std::fs::read_to_string(&layout_jsx_path) {
             Ok(source) => {
                 let t = std::time::Instant::now();
                 match costae::jsx::JsxEvaluator::new(&source, jsx_ctx.clone()) {
@@ -361,6 +479,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         match evaluator.eval(&stream_values) {
                             Ok((value, stream_calls, module_calls)) => {
                                 eprintln!("[costae] jsx eval — {}ms", t.elapsed().as_millis());
+                                let specs = match costae::parse_root_node(&value) {
+                                    Ok(s) => s,
+                                    Err(e) => { eprintln!("[costae] root node parse error: {e}"); vec![] }
+                                };
+                                let mod_init = make_mod_init(&specs);
                                 let (to_spawn, _) = reconcile_streams(&[], &stream_calls);
                                 for (bin, script) in to_spawn {
                                     let child = spawn_string_stream(&bin, script.as_deref(), stream_tx.clone(), wake_tx.clone());
@@ -368,38 +491,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                                 for bin in &module_calls {
                                     if !bi_stream_children.contains_key(bin) {
-                                        let bi = spawn_bi_stream(bin, &init_event, stream_tx.clone(), wake_tx.clone());
+                                        let bi = spawn_bi_stream(bin, &mod_init, stream_tx.clone(), wake_tx.clone());
                                         module_event_txs.insert(bin.clone(), bi.event_tx);
                                         bi_stream_children.insert(bin.clone(), bi.child);
                                     }
                                 }
-                                raw_layout = Some(value);
+                                apply_panel_specs(&mut panels, specs);
                                 jsx_evaluator = Some(evaluator);
                             }
-                            Err(e) => { eprintln!("[costae] JSX eval error: {e}"); }
+                            Err(e) => eprintln!("[costae] JSX eval error: {e}"),
                         }
                     }
-                    Err(e) => { eprintln!("[costae] JSX eval error: {e}"); }
+                    Err(e) => eprintln!("[costae] JSX compile error: {e}"),
                 }
             }
-            Err(e) => { eprintln!("[costae] JSX file error: {e}"); }
+            Err(e) => eprintln!("[costae] JSX file error: {e}"),
         }
     }
-
-    if let Some(ref layout) = raw_layout {
-        preload_layout_images(layout, &global);
-    }
-
-    let mut render_cache = RenderCache::new(30);
-    let mut bgrx: Arc<Vec<u8>> = render_cache.get_or_render(
-        &serde_json::to_value(&stream_values).unwrap_or_default(),
-        || {
-            let t = std::time::Instant::now();
-            let layout = resolve_layout(&raw_layout);
-            eprintln!("[costae] resolve_layout — {}µs", t.elapsed().as_micros());
-            render_frame(layout, &global, phys_bar_width, mon_height, dpr)
-        },
-    );
 
     loop {
         let mut changed = false;
@@ -414,34 +522,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let _ = child.kill();
                 let _ = child.wait();
             }
-            let _ = conn.destroy_window(win_id);
+            for panel in panels.drain(..) {
+                destroy_panel(panel, &conn);
+            }
             let _ = conn.flush();
             use std::os::unix::process::CommandExt;
             let mut cmd = std::process::Command::new(&exe_path);
-            // Tell the new process what mtime we saw so it doesn't re-trigger immediately
             if let Ok(mtime) = std::fs::metadata(&exe_path).and_then(|m| m.modified()) {
                 if let Ok(dur) = mtime.duration_since(std::time::UNIX_EPOCH) {
                     cmd.env("COSTAE_EXE_MTIME_NS", dur.as_nanos().to_string());
                 }
             }
             let _ = cmd.exec();
-            // exec failed — continue running
         }
 
         if reload_rx.try_recv().is_ok() {
-            if let Ok(cfg) = costae::load_config(&config_path) {
-                if cfg.config.width != bar_width || cfg.config.outer_gap != outer_gap {
-                    eprintln!("[costae] bar width changed, restarting...");
-                    for child in bi_stream_children.values_mut() {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                    }
-                    use std::os::unix::process::CommandExt;
-                    let _ = std::process::Command::new(&exe_path).exec();
-                }
-                raw_layout = cfg.layout;
-                layout_file = cfg.layout_file.clone();
-            }
             for (_, mut child) in stream_children.drain() {
                 let _ = child.kill();
                 let _ = child.wait();
@@ -453,11 +548,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             module_event_txs.clear();
             stream_values.clear();
             jsx_evaluator = None;
-            if let Some(ref path) = layout_file {
-                match std::fs::read_to_string(path) {
+
+            if layout_jsx_path.exists() {
+                match std::fs::read_to_string(&layout_jsx_path) {
                     Ok(source) => match costae::jsx::JsxEvaluator::new(&source, jsx_ctx.clone()) {
                         Ok(evaluator) => match evaluator.eval(&stream_values) {
                             Ok((value, stream_calls, module_calls)) => {
+                                let specs = match costae::parse_root_node(&value) {
+                                    Ok(s) => s,
+                                    Err(e) => { eprintln!("[costae] root node parse error: {e}"); vec![] }
+                                };
+                                let mod_init = make_mod_init(&specs);
                                 let (to_spawn, _) = reconcile_streams(&[], &stream_calls);
                                 for (bin, script) in to_spawn {
                                     let child = spawn_string_stream(&bin, script.as_deref(), stream_tx.clone(), wake_tx.clone());
@@ -465,26 +566,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                                 for bin in &module_calls {
                                     if !bi_stream_children.contains_key(bin) {
-                                        let bi = spawn_bi_stream(bin, &init_event, stream_tx.clone(), wake_tx.clone());
+                                        let bi = spawn_bi_stream(bin, &mod_init, stream_tx.clone(), wake_tx.clone());
                                         module_event_txs.insert(bin.clone(), bi.event_tx);
                                         bi_stream_children.insert(bin.clone(), bi.child);
                                     }
                                 }
-                                raw_layout = Some(value);
+                                apply_panel_specs(&mut panels, specs);
                                 jsx_evaluator = Some(evaluator);
                             }
-                            Err(e) => { eprintln!("[costae] JSX eval error: {e}"); }
+                            Err(e) => eprintln!("[costae] JSX eval error: {e}"),
                         },
-                        Err(e) => { eprintln!("[costae] JSX eval error: {e}"); }
+                        Err(e) => eprintln!("[costae] JSX compile error: {e}"),
                     },
-                    Err(e) => { eprintln!("[costae] JSX file error: {e}"); }
+                    Err(e) => eprintln!("[costae] JSX file error: {e}"),
                 }
             }
-            render_cache = RenderCache::new(30);
-            if let Some(ref layout) = raw_layout {
-                preload_layout_images(layout, &global);
-            }
-            eprintln!("[costae] config reloaded");
+            eprintln!("[costae] layout reloaded");
             changed = true;
         }
 
@@ -500,8 +597,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(ref evaluator) = jsx_evaluator {
                 let t = std::time::Instant::now();
                 match evaluator.eval(&stream_values) {
-                    Ok((new_layout, new_calls, new_module_calls)) => {
+                    Ok((new_value, new_calls, new_module_calls)) => {
                         eprintln!("[costae] jsx re-eval — {}µs", t.elapsed().as_micros());
+                        let specs = match costae::parse_root_node(&new_value) {
+                            Ok(s) => s,
+                            Err(e) => { eprintln!("[costae] root node parse error: {e}"); vec![] }
+                        };
+                        let mod_init = make_mod_init(&specs);
                         let current_calls: Vec<_> = stream_children.keys().cloned().collect();
                         let (to_spawn, to_kill) = reconcile_streams(&current_calls, &new_calls);
                         for (b, s) in to_kill {
@@ -516,37 +618,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         for b in &new_module_calls {
                             if !bi_stream_children.contains_key(b) {
-                                let bi = spawn_bi_stream(b, &init_event, stream_tx.clone(), wake_tx.clone());
+                                let bi = spawn_bi_stream(b, &mod_init, stream_tx.clone(), wake_tx.clone());
                                 module_event_txs.insert(b.clone(), bi.event_tx);
                                 bi_stream_children.insert(b.clone(), bi.child);
                             }
                         }
-                        raw_layout = Some(new_layout);
+                        apply_panel_specs(&mut panels, specs);
                         changed = true;
                     }
-                    Err(e) => { eprintln!("[costae] JSX re-eval error: {e}"); }
+                    Err(e) => eprintln!("[costae] JSX re-eval error: {e}"),
                 }
             }
         }
 
-        // Process X11 events before rendering so PropertyNotify-triggered resamples
-        // are included in the same render pass.
+        // Process X11 events
         while let Some(event) = conn.poll_for_event()? {
             match event {
-                x11rb::protocol::Event::Expose(_) => {
-                    conn.put_image(ImageFormat::Z_PIXMAP, win_id, gc, phys_bar_width as u16, mon_height as u16, 0, 0, 0, depth, &bgrx[..])?;
-                    conn.flush()?;
+                x11rb::protocol::Event::Expose(e) => {
+                    if let Some(panel) = panels.iter().find(|p| p.win_id == e.window) {
+                        conn.put_image(ImageFormat::Z_PIXMAP, panel.win_id, panel.gc, panel.phys_width as u16, panel.phys_height as u16, 0, 0, 0, depth, &panel.bgrx[..])?;
+                        conn.flush()?;
+                    }
                 }
                 x11rb::protocol::Event::ButtonPress(e) => {
-                    do_hit_test(
-                        &raw_layout, &module_event_txs,
-                        &global, phys_bar_width, mon_height, dpr,
-                        e.event_x as f32, e.event_y as f32,
-                    );
+                    if let Some(panel) = panels.iter().find(|p| p.win_id == e.event) {
+                        do_hit_test(
+                            &panel.raw_layout, &module_event_txs,
+                            &global, panel.phys_width, panel.phys_height, dpr,
+                            e.event_x as f32, e.event_y as f32,
+                        );
+                    }
                 }
                 x11rb::protocol::Event::PropertyNotify(e) => {
-                    // Wallpaper changed — read from _XROOTPMAP_ID pixmap directly,
-                    // which feh/nitrogen set and which is independent of our window being on top.
                     if xrootpmap_atom == Some(e.atom) {
                         if let Some(atom) = xrootpmap_atom {
                             let pixmap = conn
@@ -555,13 +658,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 .filter(|p| p.value.len() >= 4)
                                 .and_then(|p| p.value[..4].try_into().ok().map(u32::from_ne_bytes));
                             if let Some(pixmap_id) = pixmap {
-                                if let Some(img) = conn.get_image(ImageFormat::Z_PIXMAP, pixmap_id, mon_x, mon_y, bar_width as u16, mon_height as u16, !0).ok().and_then(|c| c.reply().ok()) {
-                                    let rgba = x11_bgrx_to_rgba(&img.data);
-                                    inject_root_bg(&global, rgba, bar_width, mon_height);
-                                    render_cache = RenderCache::new(30);
-                                    changed = true;
-                                    eprintln!("[costae] root bg updated from wallpaper change");
+                                // Re-sample root bg for all panels (GlobalContext is shared)
+                                for panel in panels.iter() {
+                                    if let Some(img) = conn.get_image(ImageFormat::Z_PIXMAP, pixmap_id, mon_x, mon_y, panel.phys_width as u16, panel.phys_height as u16, !0).ok().and_then(|c| c.reply().ok()) {
+                                        let rgba = x11_bgrx_to_rgba(&img.data);
+                                        inject_root_bg(&global, rgba, panel.phys_width, panel.phys_height);
+                                        eprintln!("[costae] root bg updated from wallpaper change");
+                                    }
                                 }
+                                for panel in panels.iter_mut() {
+                                    panel.render_cache = RenderCache::new(30);
+                                }
+                                changed = true;
                             }
                         }
                     }
@@ -572,13 +680,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         if changed {
             let key = serde_json::to_value(&stream_values).unwrap_or_default();
-            bgrx = render_cache.get_or_render(&key, || {
-                let t = std::time::Instant::now();
-                let layout = resolve_layout(&raw_layout);
-                eprintln!("[costae] resolve_layout — {}µs", t.elapsed().as_micros());
-                render_frame(layout, &global, phys_bar_width, mon_height, dpr)
-            });
-            conn.put_image(ImageFormat::Z_PIXMAP, win_id, gc, phys_bar_width as u16, mon_height as u16, 0, 0, 0, depth, &bgrx[..])?;
+            for panel in panels.iter_mut() {
+                panel.bgrx = panel.render_cache.get_or_render(&key, || {
+                    let t = std::time::Instant::now();
+                    let layout = resolve_layout(&panel.raw_layout);
+                    eprintln!("[costae] resolve_layout — {}µs", t.elapsed().as_micros());
+                    render_frame(layout, &global, panel.phys_width, panel.phys_height, dpr)
+                });
+                conn.put_image(ImageFormat::Z_PIXMAP, panel.win_id, panel.gc, panel.phys_width as u16, panel.phys_height as u16, 0, 0, 0, depth, &panel.bgrx[..])?;
+            }
             conn.flush()?;
         }
 
