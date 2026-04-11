@@ -189,6 +189,7 @@ struct X11Context<'a> {
     depth: u8,
     global: &'a GlobalContext,
     dpr: f32,
+    /// Primary monitor coordinates (fallback when panel has no output= prop).
     mon_x: i16,
     mon_y: i16,
     mon_width: u32,
@@ -196,6 +197,8 @@ struct X11Context<'a> {
     xrootpmap_atom: Option<u32>,
     strut_atom: u32,
     strut_legacy_atom: u32,
+    /// All connected outputs: name → (x, y, phys_width, phys_height).
+    output_map: &'a HashMap<String, (i16, i16, u32, u32)>,
 }
 
 fn create_panel(
@@ -205,14 +208,20 @@ fn create_panel(
     let phys_width = (spec.width as f32 * x11.dpr).round() as u32;
     let phys_height = (spec.height as f32 * x11.dpr).round() as u32;
 
+    // Resolve which monitor this panel lives on. When spec.output names a known RandR
+    // output, use its coordinates; otherwise fall back to the primary monitor.
+    let (mon_x, mon_y, mon_width, mon_height) = spec.output.as_ref()
+        .and_then(|name| x11.output_map.get(name).copied())
+        .unwrap_or((x11.mon_x, x11.mon_y, x11.mon_width, x11.mon_height));
+
     // outer_gap is informational (passed to modules so they can tell i3 about tiling gaps),
     // not a window position offset. Anchored windows sit flush at the monitor edge.
     let (win_x, win_y) = match &spec.anchor {
-        Some(costae::PanelAnchor::Left)  => (x11.mon_x, x11.mon_y),
-        Some(costae::PanelAnchor::Right) => (x11.mon_x + x11.mon_width as i16 - phys_width as i16, x11.mon_y),
-        Some(costae::PanelAnchor::Top)   => (x11.mon_x, x11.mon_y),
-        Some(costae::PanelAnchor::Bottom)=> (x11.mon_x, x11.mon_y + x11.mon_height as i16 - phys_height as i16),
-        None => (x11.mon_x + spec.x as i16, x11.mon_y + spec.y as i16),
+        Some(costae::PanelAnchor::Left)  => (mon_x, mon_y),
+        Some(costae::PanelAnchor::Right) => (mon_x + mon_width as i16 - phys_width as i16, mon_y),
+        Some(costae::PanelAnchor::Top)   => (mon_x, mon_y),
+        Some(costae::PanelAnchor::Bottom)=> (mon_x, mon_y + mon_height as i16 - phys_height as i16),
+        None => (mon_x + spec.x as i16, mon_y + spec.y as i16),
     };
 
     let win_id = x11.conn.generate_id()?;
@@ -240,7 +249,7 @@ fn create_panel(
 
     if let Some(anchor) = spec.anchor.clone() {
         let strut_vals = costae::strut_partial_values_for_anchor(
-            anchor, x11.mon_x, x11.mon_y, x11.mon_width, x11.mon_height, phys_width, phys_height,
+            anchor, mon_x, mon_y, mon_width, mon_height, phys_width, phys_height,
         );
         x11.conn.change_property32(PropMode::REPLACE, win_id, x11.strut_atom, AtomEnum::CARDINAL, &strut_vals)?;
         x11.conn.change_property32(PropMode::REPLACE, win_id, x11.strut_legacy_atom, AtomEnum::CARDINAL, &strut_vals[..4])?;
@@ -359,6 +368,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mon_width = crtc_info.width as u32;
     let dpr = dpi / 96.0;
 
+    // Enumerate all connected outputs: name → (x, y, phys_width, phys_height).
+    let mut output_map: HashMap<String, (i16, i16, u32, u32)> = HashMap::new();
+    if let Ok(cookie) = conn.randr_get_screen_resources_current(screen.root) {
+        if let Ok(resources) = cookie.reply() {
+            for &out_id in &resources.outputs {
+                if let Ok(info_cookie) = conn.randr_get_output_info(out_id, 0) {
+                    if let Ok(info) = info_cookie.reply() {
+                        if info.crtc == 0 { continue; } // not active
+                        if let Ok(crtc_cookie) = conn.randr_get_crtc_info(info.crtc, 0) {
+                            if let Ok(crtc) = crtc_cookie.reply() {
+                                let name = String::from_utf8_lossy(&info.name).into_owned();
+                                output_map.insert(name, (crtc.x, crtc.y, crtc.width as u32, crtc.height as u32));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let mut global = GlobalContext::default();
     load_fonts(&mut global);
 
@@ -389,6 +418,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         xrootpmap_atom,
         strut_atom,
         strut_legacy_atom,
+        output_map: &output_map,
     };
 
     // Express screen dimensions in logical CSS px (physical ÷ DPR) so that layout code
@@ -397,11 +427,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let screen_width_logical = (mon_width as f32 / dpr).round() as u32;
     let screen_height_logical = (mon_height as f32 / dpr).round() as u32;
 
+    // Build outputs array for jsx: all connected monitors with logical dimensions.
+    let outputs_json: Vec<serde_json::Value> = output_map.iter().map(|(name, &(_, _, pw, ph))| {
+        serde_json::json!({
+            "name": name,
+            "screen_width":  (pw as f32 / dpr).round() as u32,
+            "screen_height": (ph as f32 / dpr).round() as u32,
+        })
+    }).collect();
+
     let jsx_ctx = serde_json::json!({
         "output": output_name,
         "dpi": dpi,
         "screen_width": screen_width_logical,
         "screen_height": screen_height_logical,
+        "outputs": outputs_json,
     });
 
     let mut panels: Vec<Panel> = Vec::new();
