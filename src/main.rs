@@ -22,21 +22,23 @@ fn resolve_layout(raw_layout: &Option<serde_json::Value>) -> Option<takumi::layo
     })
 }
 
-fn sample_and_inject_root_bg(
+/// Sample the wallpaper pixels behind a panel window and return them as RGBA.
+///
+/// Tries three tiers in order: _XROOTPMAP_ID pixmap (best, immune to stacking),
+/// solid-color fallback from the adjacent pixel, then a raw GetImage on the root
+/// window.  Returns the RGBA bytes on success, or `None` if every tier fails.
+fn sample_root_bg(
     conn: &RustConnection,
     root: Window,
-    global: &GlobalContext,
-    mon_x: i16,
-    mon_y: i16,
+    win_x: i16,
+    win_y: i16,
     width: u32,
     height: u32,
     xrootpmap_atom: Option<u32>,
-) {
+) -> Option<Vec<u8>> {
     let t = std::time::Instant::now();
 
     // Tier 1: _XROOTPMAP_ID pixmap (set by feh/nitrogen for wallpapers).
-    // GetImage on a *pixmap* is immune to window stacking — it always returns
-    // the actual stored pixels regardless of what windows are on screen.
     if let Some(atom) = xrootpmap_atom {
         let pixmap = conn
             .get_property(false, root, atom, AtomEnum::ANY, 0, 1).ok()
@@ -44,43 +46,38 @@ fn sample_and_inject_root_bg(
             .filter(|p| p.value.len() >= 4)
             .and_then(|p| p.value[..4].try_into().ok().map(u32::from_ne_bytes));
         if let Some(pixmap_id) = pixmap {
-            if let Some(img) = conn.get_image(ImageFormat::Z_PIXMAP, pixmap_id, mon_x, mon_y, width as u16, height as u16, !0)
+            if let Some(img) = conn.get_image(ImageFormat::Z_PIXMAP, pixmap_id, win_x, win_y, width as u16, height as u16, !0)
                 .ok().and_then(|c| c.reply().ok())
             {
-                let rgba = x11_bgrx_to_rgba(&img.data);
-                inject_root_bg(global, rgba, width, height);
                 eprintln!("[costae] root bg from _XROOTPMAP_ID pixmap in {}ms", t.elapsed().as_millis());
-                return;
+                return Some(x11_bgrx_to_rgba(&img.data));
             }
         }
     }
 
-    // Tier 2: sample 1 pixel from just outside the bar area (one pixel to the right).
+    // Tier 2: solid color from the pixel just to the right of the panel.
     if let Some(img) = conn.get_image(
         ImageFormat::Z_PIXMAP, root,
-        mon_x + width as i16, mon_y,
+        win_x + width as i16, win_y,
         1, 1, !0,
     ).ok().and_then(|c| c.reply().ok()) {
         if img.data.len() >= 4 {
             let pixel = ((img.data[2] as u32) << 16)
                 | ((img.data[1] as u32) << 8)
                 | (img.data[0] as u32);
-            let rgba = solid_color_rgba(pixel, width, height);
-            inject_root_bg(global, rgba, width, height);
             eprintln!("[costae] root bg from adjacent pixel ({:#06x}) in {}ms", pixel, t.elapsed().as_millis());
-            return;
+            return Some(solid_color_rgba(pixel, width, height));
         }
     }
 
     // Tier 3: GetImage on root window — last resort.
-    match conn.get_image(ImageFormat::Z_PIXMAP, root, mon_x, mon_y, width as u16, height as u16, !0) {
-        Err(e) => eprintln!("[costae] root bg send error: {e:?}"),
+    match conn.get_image(ImageFormat::Z_PIXMAP, root, win_x, win_y, width as u16, height as u16, !0) {
+        Err(e) => { eprintln!("[costae] root bg send error: {e:?}"); None }
         Ok(cookie) => match cookie.reply() {
-            Err(e) => eprintln!("[costae] root bg reply error: {e:?}"),
+            Err(e) => { eprintln!("[costae] root bg reply error: {e:?}"); None }
             Ok(img) => {
-                let rgba = x11_bgrx_to_rgba(&img.data);
-                inject_root_bg(global, rgba, width, height);
                 eprintln!("[costae] root bg from root window (fallback) in {}ms", t.elapsed().as_millis());
+                Some(x11_bgrx_to_rgba(&img.data))
             }
         }
     }
@@ -176,8 +173,13 @@ struct Panel {
     id: String,
     win_id: u32,
     gc: u32,
+    win_x: i16,
+    win_y: i16,
     phys_width: u32,
     phys_height: u32,
+    /// Per-panel wallpaper snapshot (RGBA). Re-injected as "root-bg" before each render
+    /// so every panel sees the correct region of the wallpaper behind it.
+    root_bg_rgba: Vec<u8>,
     raw_layout: Option<serde_json::Value>,
     render_cache: RenderCache,
     bgrx: Arc<Vec<u8>>,
@@ -242,7 +244,9 @@ fn create_panel(
             .event_mask(EventMask::EXPOSURE | EventMask::BUTTON_PRESS),
     )?;
 
-    sample_and_inject_root_bg(x11.conn, x11.screen.root, x11.global, win_x, win_y, phys_width, phys_height, x11.xrootpmap_atom);
+    let root_bg_rgba = sample_root_bg(x11.conn, x11.screen.root, win_x, win_y, phys_width, phys_height, x11.xrootpmap_atom)
+        .unwrap_or_default();
+    inject_root_bg(x11.global, root_bg_rgba.clone(), phys_width, phys_height);
 
     x11.conn.map_window(win_id)?;
     x11.conn.configure_window(win_id, &ConfigureWindowAux::new().stack_mode(StackMode::BELOW))?;
@@ -268,8 +272,11 @@ fn create_panel(
         id: spec.id.clone(),
         win_id,
         gc,
+        win_x,
+        win_y,
         phys_width,
         phys_height,
+        root_bg_rgba,
         raw_layout: None,
         render_cache: RenderCache::new(30),
         bgrx,
@@ -698,15 +705,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 .filter(|p| p.value.len() >= 4)
                                 .and_then(|p| p.value[..4].try_into().ok().map(u32::from_ne_bytes));
                             if let Some(pixmap_id) = pixmap {
-                                // Re-sample root bg for all panels (GlobalContext is shared)
-                                for panel in panels.iter() {
-                                    if let Some(img) = conn.get_image(ImageFormat::Z_PIXMAP, pixmap_id, mon_x, mon_y, panel.phys_width as u16, panel.phys_height as u16, !0).ok().and_then(|c| c.reply().ok()) {
-                                        let rgba = x11_bgrx_to_rgba(&img.data);
-                                        inject_root_bg(&global, rgba, panel.phys_width, panel.phys_height);
-                                        eprintln!("[costae] root bg updated from wallpaper change");
-                                    }
-                                }
+                                // Re-sample each panel's own wallpaper region.
                                 for panel in panels.iter_mut() {
+                                    if let Some(img) = conn.get_image(ImageFormat::Z_PIXMAP, pixmap_id, panel.win_x, panel.win_y, panel.phys_width as u16, panel.phys_height as u16, !0).ok().and_then(|c| c.reply().ok()) {
+                                        panel.root_bg_rgba = x11_bgrx_to_rgba(&img.data);
+                                        eprintln!("[costae] root bg updated for panel '{}'", panel.id);
+                                    }
                                     panel.render_cache = RenderCache::new(30);
                                 }
                                 changed = true;
@@ -721,6 +725,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if changed {
             let key = serde_json::to_value(&stream_values).unwrap_or_default();
             for panel in panels.iter_mut() {
+                // Re-inject this panel's own wallpaper snapshot as "root-bg" before
+                // rendering so backdrop-blur and background-image read the correct pixels.
+                inject_root_bg(&global, panel.root_bg_rgba.clone(), panel.phys_width, panel.phys_height);
                 panel.bgrx = panel.render_cache.get_or_render(&key, || {
                     let t = std::time::Instant::now();
                     let layout = resolve_layout(&panel.raw_layout);
