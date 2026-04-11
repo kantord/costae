@@ -1,3 +1,5 @@
+pub mod jsx;
+
 use std::io::{Seek, SeekFrom, Write as IoWrite};
 use std::num::NonZeroUsize;
 use std::os::unix::io::FromRawFd;
@@ -85,12 +87,17 @@ use takumi::{
 #[derive(Debug, Deserialize, PartialEq)]
 pub struct BarConfig {
     pub width: u32,
+    #[serde(default)]
+    pub outer_gap: u32,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
     pub config: BarConfig,
-    pub layout: serde_json::Value,
+    #[serde(default)]
+    pub layout: Option<serde_json::Value>,
+    #[serde(default)]
+    pub layout_file: Option<String>,
 }
 
 pub fn default_config_path() -> PathBuf {

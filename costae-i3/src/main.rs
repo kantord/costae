@@ -35,14 +35,27 @@ fn i3_socket_path() -> String {
 }
 
 // i3 only scales gaps if dpi/96 >= 1.25 (logical_px threshold in libi3/dpi.c)
-fn apply_bar_gap(socket: &str, dpi: f32, bar_width: u32) {
+fn scale_gap(dpi: f32, px: u32) -> u32 {
+    if (dpi / 96.0) < 1.25 {
+        px
+    } else {
+        (px as f32 * 96.0 / dpi).floor() as u32
+    }
+}
+
+fn bar_gap_command(dpi: f32, bar_width: u32, outer_gap: u32) -> String {
+    let left = scale_gap(dpi, bar_width);
+    let og = scale_gap(dpi, outer_gap);
+    if og == 0 {
+        format!("gaps left current set {left}")
+    } else {
+        format!("gaps left current set {left}; gaps top current set {og}; gaps right current set {og}; gaps bottom current set {og}")
+    }
+}
+
+fn apply_bar_gap(socket: &str, dpi: f32, bar_width: u32, outer_gap: u32) {
     if let Ok(mut s) = UnixStream::connect(socket) {
-        let gap = if (dpi / 96.0) < 1.25 {
-            bar_width
-        } else {
-            (bar_width as f32 * 96.0 / dpi).floor() as u32
-        };
-        let cmd = format!("gaps left current set {}", gap);
+        let cmd = bar_gap_command(dpi, bar_width, outer_gap);
         let _ = i3_send(&mut s, 0, cmd.as_bytes());
         let _ = i3_recv(&mut s);
     }
@@ -120,6 +133,7 @@ pub struct InitEvent {
     pub output: String,
     pub bar_width: u32,
     pub dpi: f32,
+    pub outer_gap: u32,
 }
 
 pub fn parse_init_event(json: &str) -> Option<InitEvent> {
@@ -131,6 +145,7 @@ pub fn parse_init_event(json: &str) -> Option<InitEvent> {
         output: val["output"].as_str()?.to_string(),
         bar_width: val["config"]["width"].as_u64()? as u32,
         dpi: val["dpi"].as_f64().unwrap_or(96.0) as f32,
+        outer_gap: val["config"]["outer_gap"].as_u64().unwrap_or(0) as u32,
     })
 }
 
@@ -190,7 +205,7 @@ fn main() {
     // Emit initial workspace state
     if let Ok(ws) = fetch_workspaces(&socket, &init.output) {
         if ws.iter().any(|w| w.focused) {
-            apply_bar_gap(&socket, init.dpi, init.bar_width);
+            apply_bar_gap(&socket, init.dpi, init.bar_width, init.outer_gap);
         }
         println!("{}", build_workspace_node(&ws));
     }
@@ -225,7 +240,7 @@ fn main() {
             ModuleEvent::I3(0x80000000, payload) => {
                 if let Ok(ev) = serde_json::from_slice::<serde_json::Value>(&payload) {
                     if ev["current"]["output"].as_str() == Some(init.output.as_str()) {
-                        apply_bar_gap(&socket, init.dpi, init.bar_width);
+                        apply_bar_gap(&socket, init.dpi, init.bar_width, init.outer_gap);
                     }
                 }
                 if let Ok(ws) = fetch_workspaces(&socket, &init.output) {
@@ -333,11 +348,38 @@ mod tests {
 
     #[test]
     fn parse_init_event_extracts_output_and_config() {
-        let json = r#"{"type":"init","output":"DP-1","config":{"width":200},"dpi":96.0}"#;
+        let json = r#"{"type":"init","output":"DP-1","config":{"width":200,"outer_gap":8},"dpi":96.0}"#;
         let ev = parse_init_event(json).unwrap();
         assert_eq!(ev.output, "DP-1");
         assert_eq!(ev.bar_width, 200);
+        assert_eq!(ev.outer_gap, 8);
         assert!((ev.dpi - 96.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn parse_init_event_defaults_outer_gap_to_zero() {
+        let json = r#"{"type":"init","output":"DP-1","config":{"width":200},"dpi":96.0}"#;
+        let ev = parse_init_event(json).unwrap();
+        assert_eq!(ev.outer_gap, 0);
+    }
+
+    #[test]
+    fn bar_gap_command_sets_only_left_when_outer_gap_zero() {
+        let cmd = bar_gap_command(96.0, 200, 0);
+        assert_eq!(cmd, "gaps left current set 200");
+    }
+
+    #[test]
+    fn bar_gap_command_sets_all_four_gaps_when_outer_gap_nonzero() {
+        let cmd = bar_gap_command(96.0, 200, 8);
+        assert_eq!(cmd, "gaps left current set 200; gaps top current set 8; gaps right current set 8; gaps bottom current set 8");
+    }
+
+    #[test]
+    fn bar_gap_command_scales_gaps_for_high_dpi() {
+        // At DPI 192 (dpr=2.0), i3 scales gaps itself, so we divide back by dpr
+        let cmd = bar_gap_command(192.0, 400, 16);
+        assert_eq!(cmd, "gaps left current set 200; gaps top current set 8; gaps right current set 8; gaps bottom current set 8");
     }
 
     #[test]

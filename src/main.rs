@@ -185,19 +185,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let exe_path = std::env::current_exe().unwrap_or_default();
 
     let config_path = costae::default_config_path();
-    let (bar_width, mut raw_layout) = if config_path.exists() {
+    let (bar_width, outer_gap, mut raw_layout, mut layout_file) = if config_path.exists() {
         match costae::load_config(&config_path) {
             Ok(cfg) => {
-                eprintln!("[costae] config loaded: width={}", cfg.config.width);
-                (cfg.config.width, Some(cfg.layout))
+                eprintln!("[costae] config loaded: width={}, outer_gap={}", cfg.config.width, cfg.config.outer_gap);
+                (cfg.config.width, cfg.config.outer_gap, cfg.layout, cfg.layout_file)
             }
             Err(e) => {
                 eprintln!("[costae] config error: {e}, using defaults");
-                (DEFAULT_BAR_WIDTH, None)
+                (DEFAULT_BAR_WIDTH, 0, None, None)
             }
         }
     } else {
-        (DEFAULT_BAR_WIDTH, None)
+        (DEFAULT_BAR_WIDTH, 0, None, None)
     };
 
     let (wake_tx, wake_rx) = mpsc::sync_channel::<()>(1);
@@ -279,6 +279,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Scale bar_width (logical CSS px from config) to physical pixels, matching i3's DPI scaling.
     let dpr = dpi / 96.0;
     let phys_bar_width = (bar_width as f32 * dpr).round() as u32;
+    let phys_outer_gap = (outer_gap as f32 * dpr).round() as u32;
 
     let win_id = conn.generate_id()?;
     conn.create_window(
@@ -299,9 +300,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     let mut global = GlobalContext::default();
     load_fonts(&mut global);
-    if let Some(ref layout) = raw_layout {
-        preload_layout_images(layout, &global);
-    }
 
     // Watch for wallpaper changes: wallpaper setters (feh, nitrogen, etc.) signal a new
     // wallpaper by updating the _XROOTPMAP_ID property on the root window.
@@ -342,10 +340,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let init_event = serde_json::json!({
         "type": "init",
-        "config": {"width": phys_bar_width},
+        "config": {"width": phys_bar_width, "outer_gap": phys_outer_gap},
         "output": output_name,
         "dpi": dpi
     });
+
+    if let Some(ref path) = layout_file {
+        let ctx = serde_json::json!({
+            "output": output_name,
+            "dpi": dpi,
+            "width": bar_width,
+            "outer_gap": outer_gap,
+        });
+        match std::fs::read_to_string(path) {
+            Ok(source) => {
+                let t = std::time::Instant::now();
+                match costae::jsx::eval_jsx(&source, ctx) {
+                    Ok(value) => {
+                        eprintln!("[costae] jsx eval — {}ms", t.elapsed().as_millis());
+                        raw_layout = Some(value);
+                    }
+                    Err(e) => { eprintln!("[costae] JSX eval error: {e}"); }
+                }
+            }
+            Err(e) => { eprintln!("[costae] JSX file error: {e}"); }
+        }
+    }
+
+    if let Some(ref layout) = raw_layout {
+        preload_layout_images(layout, &global);
+    }
 
     let spawn_all_modules = |layout: &serde_json::Value,
                               tx: &mpsc::Sender<(String, String)>,
@@ -383,7 +407,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut render_cache = RenderCache::new(30);
     let mut bgrx: Arc<Vec<u8>> = render_cache.get_or_render(
         &serde_json::to_value(&module_values).unwrap_or_default(),
-        || render_frame(resolve_layout(&raw_layout, &module_values, &module_paths), &global, phys_bar_width, mon_height, dpr),
+        || {
+            let t = std::time::Instant::now();
+            let layout = resolve_layout(&raw_layout, &module_values, &module_paths);
+            eprintln!("[costae] resolve_layout — {}µs", t.elapsed().as_micros());
+            render_frame(layout, &global, phys_bar_width, mon_height, dpr)
+        },
     );
 
     loop {
@@ -411,7 +440,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         if reload_rx.try_recv().is_ok() {
             if let Ok(cfg) = costae::load_config(&config_path) {
-                if cfg.config.width != bar_width {
+                if cfg.config.width != bar_width || cfg.config.outer_gap != outer_gap {
                     // Bar width changed — the X11 window must be recreated at the new physical
                     // size, so re-exec the process (same mechanism as binary hot-reload).
                     eprintln!("[costae] bar width changed, restarting...");
@@ -423,7 +452,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let _ = std::process::Command::new(&exe_path).exec();
                     // exec failed — fall through to in-place reload
                 }
-                raw_layout = Some(cfg.layout);
+                raw_layout = cfg.layout;
+                layout_file = cfg.layout_file.clone();
+            }
+            if let Some(ref path) = layout_file {
+                let ctx = serde_json::json!({
+                    "output": output_name,
+                    "dpi": dpi,
+                    "width": bar_width,
+                    "outer_gap": outer_gap,
+                });
+                match std::fs::read_to_string(path) {
+                    Ok(source) => match costae::jsx::eval_jsx(&source, ctx) {
+                        Ok(value) => { raw_layout = Some(value); }
+                        Err(e) => { eprintln!("[costae] JSX eval error: {e}"); }
+                    },
+                    Err(e) => { eprintln!("[costae] JSX file error: {e}"); }
+                }
             }
             for child in &mut module_children {
                 let _ = child.kill();
@@ -493,7 +538,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if changed {
             let key = serde_json::to_value(&module_values).unwrap_or_default();
             bgrx = render_cache.get_or_render(&key, || {
-                render_frame(resolve_layout(&raw_layout, &module_values, &module_paths), &global, phys_bar_width, mon_height, dpr)
+                let t = std::time::Instant::now();
+                let layout = resolve_layout(&raw_layout, &module_values, &module_paths);
+                eprintln!("[costae] resolve_layout — {}µs", t.elapsed().as_micros());
+                render_frame(layout, &global, phys_bar_width, mon_height, dpr)
             });
             conn.put_image(ImageFormat::Z_PIXMAP, win_id, gc, phys_bar_width as u16, mon_height as u16, 0, 0, 0, depth, &bgrx[..])?;
             conn.flush()?;
