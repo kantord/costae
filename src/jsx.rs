@@ -8,19 +8,37 @@ use oxc_semantic::SemanticBuilder;
 use oxc_span::SourceType;
 use oxc_transformer::{JsxOptions, JsxRuntime, TransformOptions, Transformer};
 
-/// Wraps the JSX *source* (before transformation) so that all declarations live inside
-/// `globalThis._render = function() { ... }` and the root expression gets `return`.
+/// Wraps the JSX *source* so that all top-level declarations live inside
+/// `globalThis._render = function() { ... }` and the final expression becomes its
+/// return value.
 ///
-/// Operating on the pre-transform source is reliable: inside function bodies the `(`
-/// that opens a `return (` is NOT at column 0 (it's preceded by `return ` on the same
-/// line), so `rfind("\n(")` unambiguously finds only the top-level root expression.
-/// Each call to `_render()` gets fresh bindings, so `const`/`let` work correctly.
+/// Uses OXC's AST to locate the last `ExpressionStatement` in `Program.body` by byte
+/// offset — no string heuristics. This means wrapping parens around the root expression
+/// are never required; the user just writes their JSX as the final statement.
+///
+/// Each call to `_render()` creates fresh variable bindings, so `const`/`let`
+/// declarations in the body work correctly across multiple invocations.
 fn wrap_source_as_render_fn(source: &str) -> String {
-    if let Some(pos) = source.rfind("\n(") {
-        let before = &source[..pos + 1]; // up to and including the \n
-        let after = &source[pos + 1..];  // the root expression starting with (
+    use oxc_ast::ast::Statement;
+
+    let allocator = Allocator::default();
+    let ret = Parser::new(&allocator, source, SourceType::jsx()).parse();
+
+    // Find the byte offset of the last top-level ExpressionStatement.
+    let split_at = ret.program.body.last().and_then(|stmt| {
+        if let Statement::ExpressionStatement(expr) = stmt {
+            Some(expr.span.start as usize)
+        } else {
+            None
+        }
+    });
+
+    if let Some(start) = split_at {
+        let before = &source[..start];
+        let after = &source[start..];
         format!("globalThis._render = function() {{\n{}return {};\n}};\n", before, after)
     } else {
+        // Fallback: no top-level expression found — wrap the whole source.
         format!("globalThis._render = function() {{\nreturn {};\n}};\n", source)
     }
 }
@@ -288,6 +306,24 @@ mod tests {
             &std::collections::HashMap::new(),
         ).unwrap();
         assert!(module_calls.contains(&"/usr/bin/test-module".to_string()));
+    }
+
+    #[test]
+    fn wrap_source_as_render_fn_works_without_wrapping_parens() {
+        // Root expression has no wrapping parens — AST split must still find it correctly.
+        let source = r#"
+function Inner({ val }) {
+  return (
+    <text tw="text-white">{val}</text>
+  );
+}
+<Inner val={useStringStream("/bin/bash", "x")} />"#;
+        let evaluator = JsxEvaluator::new(source, serde_json::Value::Null).unwrap();
+
+        let mut s = std::collections::HashMap::new();
+        s.insert("/bin/bash\0x".to_string(), "hello".to_string());
+        let (result, _, _) = evaluator.eval(&s).unwrap();
+        assert_eq!(result["text"], "hello");
     }
 
     #[test]

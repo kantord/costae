@@ -350,6 +350,7 @@ dependencies = [
  "libc",
  "lru",
  "oxc_allocator",
+ "oxc_ast",
  "oxc_codegen",
  "oxc_parser",
  "oxc_semantic",
