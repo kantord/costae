@@ -551,6 +551,9 @@ pub struct PanelSpec {
     pub outer_gap: u32,
     /// RandR output name to place this panel on (e.g. "DP-2"). None = primary output.
     pub output: Option<String>,
+    /// When true the window is stacked above other windows (for floating overlays like
+    /// notifications). When false (default) the window sits below tiled content.
+    pub above: bool,
     /// The layout subtree that lives inside this panel (first child of the panel node).
     pub content: serde_json::Value,
 }
@@ -594,13 +597,16 @@ pub fn parse_root_node(root: &serde_json::Value) -> Result<Vec<PanelSpec>, Strin
             let output = panel.get("output")
                 .and_then(|v| v.as_str())
                 .map(str::to_string);
+            let above = panel.get("above")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             // The panel's layout content: first child (typically a root container).
             let content = panel.get("children")
                 .and_then(|c| c.as_array())
                 .and_then(|c| c.first())
                 .cloned()
                 .unwrap_or(serde_json::Value::Null);
-            Ok(PanelSpec { id, anchor, width, height, x, y, outer_gap, output, content })
+            Ok(PanelSpec { id, anchor, width, height, x, y, outer_gap, output, above, content })
         })())
     }).collect()
 }
@@ -720,7 +726,7 @@ mod tests {
     #[test]
     fn reconcile_panels_partitions_specs_into_create_update_destroy() {
         fn spec(id: &str) -> PanelSpec {
-            PanelSpec { id: id.to_string(), anchor: None, width: 100, height: 100, x: 0, y: 0, outer_gap: 0, output: None, content: serde_json::Value::Null }
+            PanelSpec { id: id.to_string(), anchor: None, width: 100, height: 100, x: 0, y: 0, outer_gap: 0, output: None, above: false, content: serde_json::Value::Null }
         }
         let new_specs = vec![spec("sidebar"), spec("topbar")];
         let (to_create, to_update, to_destroy) = reconcile_panels(&["sidebar", "bottombar"], &new_specs);

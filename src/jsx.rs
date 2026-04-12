@@ -1,6 +1,8 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+use rquickjs::CatchResultExt;
+
 use oxc_allocator::Allocator;
 use oxc_codegen::Codegen;
 use oxc_parser::Parser;
@@ -133,7 +135,9 @@ impl JsxEvaluator {
         self.module_calls.lock().unwrap().clear();
 
         self.context.with(|qjs_ctx| {
-            let value: rquickjs::Value = qjs_ctx.eval("_render()")?;
+            let value: rquickjs::Value = qjs_ctx.eval("_render()")
+                .catch(&qjs_ctx)
+                .map_err(|e| { eprintln!("[costae] JS exception:\n{e}"); rquickjs::Error::Exception })?;
             let json_str = qjs_ctx
                 .json_stringify(value)?
                 .ok_or(rquickjs::Error::Unknown)?

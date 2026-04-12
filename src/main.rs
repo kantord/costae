@@ -223,7 +223,10 @@ fn create_panel(
         Some(costae::PanelAnchor::Right) => (mon_x + mon_width as i16 - phys_width as i16, mon_y),
         Some(costae::PanelAnchor::Top)   => (mon_x, mon_y),
         Some(costae::PanelAnchor::Bottom)=> (mon_x, mon_y + mon_height as i16 - phys_height as i16),
-        None => (mon_x + spec.x as i16, mon_y + spec.y as i16),
+        None => (
+            mon_x + (spec.x as f32 * x11.dpr).round() as i16,
+            mon_y + (spec.y as f32 * x11.dpr).round() as i16,
+        ),
     };
 
     let win_id = x11.conn.generate_id()?;
@@ -249,7 +252,8 @@ fn create_panel(
     inject_root_bg(x11.global, root_bg_rgba.clone(), phys_width, phys_height);
 
     x11.conn.map_window(win_id)?;
-    x11.conn.configure_window(win_id, &ConfigureWindowAux::new().stack_mode(StackMode::BELOW))?;
+    let stack_mode = if spec.above { StackMode::ABOVE } else { StackMode::BELOW };
+    x11.conn.configure_window(win_id, &ConfigureWindowAux::new().stack_mode(stack_mode))?;
 
     if let Some(anchor) = spec.anchor.clone() {
         let strut_vals = costae::strut_partial_values_for_anchor(
