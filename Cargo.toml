@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "costae-i3", "costae-luax"]
+members = [".", "costae-i3", "costae-luax", "costae-notify"]
 resolver = "2"
 
 [package]

@@ -698,24 +698,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 x11rb::protocol::Event::PropertyNotify(e) => {
                     if xrootpmap_atom == Some(e.atom) {
-                        if let Some(atom) = xrootpmap_atom {
-                            let pixmap = conn
-                                .get_property(false, screen.root, atom, AtomEnum::ANY, 0, 1).ok()
-                                .and_then(|c| c.reply().ok())
-                                .filter(|p| p.value.len() >= 4)
-                                .and_then(|p| p.value[..4].try_into().ok().map(u32::from_ne_bytes));
-                            if let Some(pixmap_id) = pixmap {
-                                // Re-sample each panel's own wallpaper region.
-                                for panel in panels.iter_mut() {
-                                    if let Some(img) = conn.get_image(ImageFormat::Z_PIXMAP, pixmap_id, panel.win_x, panel.win_y, panel.phys_width as u16, panel.phys_height as u16, !0).ok().and_then(|c| c.reply().ok()) {
-                                        panel.root_bg_rgba = x11_bgrx_to_rgba(&img.data);
-                                        eprintln!("[costae] root bg updated for panel '{}'", panel.id);
-                                    }
-                                    panel.render_cache = RenderCache::new(30);
-                                }
-                                changed = true;
+                        // Wallpaper changed: re-sample each panel's own region using the
+                        // same 3-tier fallback as initial sampling so every monitor gets
+                        // the correct pixels regardless of pixmap layout.
+                        for panel in panels.iter_mut() {
+                            if let Some(rgba) = sample_root_bg(&conn, screen.root, panel.win_x, panel.win_y, panel.phys_width, panel.phys_height, xrootpmap_atom) {
+                                panel.root_bg_rgba = rgba;
+                                eprintln!("[costae] root bg updated for panel '{}'", panel.id);
                             }
+                            panel.render_cache = RenderCache::new(30);
                         }
+                        changed = true;
                     }
                 }
                 _ => {}
