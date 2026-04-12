@@ -86,6 +86,7 @@ pub struct JsxEvaluator {
     stream_values: Arc<std::sync::RwLock<std::collections::HashMap<String, String>>>,
     calls: Arc<Mutex<Vec<(String, Option<String>)>>>,
     module_calls: Arc<Mutex<Vec<String>>>,
+    global_state: Arc<Mutex<serde_json::Map<String, serde_json::Value>>>,
 }
 
 impl JsxEvaluator {
@@ -123,7 +124,8 @@ impl JsxEvaluator {
             })?;
         }
 
-        Ok(Self { context, _runtime: runtime, stream_values, calls, module_calls })
+        let global_state = Arc::new(Mutex::new(serde_json::Map::new()));
+        Ok(Self { context, _runtime: runtime, stream_values, calls, module_calls, global_state })
     }
 
     pub fn eval(
@@ -135,9 +137,23 @@ impl JsxEvaluator {
         self.module_calls.lock().unwrap().clear();
 
         self.context.with(|qjs_ctx| {
+            let state_json = serde_json::to_string(&*self.global_state.lock().unwrap())
+                .map_err(|_| rquickjs::Error::Unknown)?;
+            qjs_ctx.eval::<(), _>(format!("globalThis.globals = {};", state_json).as_str())?;
+
             let value: rquickjs::Value = qjs_ctx.eval("_render()")
                 .catch(&qjs_ctx)
                 .map_err(|e| { eprintln!("[costae] JS exception:\n{e}"); rquickjs::Error::Exception })?;
+
+            let globals_val: rquickjs::Value = qjs_ctx.eval("globalThis.globals")?;
+            let globals_json_str = qjs_ctx
+                .json_stringify(globals_val)?
+                .ok_or(rquickjs::Error::Unknown)?
+                .to_string()?;
+            if let Ok(new_state) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&globals_json_str) {
+                *self.global_state.lock().unwrap() = new_state;
+            }
+
             let json_str = qjs_ctx
                 .json_stringify(value)?
                 .ok_or(rquickjs::Error::Unknown)?
@@ -355,6 +371,28 @@ function Inner({ val }) {
         s2.insert("/bin/bash\0x".to_string(), "second".to_string());
         let (r2, _, _) = evaluator.eval(&s2).unwrap();
         assert_eq!(r2["text"], "second");
+    }
+
+    #[test]
+    fn globals_object_persists_value_across_eval_calls() {
+        let evaluator = JsxEvaluator::new(
+            r#"
+globals.count ??= 0;
+globals.count += 1;
+<text tw="text-white">{String(globals.count)}</text>
+            "#,
+            serde_json::Value::Null,
+        ).unwrap();
+
+        let streams = std::collections::HashMap::new();
+        let (r1, _, _) = evaluator.eval(&streams).unwrap();
+        assert_eq!(r1["text"], "1");
+
+        let (r2, _, _) = evaluator.eval(&streams).unwrap();
+        assert_eq!(r2["text"], "2");
+
+        let (r3, _, _) = evaluator.eval(&streams).unwrap();
+        assert_eq!(r3["text"], "3");
     }
 
     #[test]
