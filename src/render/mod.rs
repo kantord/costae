@@ -1,0 +1,266 @@
+use std::num::NonZeroUsize;
+use std::sync::Arc;
+
+use lru::LruCache;
+use takumi::{
+    GlobalContext,
+    layout::{Viewport, node::Node},
+    rendering::{RenderOptions, render},
+    resources::{font::FontResource, image::ImageSource},
+};
+
+/// LRU cache of rendered frames keyed on the canonical JSON of `module_values`.
+///
+/// Canonical JSON (RFC 8785 via `json_canon`) normalises object key order so that
+/// `{"a":1,"b":2}` and `{"b":2,"a":1}` resolve to the same cache entry.
+///
+/// Frames are stored as `Arc<Vec<u8>>` so the caller can hold onto the current
+/// frame across loop iterations even after it has been evicted from the cache
+/// (e.g. the bar needs to repaint on Expose while the cache has already moved on).
+pub struct RenderCache {
+    cache: LruCache<String, Arc<Vec<u8>>>,
+}
+
+impl RenderCache {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            cache: LruCache::new(NonZeroUsize::new(capacity).unwrap()),
+        }
+    }
+
+    pub fn get_or_render<F>(&mut self, key: &serde_json::Value, render: F) -> Arc<Vec<u8>>
+    where
+        F: FnOnce() -> Vec<u8>,
+    {
+        let t = std::time::Instant::now();
+        let canonical = json_canon::to_string(key).unwrap_or_default();
+        if let Some(cached) = self.cache.get(&canonical) {
+            tracing::debug!(elapsed_us = t.elapsed().as_micros(), bytes = cached.len(), "render cache HIT");
+            return Arc::clone(cached);
+        }
+        let result = Arc::new(render());
+        tracing::debug!(elapsed_ms = t.elapsed().as_millis(), bytes = result.len(), "render cache MISS");
+        self.cache.put(canonical, Arc::clone(&result));
+        result
+    }
+}
+
+/// Render `layout` into a BGRX framebuffer.
+///
+/// `width` and `height` are **physical** pixels — the X11 window dimensions.
+/// `dpr = dpi / 96.0` scales CSS `px` units so that `1px` in the config equals
+/// one logical pixel regardless of display density, matching i3's own scaling.
+/// The returned buffer is always `width × height × 4` bytes (BGRX).
+pub fn render_frame(layout: Option<Node>, global: &GlobalContext, width: u32, height: u32, dpr: f32) -> Vec<u8> {
+    let node = layout.unwrap_or_else(|| Node::container(vec![]));
+    let options = RenderOptions::builder()
+        .global(global)
+        .viewport(Viewport::new((Some(width), Some(height))).with_device_pixel_ratio(dpr))
+        .node(node)
+        .build();
+    let rgba = render(options).expect("render").into_raw();
+    let mut bgrx = Vec::with_capacity(rgba.len());
+    for px in rgba.chunks_exact(4) {
+        bgrx.extend_from_slice(&[px[2], px[1], px[0], 0x00]);
+    }
+    bgrx
+}
+
+pub fn load_fonts(global: &mut GlobalContext) {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let local_fonts = format!("{home}/.local/share/fonts");
+    let dot_fonts = format!("{home}/.fonts");
+
+    let candidate_dirs: Vec<std::path::PathBuf> = vec![
+        std::path::PathBuf::from("/usr/share/fonts/TTF"),
+        std::path::PathBuf::from("/usr/share/fonts/truetype"),
+        std::path::PathBuf::from("/usr/share/fonts/OTF"),
+        std::path::PathBuf::from("/usr/share/fonts/opentype"),
+        std::path::PathBuf::from(&local_fonts),
+        std::path::PathBuf::from(&dot_fonts),
+    ];
+
+    let dir_refs: Vec<&std::path::Path> = candidate_dirs.iter().map(|p| p.as_path()).collect();
+    for path in find_font_files(&dir_refs) {
+        if let Ok(bytes) = std::fs::read(&path) {
+            let _ = global.font_context.load_and_store(FontResource::new(bytes));
+        }
+    }
+}
+
+pub fn find_font_files(dirs: &[&std::path::Path]) -> Vec<std::path::PathBuf> {
+    let mut results = Vec::new();
+    for &dir in dirs {
+        let read_dir = match std::fs::read_dir(dir) {
+            Ok(rd) => rd,
+            Err(_) => continue,
+        };
+        for entry in read_dir.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                let ext_lower = ext.to_ascii_lowercase();
+                if ext_lower == "ttf" || ext_lower == "otf" {
+                    results.push(path);
+                }
+            }
+        }
+    }
+    results
+}
+
+#[cfg(test)]
+mod tests {
+    use super::find_font_files;
+    use std::fs;
+    use std::path::PathBuf;
+
+    /// Create a uniquely-named subdirectory inside `std::env::temp_dir()` and
+    /// return its path. The caller is responsible for cleanup via `fs::remove_dir_all`.
+    fn make_temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("costae_find_font_files_{}", name));
+        let _ = fs::remove_dir_all(&dir); // clean up leftovers from previous runs
+        fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    #[test]
+    fn empty_dirs_slice_returns_empty_vec() {
+        let result = find_font_files(&[]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn ttf_file_is_returned() {
+        let dir = make_temp_dir("ttf");
+        let font_path = dir.join("MyFont.ttf");
+        fs::write(&font_path, b"fake ttf").unwrap();
+
+        let result = find_font_files(&[dir.as_path()]);
+
+        fs::remove_dir_all(&dir).ok();
+        assert_eq!(result, vec![font_path]);
+    }
+
+    #[test]
+    fn otf_file_is_returned() {
+        let dir = make_temp_dir("otf");
+        let font_path = dir.join("MyFont.otf");
+        fs::write(&font_path, b"fake otf").unwrap();
+
+        let result = find_font_files(&[dir.as_path()]);
+
+        fs::remove_dir_all(&dir).ok();
+        assert_eq!(result, vec![font_path]);
+    }
+
+    #[test]
+    fn non_font_extensions_are_ignored() {
+        let dir = make_temp_dir("nonfont");
+        fs::write(dir.join("readme.txt"), b"text").unwrap();
+        fs::write(dir.join("icon.woff"), b"woff").unwrap();
+
+        let result = find_font_files(&[dir.as_path()]);
+
+        fs::remove_dir_all(&dir).ok();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn nonexistent_directory_is_skipped_silently() {
+        let missing = std::env::temp_dir().join("costae_find_font_files_does_not_exist_xyz123");
+        let result = find_font_files(&[missing.as_path()]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn files_from_multiple_directories_are_combined() {
+        let dir_a = make_temp_dir("multi_a");
+        let dir_b = make_temp_dir("multi_b");
+        let font_a = dir_a.join("A.ttf");
+        let font_b = dir_b.join("B.otf");
+        fs::write(&font_a, b"ttf").unwrap();
+        fs::write(&font_b, b"otf").unwrap();
+
+        let mut result = find_font_files(&[dir_a.as_path(), dir_b.as_path()]);
+        result.sort();
+
+        let mut expected = vec![font_a, font_b];
+        expected.sort();
+
+        fs::remove_dir_all(&dir_a).ok();
+        fs::remove_dir_all(&dir_b).ok();
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn subdirectory_fonts_are_not_included() {
+        let dir = make_temp_dir("subdir");
+        let subdir = dir.join("nested");
+        fs::create_dir_all(&subdir).unwrap();
+        fs::write(subdir.join("deep.ttf"), b"ttf").unwrap();
+
+        let result = find_font_files(&[dir.as_path()]);
+
+        fs::remove_dir_all(&dir).ok();
+        assert!(result.is_empty(), "expected no files from subdirectory, got {:?}", result);
+    }
+
+    #[test]
+    fn extension_match_is_case_insensitive() {
+        let dir = make_temp_dir("case");
+        let upper_ttf = dir.join("UPPER.TTF");
+        let mixed_otf = dir.join("Mixed.OtF");
+        fs::write(&upper_ttf, b"ttf").unwrap();
+        fs::write(&mixed_otf, b"otf").unwrap();
+
+        let mut result = find_font_files(&[dir.as_path()]);
+        result.sort();
+
+        let mut expected = vec![upper_ttf, mixed_otf];
+        expected.sort();
+
+        fs::remove_dir_all(&dir).ok();
+        assert_eq!(result, expected);
+    }
+}
+
+pub fn preload_layout_images(layout: &serde_json::Value, global: &GlobalContext) {
+    fn walk(value: &serde_json::Value, srcs: &mut Vec<String>) {
+        match value {
+            serde_json::Value::Object(map) => {
+                if map.get("type").and_then(|t| t.as_str()) == Some("image") {
+                    if let Some(src) = map.get("src").and_then(|s| s.as_str()) {
+                        srcs.push(src.to_string());
+                    }
+                    return; // image nodes are terminal
+                }
+                for v in map.values() {
+                    walk(v, srcs);
+                }
+            }
+            serde_json::Value::Array(arr) => {
+                for v in arr {
+                    walk(v, srcs);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut srcs = Vec::new();
+    walk(layout, &mut srcs);
+
+    for src in srcs {
+        if src.starts_with("http://") || src.starts_with("https://") || src.starts_with("data:") {
+            continue;
+        }
+        if let Ok(bytes) = std::fs::read(&src) {
+            if let Ok(image) = ImageSource::from_bytes(&bytes) {
+                global.persistent_image_store.insert(src, image);
+            }
+        }
+    }
+}

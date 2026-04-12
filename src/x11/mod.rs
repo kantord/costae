@@ -1,0 +1,95 @@
+use takumi::GlobalContext;
+use tiny_skia::{IntSize, Pixmap};
+use takumi::resources::image::ImageSource;
+
+pub use crate::layout::{PanelAnchor, PanelSpec};
+
+/// Convert X11 ZPixmap BGRX bytes (4 bytes per pixel, X padding ignored) to RGBA
+/// with alpha=255 (wallpaper is always fully opaque).
+pub fn x11_bgrx_to_rgba(bgrx: &[u8]) -> Vec<u8> {
+    let mut rgba = Vec::with_capacity(bgrx.len());
+    for px in bgrx.chunks_exact(4) {
+        rgba.push(px[2]); // R
+        rgba.push(px[1]); // G
+        rgba.push(px[0]); // B
+        rgba.push(0xFF);  // A
+    }
+    rgba
+}
+
+/// Store a raw RGBA wallpaper slice (already cropped to bar dimensions) in the
+/// persistent image store under the key `"root-bg"` so layout nodes can
+/// reference it via `backgroundImage: "url(root-bg)"` in the config.
+///
+/// Because takumi sees this as real pixel content behind elements in the render
+/// tree, CSS `backdrop-filter: blur()` on cards will correctly blur the wallpaper
+/// — the same effect that a compositor would produce, but in pure software.
+pub fn inject_root_bg(global: &GlobalContext, rgba: Vec<u8>, width: u32, height: u32) {
+    if let Some(size) = IntSize::from_wh(width, height) {
+        if let Some(pixmap) = Pixmap::from_vec(rgba, size) {
+            global.persistent_image_store.insert("root-bg".to_string(), ImageSource::from(pixmap));
+        }
+    }
+}
+
+/// Compute `_NET_WM_STRUT_PARTIAL` values for a panel anchored to a screen edge.
+///
+/// The 12-element array follows the EWMH spec:
+///   [0] left, [1] right, [2] top, [3] bottom,
+///   [4] left_start_y,  [5] left_end_y,
+///   [6] right_start_y, [7] right_end_y,
+///   [8] top_start_x,   [9] top_end_x,
+///   [10] bottom_start_x, [11] bottom_end_x
+///
+/// All values are in physical pixels, absolute from the screen origin.
+pub fn strut_partial_values_for_anchor(
+    anchor: PanelAnchor,
+    mon_x: i16,
+    mon_y: i16,
+    _mon_width: u32,
+    mon_height: u32,
+    phys_panel_width: u32,
+    phys_panel_height: u32,
+) -> [u32; 12] {
+    let mut v = [0u32; 12];
+    match anchor {
+        PanelAnchor::Left => {
+            v[0] = mon_x as u32 + phys_panel_width;
+            v[4] = mon_y as u32;
+            v[5] = mon_y as u32 + mon_height.saturating_sub(1);
+        }
+        PanelAnchor::Right => {
+            v[1] = phys_panel_width; // measured from right screen edge
+            v[6] = mon_y as u32;
+            v[7] = mon_y as u32 + mon_height.saturating_sub(1);
+        }
+        PanelAnchor::Top => {
+            v[2] = mon_y as u32 + phys_panel_height;
+            v[8] = mon_x as u32;
+            v[9] = mon_x as u32 + _mon_width.saturating_sub(1);
+        }
+        PanelAnchor::Bottom => {
+            v[3] = phys_panel_height; // measured from bottom screen edge
+            v[10] = mon_x as u32;
+            v[11] = mon_x as u32 + _mon_width.saturating_sub(1);
+        }
+    }
+    v
+}
+
+/// Convert an X11 TrueColor pixel value (0x00RRGGBB for standard 24bpp visuals)
+/// to a flat RGBA buffer of `width × height` pixels, all the same solid color.
+/// Used as a fallback when no wallpaper pixmap is set (e.g. i3 solid background).
+pub fn solid_color_rgba(pixel: u32, width: u32, height: u32) -> Vec<u8> {
+    let r = ((pixel >> 16) & 0xFF) as u8;
+    let g = ((pixel >> 8) & 0xFF) as u8;
+    let b = (pixel & 0xFF) as u8;
+    let count = (width * height) as usize;
+    let mut rgba = Vec::with_capacity(count * 4);
+    for _ in 0..count {
+        rgba.extend_from_slice(&[r, g, b, 0xFF]);
+    }
+    rgba
+}
+
+pub mod panel;

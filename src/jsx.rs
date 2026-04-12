@@ -47,17 +47,17 @@ fn wrap_source_as_render_fn(source: &str) -> String {
 
 const JSX_GLOBALS_JS: &str = r#"
     globalThis._jsx = (tag, props, ...children) => {
+        const flat = children.flat().filter(c => c !== null && c !== undefined && c !== false);
         if (typeof tag === 'function') {
-            return tag({ ...props, children: children.flat() });
+            return tag({ ...props, children: flat });
         }
         if (tag === 'text') {
-            const flat = children.flat();
-            const text = flat.length === 1 && flat[0] !== null && typeof flat[0] === 'object'
+            const text = flat.length === 1 && typeof flat[0] === 'object'
                 ? flat[0]
                 : flat.join('');
             return { type: tag, ...props, text };
         }
-        return { type: tag, ...props, children: children.flat() };
+        return { type: tag, ...props, children: flat };
     };
     globalThis.useJSONStream = (bin, script) => {
         const str = useStringStream(bin, script);
@@ -83,9 +83,10 @@ const JSX_GLOBALS_JS: &str = r#"
 pub struct JsxEvaluator {
     context: rquickjs::Context,
     _runtime: rquickjs::Runtime,
-    stream_values: Arc<std::sync::RwLock<std::collections::HashMap<String, String>>>,
+    stream_values: Arc<std::sync::RwLock<std::collections::HashMap<(String, Option<String>), String>>>,
     calls: Arc<Mutex<Vec<(String, Option<String>)>>>,
     module_calls: Arc<Mutex<Vec<String>>>,
+    global_state: Arc<Mutex<serde_json::Map<String, serde_json::Value>>>,
 }
 
 impl JsxEvaluator {
@@ -93,7 +94,7 @@ impl JsxEvaluator {
         let render_js = transform_jsx(&wrap_source_as_render_fn(source));
         let runtime = rquickjs::Runtime::new()?;
         let context = rquickjs::Context::full(&runtime)?;
-        let stream_values = Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
+        let stream_values: Arc<std::sync::RwLock<std::collections::HashMap<(String, Option<String>), String>>> = Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
         let calls: Arc<Mutex<Vec<(String, Option<String>)>>> = Arc::new(Mutex::new(Vec::new()));
         let module_calls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
 
@@ -105,8 +106,7 @@ impl JsxEvaluator {
                 qjs_ctx.eval::<(), _>(JSX_GLOBALS_JS)?;
                 let func = rquickjs::Function::new(qjs_ctx.clone(), move |bin: String, script: Option<String>| {
                     calls_inner.lock().unwrap().push((bin.clone(), script.clone()));
-                    let key = format!("{}\0{}", bin, script.unwrap_or_default());
-                    sv.read().unwrap().get(&key).cloned().unwrap_or_default()
+                    sv.read().unwrap().get(&(bin, script)).cloned().unwrap_or_default()
                 })?;
                 qjs_ctx.globals().set("useStringStream", func)?;
                 let func2 = rquickjs::Function::new(qjs_ctx.clone(), move |bin: String| {
@@ -123,21 +123,36 @@ impl JsxEvaluator {
             })?;
         }
 
-        Ok(Self { context, _runtime: runtime, stream_values, calls, module_calls })
+        let global_state = Arc::new(Mutex::new(serde_json::Map::new()));
+        Ok(Self { context, _runtime: runtime, stream_values, calls, module_calls, global_state })
     }
 
     pub fn eval(
         &self,
-        new_stream_values: &std::collections::HashMap<String, String>,
+        new_stream_values: &std::collections::HashMap<(String, Option<String>), String>,
     ) -> rquickjs::Result<(serde_json::Value, Vec<(String, Option<String>)>, Vec<String>)> {
         *self.stream_values.write().unwrap() = new_stream_values.clone();
         self.calls.lock().unwrap().clear();
         self.module_calls.lock().unwrap().clear();
 
         self.context.with(|qjs_ctx| {
+            let state_json = serde_json::to_string(&*self.global_state.lock().unwrap())
+                .map_err(|_| rquickjs::Error::Unknown)?;
+            qjs_ctx.eval::<(), _>(format!("globalThis.globals = {};", state_json).as_str())?;
+
             let value: rquickjs::Value = qjs_ctx.eval("_render()")
                 .catch(&qjs_ctx)
-                .map_err(|e| { eprintln!("[costae] JS exception:\n{e}"); rquickjs::Error::Exception })?;
+                .map_err(|e| { tracing::error!(exception = %e, "JS exception"); rquickjs::Error::Exception })?;
+
+            let globals_val: rquickjs::Value = qjs_ctx.eval("globalThis.globals")?;
+            let globals_json_str = qjs_ctx
+                .json_stringify(globals_val)?
+                .ok_or(rquickjs::Error::Unknown)?
+                .to_string()?;
+            if let Ok(new_state) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&globals_json_str) {
+                *self.global_state.lock().unwrap() = new_state;
+            }
+
             let json_str = qjs_ctx
                 .json_stringify(value)?
                 .ok_or(rquickjs::Error::Unknown)?
@@ -150,7 +165,7 @@ impl JsxEvaluator {
     }
 }
 
-pub fn eval_jsx(source: &str, ctx: serde_json::Value, stream_values: &std::collections::HashMap<String, String>) -> rquickjs::Result<(serde_json::Value, Vec<(String, Option<String>)>, Vec<String>)> {
+pub fn eval_jsx(source: &str, ctx: serde_json::Value, stream_values: &std::collections::HashMap<(String, Option<String>), String>) -> rquickjs::Result<(serde_json::Value, Vec<(String, Option<String>)>, Vec<String>)> {
     JsxEvaluator::new(source, ctx)?.eval(stream_values)
 }
 
@@ -230,7 +245,7 @@ mod tests {
     #[test]
     fn use_string_stream_returns_injected_value() {
         let mut streams = std::collections::HashMap::new();
-        streams.insert("/usr/bin/bash\0echo hi".to_string(), "hello".to_string());
+        streams.insert(("/usr/bin/bash".to_string(), Some("echo hi".to_string())), "hello".to_string());
         let (result, _, _) = eval_jsx(
             r#"<text tw="text-white">{useStringStream("/usr/bin/bash", "echo hi")}</text>"#,
             serde_json::Value::Null,
@@ -292,7 +307,7 @@ mod tests {
     #[test]
     fn use_json_stream_parses_latest_json_output() {
         let mut streams = std::collections::HashMap::new();
-        streams.insert("/usr/bin/test\0".to_string(), r#"{"name":"hello"}"#.to_string());
+        streams.insert(("/usr/bin/test".to_string(), None), r#"{"name":"hello"}"#.to_string());
         let (result, _, _) = eval_jsx(
             r#"<text tw="text-white">{useJSONStream("/usr/bin/test").name}</text>"#,
             serde_json::Value::Null,
@@ -325,7 +340,7 @@ function Inner({ val }) {
         let evaluator = JsxEvaluator::new(source, serde_json::Value::Null).unwrap();
 
         let mut s = std::collections::HashMap::new();
-        s.insert("/bin/bash\0x".to_string(), "hello".to_string());
+        s.insert(("/bin/bash".to_string(), Some("x".to_string())), "hello".to_string());
         let (result, _, _) = evaluator.eval(&s).unwrap();
         assert_eq!(result["text"], "hello");
     }
@@ -347,14 +362,36 @@ function Inner({ val }) {
         let evaluator = JsxEvaluator::new(source, serde_json::Value::Null).unwrap();
 
         let mut s1 = std::collections::HashMap::new();
-        s1.insert("/bin/bash\0x".to_string(), "first".to_string());
+        s1.insert(("/bin/bash".to_string(), Some("x".to_string())), "first".to_string());
         let (r1, _, _) = evaluator.eval(&s1).unwrap();
         assert_eq!(r1["text"], "first");
 
         let mut s2 = std::collections::HashMap::new();
-        s2.insert("/bin/bash\0x".to_string(), "second".to_string());
+        s2.insert(("/bin/bash".to_string(), Some("x".to_string())), "second".to_string());
         let (r2, _, _) = evaluator.eval(&s2).unwrap();
         assert_eq!(r2["text"], "second");
+    }
+
+    #[test]
+    fn globals_object_persists_value_across_eval_calls() {
+        let evaluator = JsxEvaluator::new(
+            r#"
+globals.count ??= 0;
+globals.count += 1;
+<text tw="text-white">{String(globals.count)}</text>
+            "#,
+            serde_json::Value::Null,
+        ).unwrap();
+
+        let streams = std::collections::HashMap::new();
+        let (r1, _, _) = evaluator.eval(&streams).unwrap();
+        assert_eq!(r1["text"], "1");
+
+        let (r2, _, _) = evaluator.eval(&streams).unwrap();
+        assert_eq!(r2["text"], "2");
+
+        let (r3, _, _) = evaluator.eval(&streams).unwrap();
+        assert_eq!(r3["text"], "3");
     }
 
     #[test]
@@ -365,13 +402,66 @@ function Inner({ val }) {
         ).unwrap();
 
         let mut streams1 = std::collections::HashMap::new();
-        streams1.insert("/bin/bash\0echo hi".to_string(), "first".to_string());
+        streams1.insert(("/bin/bash".to_string(), Some("echo hi".to_string())), "first".to_string());
         let (result1, _, _) = evaluator.eval(&streams1).unwrap();
         assert_eq!(result1["text"], "first");
 
         let mut streams2 = std::collections::HashMap::new();
-        streams2.insert("/bin/bash\0echo hi".to_string(), "second".to_string());
+        streams2.insert(("/bin/bash".to_string(), Some("echo hi".to_string())), "second".to_string());
         let (result2, _, _) = evaluator.eval(&streams2).unwrap();
         assert_eq!(result2["text"], "second");
+    }
+
+    /// Regression test for the `\0`-separator key collision bug.
+    ///
+    /// A stream identified by `(bin, None)` and a stream identified by `(bin, Some(""))`
+    /// must occupy *distinct* slots in the stream_values map passed to `JsxEvaluator::eval`.
+    /// With the current `format!("{}\0{}", bin, script.unwrap_or_default())` key scheme
+    /// both produce `"bin\0"`, so inserting two entries collapses them into one.
+    ///
+    /// This test will FAIL under the current implementation (the map has only 1 entry)
+    /// and pass once the key type is changed to `(String, Option<String>)`.
+    #[test]
+    fn stream_key_none_and_some_empty_are_not_interchangeable() {
+        let bin = "/usr/bin/foo";
+
+        // After the fix the map uses (String, Option<String>) keys, so (bin, None) and
+        // (bin, Some("")) are distinct keys and both entries are preserved.
+        let key_for_none: (String, Option<String>) = (bin.to_string(), None);
+        let key_for_empty: (String, Option<String>) = (bin.to_string(), Some("".to_string()));
+
+        // With typed keys, both entries are kept — no collision.
+        let mut map: std::collections::HashMap<(String, Option<String>), &str> = std::collections::HashMap::new();
+        map.insert(key_for_none, "value_for_none");
+        map.insert(key_for_empty, "value_for_empty");
+
+        // After the fix the map uses (String, Option<String>) keys and this will be 2.
+        // Under the current bug it is 1 — this assertion is the RED line.
+        assert_eq!(
+            map.len(),
+            2,
+            "stream_values map must have 2 distinct entries for (bin, None) and (bin, Some(\"\")); \
+             got {} — the \\0-separator key scheme causes a collision",
+            map.len()
+        );
+    }
+
+    #[test]
+    fn jsx_null_and_false_children_are_filtered_from_container() {
+        let (result, _, _) = eval_jsx(
+            r#"
+const show = false;
+<container tw="flex">
+  <text tw="text-white">visible</text>
+  {show && <text tw="text-white">hidden</text>}
+  {null}
+</container>
+            "#,
+            serde_json::Value::Null,
+            &std::collections::HashMap::new(),
+        ).unwrap();
+        let children = result["children"].as_array().unwrap();
+        assert_eq!(children.len(), 1, "expected 1 child, got: {:?}", children);
+        assert_eq!(children[0]["text"], "visible");
     }
 }
