@@ -47,17 +47,17 @@ fn wrap_source_as_render_fn(source: &str) -> String {
 
 const JSX_GLOBALS_JS: &str = r#"
     globalThis._jsx = (tag, props, ...children) => {
+        const flat = children.flat().filter(c => c !== null && c !== undefined && c !== false);
         if (typeof tag === 'function') {
-            return tag({ ...props, children: children.flat() });
+            return tag({ ...props, children: flat });
         }
         if (tag === 'text') {
-            const flat = children.flat();
-            const text = flat.length === 1 && flat[0] !== null && typeof flat[0] === 'object'
+            const text = flat.length === 1 && typeof flat[0] === 'object'
                 ? flat[0]
                 : flat.join('');
             return { type: tag, ...props, text };
         }
-        return { type: tag, ...props, children: children.flat() };
+        return { type: tag, ...props, children: flat };
     };
     globalThis.useJSONStream = (bin, script) => {
         const str = useStringStream(bin, script);
@@ -411,5 +411,24 @@ globals.count += 1;
         streams2.insert("/bin/bash\0echo hi".to_string(), "second".to_string());
         let (result2, _, _) = evaluator.eval(&streams2).unwrap();
         assert_eq!(result2["text"], "second");
+    }
+
+    #[test]
+    fn jsx_null_and_false_children_are_filtered_from_container() {
+        let (result, _, _) = eval_jsx(
+            r#"
+const show = false;
+<container tw="flex">
+  <text tw="text-white">visible</text>
+  {show && <text tw="text-white">hidden</text>}
+  {null}
+</container>
+            "#,
+            serde_json::Value::Null,
+            &std::collections::HashMap::new(),
+        ).unwrap();
+        let children = result["children"].as_array().unwrap();
+        assert_eq!(children.len(), 1, "expected 1 child, got: {:?}", children);
+        assert_eq!(children[0]["text"], "visible");
     }
 }
