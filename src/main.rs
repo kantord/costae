@@ -293,12 +293,54 @@ fn destroy_panel(panel: Panel, conn: &RustConnection) {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let log_path = {
+        let home = std::env::var("HOME").unwrap_or_default();
+        format!("{home}/.local/share/costae-crash.log")
+    };
+    {
+        let log_path = log_path.clone();
+        std::panic::set_hook(Box::new(move |info| {
+            let msg = format!("PANIC: {info}");
+            eprintln!("[costae] {msg}");
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+                use std::io::Write;
+                let _ = writeln!(f, "{msg}");
+            }
+        }));
+    }
+
     let exe_path = std::env::current_exe().unwrap_or_default();
 
     let layout_jsx_path = {
         let home = std::env::var("HOME").unwrap_or_default();
         std::path::PathBuf::from(home).join(".config/costae/layout.jsx")
     };
+
+    let last_tick = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    {
+        let last_tick = std::sync::Arc::clone(&last_tick);
+        let log_path = log_path.clone();
+        thread::spawn(move || {
+            loop {
+                thread::sleep(Duration::from_secs(10));
+                let last = last_tick.load(std::sync::atomic::Ordering::Relaxed);
+                if last == 0 { continue; }
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let stale = now.saturating_sub(last);
+                if stale > 10 {
+                    let msg = format!("FREEZE: main loop stalled for {stale}s");
+                    eprintln!("[costae] {msg}");
+                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+                        use std::io::Write;
+                        let _ = writeln!(f, "{msg}");
+                    }
+                }
+            }
+        });
+    }
 
     let (wake_tx, wake_rx) = mpsc::sync_channel::<()>(1);
 
@@ -561,6 +603,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     loop {
+        last_tick.store(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         let mut changed = false;
 
         if bin_reload_rx.try_recv().is_ok() {
