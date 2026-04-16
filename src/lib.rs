@@ -4,6 +4,7 @@ pub mod layout;
 pub mod render;
 pub mod modules;
 pub mod x11;
+pub mod managed_set;
 
 pub use takumi::GlobalContext;
 pub use takumi::rendering::MeasuredNode;

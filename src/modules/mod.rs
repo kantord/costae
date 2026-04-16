@@ -1,9 +1,9 @@
 use takumi::rendering::MeasuredNode;
 
-/// Walk the MeasuredNode and JSON trees in lockstep to find the deepest node
-/// under (click_x, click_y) that carries an `on_click` field.
-/// Returns (json_path, on_click_value) on hit, None otherwise.
-/// Transforms are relative to parent, so we accumulate them as we descend.
+/// Find the deepest node under `(click_x, click_y)` that carries an `on_click` field.
+///
+/// Walks the `MeasuredNode` and JSON trees in lockstep.
+/// Returns `(json_path, on_click_value)` on hit, `None` otherwise.
 pub fn hit_test(
     measured: &MeasuredNode,
     json: &serde_json::Value,
