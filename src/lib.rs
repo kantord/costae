@@ -1,4 +1,5 @@
 pub mod jsx;
+pub mod data_loop;
 
 use std::io::{Seek, SeekFrom, Write as IoWrite};
 use std::num::NonZeroUsize;
@@ -412,6 +413,7 @@ pub fn spawn_string_stream(
             }
             let _ = wake_tx.try_send(());
         }
+        eprintln!("[costae] stream subprocess exited: bin={:?} script={:?}", bin_owned, script_owned);
     });
     spawned.child
 }

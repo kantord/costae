@@ -14,6 +14,12 @@ use x11rb::{
     wrapper::ConnectionExt as _,
 };
 
+fn now_hms() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    format!("{:02}:{:02}:{:02}", (secs / 3600) % 24, (secs / 60) % 60, secs % 60)
+}
+
 fn resolve_layout(raw_layout: &Option<serde_json::Value>) -> Option<takumi::layout::node::Node> {
     raw_layout.as_ref().and_then(|layout| {
         parse_layout(layout)
@@ -736,6 +742,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             match event {
                 x11rb::protocol::Event::Expose(e) => {
                     if let Some(panel) = panels.iter().find(|p| p.win_id == e.window) {
+                        eprintln!("[costae {}] expose repaint panel '{}' win_id={}", now_hms(), panel.id, panel.win_id);
                         conn.put_image(ImageFormat::Z_PIXMAP, panel.win_id, panel.gc, panel.phys_width as u16, panel.phys_height as u16, 0, 0, 0, depth, &panel.bgrx[..])?;
                         conn.flush()?;
                     }
@@ -764,6 +771,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         changed = true;
                     }
                 }
+                x11rb::protocol::Event::Error(e) => {
+                    eprintln!("[costae {}] X11 async error: {:?}", now_hms(), e);
+                }
                 _ => {}
             }
         }
@@ -780,9 +790,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     eprintln!("[costae] resolve_layout — {}µs", t.elapsed().as_micros());
                     render_frame(layout, &global, panel.phys_width, panel.phys_height, dpr)
                 });
+                eprintln!("[costae {}] put_image panel '{}' win_id={}", now_hms(), panel.id, panel.win_id);
                 conn.put_image(ImageFormat::Z_PIXMAP, panel.win_id, panel.gc, panel.phys_width as u16, panel.phys_height as u16, 0, 0, 0, depth, &panel.bgrx[..])?;
             }
             conn.flush()?;
+            eprintln!("[costae {}] flush ok", now_hms());
         }
 
         let _ = wake_rx.recv_timeout(Duration::from_millis(50));

@@ -189,25 +189,40 @@ fn main() {
         println!("{}", build_workspace_data(&ws));
     }
 
-    // Thread: subscribe to i3 workspace events and forward as I3 events
+    // Thread: subscribe to i3 workspace events and forward as I3 events.
+    // Reconnects automatically if the socket drops (e.g. i3 restart).
     {
         let event_tx = event_tx.clone();
         let socket_clone = socket.clone();
         thread::spawn(move || {
-            let mut sub = match UnixStream::connect(&socket_clone) {
-                Ok(s) => s,
-                Err(_) => return,
-            };
-            let _ = i3_send(&mut sub, 2, b"[\"workspace\"]");
-            let _ = i3_recv(&mut sub);
             loop {
-                match i3_recv(&mut sub) {
-                    Ok((typ, payload)) => {
-                        if event_tx.send(ModuleEvent::I3(typ, payload)).is_err() {
+                let mut sub = match UnixStream::connect(&socket_clone) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("[costae-i3] failed to connect to i3 socket: {e}, retrying in 1s");
+                        std::thread::sleep(std::time::Duration::from_secs(1));
+                        continue;
+                    }
+                };
+                if i3_send(&mut sub, 2, b"[\"workspace\"]").is_err() { continue; }
+                if i3_recv(&mut sub).is_err() { continue; }
+                eprintln!("[costae-i3] i3 subscription connected");
+                // Trigger an immediate workspace refresh after (re)connect
+                if event_tx.send(ModuleEvent::I3(0x80000000, b"{}".to_vec())).is_err() {
+                    return;
+                }
+                loop {
+                    match i3_recv(&mut sub) {
+                        Ok((typ, payload)) => {
+                            if event_tx.send(ModuleEvent::I3(typ, payload)).is_err() {
+                                return;
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("[costae-i3] i3 subscription dropped: {e}, reconnecting...");
                             break;
                         }
                     }
-                    Err(_) => break,
                 }
             }
         });
