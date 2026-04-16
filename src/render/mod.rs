@@ -35,11 +35,11 @@ impl RenderCache {
         let t = std::time::Instant::now();
         let canonical = json_canon::to_string(key).unwrap_or_default();
         if let Some(cached) = self.cache.get(&canonical) {
-            eprintln!("[costae] render cache HIT  — {}µs ({} bytes)", t.elapsed().as_micros(), cached.len());
+            tracing::debug!(elapsed_us = t.elapsed().as_micros(), bytes = cached.len(), "render cache HIT");
             return Arc::clone(cached);
         }
         let result = Arc::new(render());
-        eprintln!("[costae] render cache MISS — {}ms ({} bytes)", t.elapsed().as_millis(), result.len());
+        tracing::debug!(elapsed_ms = t.elapsed().as_millis(), bytes = result.len(), "render cache MISS");
         self.cache.put(canonical, Arc::clone(&result));
         result
     }

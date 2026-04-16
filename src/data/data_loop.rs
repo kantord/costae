@@ -110,7 +110,7 @@ impl DataLoop {
             let mut child = match cmd.spawn() {
                 Ok(c) => c,
                 Err(e) => {
-                    eprintln!("[data_loop] failed to spawn {}: {}", spec_clone.bin, e);
+                    tracing::error!(bin = %spec_clone.bin, error = %e, "failed to spawn");
                     continue;
                 }
             };
@@ -144,14 +144,14 @@ impl DataLoop {
                 }
             });
 
-            // Spawn stderr reader thread — lines are logged to our own stderr.
+            // Spawn stderr reader thread — lines are forwarded to tracing.
             if let Some(stderr) = child.stderr.take() {
                 let bin_name = spec_clone.bin.clone();
                 thread::spawn(move || {
                     let reader = std::io::BufReader::new(stderr);
                     for line in reader.lines() {
                         match line {
-                            Ok(l) => eprintln!("[module {}] {}", bin_name, l),
+                            Ok(l) => tracing::warn!(module = %bin_name, "{l}"),
                             Err(_) => break,
                         }
                     }
@@ -180,7 +180,7 @@ impl DataLoop {
                 })
                 .collect();
             for spec in exited {
-                eprintln!("[data_loop] process exited: {}", spec.bin);
+                tracing::warn!(bin = %spec.bin, "process exited");
                 self.pool.remove(&spec);
             }
             self.reconcile_pool();

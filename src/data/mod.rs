@@ -117,7 +117,7 @@ pub fn spawn_string_stream(
             }
             let _ = wake_tx.try_send(());
         }
-        eprintln!("[costae] stream subprocess exited: bin={:?} script={:?}", bin_owned, script_owned);
+        tracing::warn!(bin = %bin_owned, script = ?script_owned, "stream subprocess exited");
     });
     spawned.child
 }

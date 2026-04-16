@@ -11,21 +11,20 @@ use x11rb::{
     rust_connection::RustConnection,
 };
 
-fn now_hms() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-    format!("{:02}:{:02}:{:02}", (secs / 3600) % 24, (secs / 60) % 60, secs % 60)
-}
-
 fn resolve_layout(raw_layout: &Option<serde_json::Value>) -> Option<takumi::layout::node::Node> {
     raw_layout.as_ref().and_then(|layout| {
         parse_layout(layout)
-            .map_err(|e| eprintln!("[costae] layout parse error: {e}"))
+            .map_err(|e| tracing::error!(error = %e, "layout parse error"))
             .ok()
     })
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env()
+            .add_directive(tracing::Level::INFO.into()))
+        .init();
+
     let log_path = {
         let home = std::env::var("HOME").unwrap_or_default();
         format!("{home}/.local/share/costae-crash.log")
@@ -34,7 +33,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let log_path = log_path.clone();
         std::panic::set_hook(Box::new(move |info| {
             let msg = format!("PANIC: {info}");
-            eprintln!("[costae] {msg}");
+            tracing::error!("{msg}");
             if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
                 use std::io::Write;
                 let _ = writeln!(f, "{msg}");
@@ -65,7 +64,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let stale = now.saturating_sub(last);
                 if stale > 10 {
                     let msg = format!("FREEZE: main loop stalled for {stale}s");
-                    eprintln!("[costae] {msg}");
+                    tracing::error!("{msg}");
                     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
                         use std::io::Write;
                         let _ = writeln!(f, "{msg}");
@@ -279,7 +278,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     panels.push(panel);
                 }
-                Err(e) => eprintln!("[costae] failed to create panel '{}': {e}", spec.id),
+                Err(e) => tracing::error!(panel = %spec.id, error = %e, "failed to create panel"),
             }
         }
 
@@ -304,10 +303,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Ok(evaluator) => {
                         match evaluator.eval(&stream_values) {
                             Ok((value, stream_calls, module_calls)) => {
-                                eprintln!("[costae] jsx eval — {}ms", t.elapsed().as_millis());
+                                tracing::debug!(elapsed_ms = t.elapsed().as_millis(), "jsx eval");
                                 let specs = match costae::parse_root_node(&value) {
                                     Ok(s) => s,
-                                    Err(e) => { eprintln!("[costae] root node parse error: {e}"); vec![] }
+                                    Err(e) => { tracing::error!(error = %e, "root node parse error"); vec![] }
                                 };
                                 let mod_init = make_mod_init(&specs);
                                 let (to_spawn, _) = reconcile_streams(&[], &stream_calls);
@@ -325,13 +324,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 apply_panel_specs(&mut panels, specs);
                                 jsx_evaluator = Some(evaluator);
                             }
-                            Err(e) => eprintln!("[costae] JSX eval error: {e}"),
+                            Err(e) => tracing::error!(error = %e, "JSX eval error"),
                         }
                     }
-                    Err(e) => eprintln!("[costae] JSX compile error: {e}"),
+                    Err(e) => tracing::error!(error = %e, "JSX compile error"),
                 }
             }
-            Err(e) => eprintln!("[costae] JSX file error: {e}"),
+            Err(e) => tracing::error!(error = %e, "JSX file error"),
         }
     }
 
@@ -346,7 +345,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut changed = false;
 
         if bin_reload_rx.try_recv().is_ok() {
-            eprintln!("[costae] binary changed, restarting...");
+            tracing::info!("binary changed, restarting...");
             for child in stream_children.values_mut() {
                 let _ = child.kill();
                 let _ = child.wait();
@@ -389,7 +388,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             Ok((value, stream_calls, module_calls)) => {
                                 let specs = match costae::parse_root_node(&value) {
                                     Ok(s) => s,
-                                    Err(e) => { eprintln!("[costae] root node parse error: {e}"); vec![] }
+                                    Err(e) => { tracing::error!(error = %e, "root node parse error"); vec![] }
                                 };
                                 let mod_init = make_mod_init(&specs);
                                 let (to_spawn, _) = reconcile_streams(&[], &stream_calls);
@@ -407,14 +406,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 apply_panel_specs(&mut panels, specs);
                                 jsx_evaluator = Some(evaluator);
                             }
-                            Err(e) => eprintln!("[costae] JSX eval error: {e}"),
+                            Err(e) => tracing::error!(error = %e, "JSX eval error"),
                         },
-                        Err(e) => eprintln!("[costae] JSX compile error: {e}"),
+                        Err(e) => tracing::error!(error = %e, "JSX compile error"),
                     },
-                    Err(e) => eprintln!("[costae] JSX file error: {e}"),
+                    Err(e) => tracing::error!(error = %e, "JSX file error"),
                 }
             }
-            eprintln!("[costae] layout reloaded");
+            tracing::info!("layout reloaded");
             changed = true;
         }
 
@@ -431,10 +430,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let t = std::time::Instant::now();
                 match evaluator.eval(&stream_values) {
                     Ok((new_value, new_calls, new_module_calls)) => {
-                        eprintln!("[costae] jsx re-eval — {}µs", t.elapsed().as_micros());
+                        tracing::debug!(elapsed_us = t.elapsed().as_micros(), "jsx re-eval");
                         let specs = match costae::parse_root_node(&new_value) {
                             Ok(s) => s,
-                            Err(e) => { eprintln!("[costae] root node parse error: {e}"); vec![] }
+                            Err(e) => { tracing::error!(error = %e, "root node parse error"); vec![] }
                         };
                         let mod_init = make_mod_init(&specs);
                         let current_calls: Vec<_> = stream_children.keys().cloned().collect();
@@ -459,7 +458,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         apply_panel_specs(&mut panels, specs);
                         changed = true;
                     }
-                    Err(e) => eprintln!("[costae] JSX re-eval error: {e}"),
+                    Err(e) => tracing::error!(error = %e, "JSX re-eval error"),
                 }
             }
         }
@@ -469,7 +468,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             match event {
                 x11rb::protocol::Event::Expose(e) => {
                     if let Some(panel) = panels.iter().find(|p| p.win_id == e.window) {
-                        eprintln!("[costae {}] expose repaint panel '{}' win_id={}", now_hms(), panel.id, panel.win_id);
+                        tracing::debug!(panel = %panel.id, win_id = panel.win_id, "expose repaint");
                         conn.put_image(ImageFormat::Z_PIXMAP, panel.win_id, panel.gc, panel.phys_width as u16, panel.phys_height as u16, 0, 0, 0, depth, &panel.bgrx[..])?;
                         conn.flush()?;
                     }
@@ -491,7 +490,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         for panel in panels.iter_mut() {
                             if let Some(rgba) = sample_root_bg(&conn, screen.root, panel.win_x, panel.win_y, panel.phys_width, panel.phys_height, xrootpmap_atom) {
                                 panel.root_bg_rgba = rgba;
-                                eprintln!("[costae] root bg updated for panel '{}'", panel.id);
+                                tracing::debug!(panel = %panel.id, "root bg updated");
                             }
                             panel.render_cache = RenderCache::new(30);
                         }
@@ -499,7 +498,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 x11rb::protocol::Event::Error(e) => {
-                    eprintln!("[costae {}] X11 async error: {:?}", now_hms(), e);
+                    tracing::error!(error = ?e, "X11 async error");
                 }
                 _ => {}
             }
@@ -514,14 +513,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 panel.bgrx = panel.render_cache.get_or_render(&key, || {
                     let t = std::time::Instant::now();
                     let layout = resolve_layout(&panel.raw_layout);
-                    eprintln!("[costae] resolve_layout — {}µs", t.elapsed().as_micros());
+                    tracing::debug!(elapsed_us = t.elapsed().as_micros(), "resolve_layout");
                     render_frame(layout, &global, panel.phys_width, panel.phys_height, dpr)
                 });
-                eprintln!("[costae {}] put_image panel '{}' win_id={}", now_hms(), panel.id, panel.win_id);
+                tracing::debug!(panel = %panel.id, win_id = panel.win_id, "put_image");
                 conn.put_image(ImageFormat::Z_PIXMAP, panel.win_id, panel.gc, panel.phys_width as u16, panel.phys_height as u16, 0, 0, 0, depth, &panel.bgrx[..])?;
             }
             conn.flush()?;
-            eprintln!("[costae {}] flush ok", now_hms());
+            tracing::debug!("flush ok");
         }
 
         let _ = wake_rx.recv_timeout(Duration::from_millis(50));

@@ -74,7 +74,7 @@ pub fn sample_root_bg(
             if let Some(img) = conn.get_image(ImageFormat::Z_PIXMAP, pixmap_id, win_x, win_y, width as u16, height as u16, !0)
                 .ok().and_then(|c| c.reply().ok())
             {
-                eprintln!("[costae] root bg from _XROOTPMAP_ID pixmap in {}ms", t.elapsed().as_millis());
+                tracing::debug!(elapsed_ms = t.elapsed().as_millis(), "root bg from _XROOTPMAP_ID pixmap");
                 return Some(x11_bgrx_to_rgba(&img.data));
             }
         }
@@ -90,18 +90,18 @@ pub fn sample_root_bg(
             let pixel = ((img.data[2] as u32) << 16)
                 | ((img.data[1] as u32) << 8)
                 | (img.data[0] as u32);
-            eprintln!("[costae] root bg from adjacent pixel ({:#06x}) in {}ms", pixel, t.elapsed().as_millis());
+            tracing::debug!(pixel = format!("{:#06x}", pixel), elapsed_ms = t.elapsed().as_millis(), "root bg from adjacent pixel");
             return Some(solid_color_rgba(pixel, width, height));
         }
     }
 
     // Tier 3: GetImage on root window — last resort.
     match conn.get_image(ImageFormat::Z_PIXMAP, root, win_x, win_y, width as u16, height as u16, !0) {
-        Err(e) => { eprintln!("[costae] root bg send error: {e:?}"); None }
+        Err(e) => { tracing::warn!(error = ?e, "root bg send error"); None }
         Ok(cookie) => match cookie.reply() {
-            Err(e) => { eprintln!("[costae] root bg reply error: {e:?}"); None }
+            Err(e) => { tracing::warn!(error = ?e, "root bg reply error"); None }
             Ok(img) => {
-                eprintln!("[costae] root bg from root window (fallback) in {}ms", t.elapsed().as_millis());
+                tracing::debug!(elapsed_ms = t.elapsed().as_millis(), "root bg from root window (fallback)");
                 Some(x11_bgrx_to_rgba(&img.data))
             }
         }
@@ -125,15 +125,15 @@ pub fn i3_dpi(conn: &RustConnection, root: Window, screen: &Screen) -> f32 {
         None
     })();
     if let Some(dpi) = from_xresources {
-        eprintln!("[costae] DPI {dpi:.1} (from Xft.dpi)");
+        tracing::info!(dpi, "DPI detected (from Xft.dpi)");
         return dpi;
     }
     if screen.height_in_millimeters > 0 {
         let dpi = screen.height_in_pixels as f32 * 25.4 / screen.height_in_millimeters as f32;
-        eprintln!("[costae] DPI {dpi:.1} (from screen physical dimensions)");
+        tracing::info!(dpi, "DPI detected (from screen physical dimensions)");
         return dpi;
     }
-    eprintln!("[costae] DPI 96.0 (fallback)");
+    tracing::warn!("DPI fallback to 96.0");
     96.0
 }
 
@@ -153,7 +153,7 @@ pub fn do_hit_test(
     };
     let node = match raw_layout.as_ref().and_then(|layout| {
         parse_layout(layout)
-            .map_err(|e| eprintln!("[costae] layout parse error: {e}"))
+            .map_err(|e| tracing::error!(error = %e, "layout parse error"))
             .ok()
     }) {
         Some(n) => n,

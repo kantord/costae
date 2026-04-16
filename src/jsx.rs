@@ -143,7 +143,7 @@ impl JsxEvaluator {
 
             let value: rquickjs::Value = qjs_ctx.eval("_render()")
                 .catch(&qjs_ctx)
-                .map_err(|e| { eprintln!("[costae] JS exception:\n{e}"); rquickjs::Error::Exception })?;
+                .map_err(|e| { tracing::error!(exception = %e, "JS exception"); rquickjs::Error::Exception })?;
 
             let globals_val: rquickjs::Value = qjs_ctx.eval("globalThis.globals")?;
             let globals_json_str = qjs_ctx
