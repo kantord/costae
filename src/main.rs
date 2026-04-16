@@ -19,6 +19,76 @@ fn resolve_layout(raw_layout: &Option<serde_json::Value>) -> Option<takumi::layo
     })
 }
 
+/// Tracks all running child processes and their communication channels.
+struct StreamRegistry {
+    stream_children: HashMap<(String, Option<String>), std::process::Child>,
+    bi_stream_children: HashMap<String, std::process::Child>,
+    module_event_txs: HashMap<String, mpsc::Sender<serde_json::Value>>,
+}
+
+impl StreamRegistry {
+    fn new() -> Self {
+        Self {
+            stream_children: HashMap::new(),
+            bi_stream_children: HashMap::new(),
+            module_event_txs: HashMap::new(),
+        }
+    }
+}
+
+/// Apply the result of a JSX evaluation: parse specs, reconcile streams, spawn/kill children,
+/// and update panels.
+///
+/// `current_calls` should be `&[]` on a fresh load (blocks 1 & 2) so that all stream_calls are
+/// treated as new spawns. On a re-eval (block 3) pass the currently running keys so that removed
+/// streams are killed.
+///
+/// Returns `true` on success, `false` if `parse_root_node` fails.
+#[allow(clippy::too_many_arguments)]
+fn apply_eval_result(
+    value: &serde_json::Value,
+    stream_calls: &[(String, Option<String>)],
+    module_calls: &[String],
+    current_calls: &[(String, Option<String>)],
+    registry: &mut StreamRegistry,
+    panels: &mut Vec<Panel>,
+    stream_tx: &mpsc::Sender<(String, Option<String>, String)>,
+    wake_tx: &mpsc::SyncSender<()>,
+    mod_init_fn: &dyn Fn(&[costae::PanelSpec]) -> serde_json::Value,
+    apply_panel_specs_fn: &mut dyn FnMut(&mut Vec<Panel>, Vec<costae::PanelSpec>),
+) -> bool {
+    let specs = match costae::parse_root_node(value) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(error = %e, "root node parse error");
+            return false;
+        }
+    };
+    let mod_init = mod_init_fn(&specs);
+
+    let (to_spawn, to_kill) = reconcile_streams(current_calls, stream_calls);
+    for (b, s) in to_kill {
+        if let Some(mut child) = registry.stream_children.remove(&(b, s)) {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+    for (bin, script) in to_spawn {
+        let child = spawn_string_stream(&bin, script.as_deref(), stream_tx.clone(), wake_tx.clone());
+        registry.stream_children.insert((bin, script), child);
+    }
+    for bin in module_calls {
+        if !registry.bi_stream_children.contains_key(bin) {
+            let bi = spawn_bi_stream(bin, &mod_init, stream_tx.clone(), wake_tx.clone());
+            registry.module_event_txs.insert(bin.clone(), bi.event_tx);
+            registry.bi_stream_children.insert(bin.clone(), bi.child);
+        }
+    }
+
+    apply_panel_specs_fn(panels, specs);
+    true
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env()
@@ -129,11 +199,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    let mut module_event_txs: HashMap<String, mpsc::Sender<serde_json::Value>> = HashMap::new();
-    let mut bi_stream_children: HashMap<String, std::process::Child> = HashMap::new();
-
+    let mut registry = StreamRegistry::new();
     let mut stream_values: HashMap<String, String> = HashMap::new();
-    let mut stream_children: HashMap<(String, Option<String>), std::process::Child> = HashMap::new();
     let (stream_tx, stream_rx) = mpsc::channel::<(String, Option<String>, String)>();
     let mut jsx_evaluator: Option<costae::jsx::JsxEvaluator> = None;
 
@@ -256,7 +323,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Helper: apply a new set of PanelSpecs — create/destroy panels and update raw_layout.
     // Module spawning is done by the caller before invoking this.
-    let apply_panel_specs = |panels: &mut Vec<Panel>, specs: Vec<costae::PanelSpec>| {
+    let mut apply_panel_specs = |panels: &mut Vec<Panel>, specs: Vec<costae::PanelSpec>| {
         let existing_ids: Vec<&str> = panels.iter().map(|p| p.id.as_str()).collect();
         let (to_create, to_update, to_destroy) = reconcile_panels(&existing_ids, &specs);
 
@@ -304,24 +371,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         match evaluator.eval(&stream_values) {
                             Ok((value, stream_calls, module_calls)) => {
                                 tracing::debug!(elapsed_ms = t.elapsed().as_millis(), "jsx eval");
-                                let specs = match costae::parse_root_node(&value) {
-                                    Ok(s) => s,
-                                    Err(e) => { tracing::error!(error = %e, "root node parse error"); vec![] }
-                                };
-                                let mod_init = make_mod_init(&specs);
-                                let (to_spawn, _) = reconcile_streams(&[], &stream_calls);
-                                for (bin, script) in to_spawn {
-                                    let child = spawn_string_stream(&bin, script.as_deref(), stream_tx.clone(), wake_tx.clone());
-                                    stream_children.insert((bin, script), child);
-                                }
-                                for bin in &module_calls {
-                                    if !bi_stream_children.contains_key(bin) {
-                                        let bi = spawn_bi_stream(bin, &mod_init, stream_tx.clone(), wake_tx.clone());
-                                        module_event_txs.insert(bin.clone(), bi.event_tx);
-                                        bi_stream_children.insert(bin.clone(), bi.child);
-                                    }
-                                }
-                                apply_panel_specs(&mut panels, specs);
+                                apply_eval_result(
+                                    &value, &stream_calls, &module_calls,
+                                    &[], &mut registry, &mut panels,
+                                    &stream_tx, &wake_tx,
+                                    &make_mod_init, &mut apply_panel_specs,
+                                );
                                 jsx_evaluator = Some(evaluator);
                             }
                             Err(e) => tracing::error!(error = %e, "JSX eval error"),
@@ -346,11 +401,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         if bin_reload_rx.try_recv().is_ok() {
             tracing::info!("binary changed, restarting...");
-            for child in stream_children.values_mut() {
+            for child in registry.stream_children.values_mut() {
                 let _ = child.kill();
                 let _ = child.wait();
             }
-            for child in bi_stream_children.values_mut() {
+            for child in registry.bi_stream_children.values_mut() {
                 let _ = child.kill();
                 let _ = child.wait();
             }
@@ -369,15 +424,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         if reload_rx.try_recv().is_ok() {
-            for (_, mut child) in stream_children.drain() {
+            for (_, mut child) in registry.stream_children.drain() {
                 let _ = child.kill();
                 let _ = child.wait();
             }
-            for (_, mut child) in bi_stream_children.drain() {
+            for (_, mut child) in registry.bi_stream_children.drain() {
                 let _ = child.kill();
                 let _ = child.wait();
             }
-            module_event_txs.clear();
+            registry.module_event_txs.clear();
             stream_values.clear();
             jsx_evaluator = None;
 
@@ -386,24 +441,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Ok(source) => match costae::jsx::JsxEvaluator::new(&source, jsx_ctx.clone()) {
                         Ok(evaluator) => match evaluator.eval(&stream_values) {
                             Ok((value, stream_calls, module_calls)) => {
-                                let specs = match costae::parse_root_node(&value) {
-                                    Ok(s) => s,
-                                    Err(e) => { tracing::error!(error = %e, "root node parse error"); vec![] }
-                                };
-                                let mod_init = make_mod_init(&specs);
-                                let (to_spawn, _) = reconcile_streams(&[], &stream_calls);
-                                for (bin, script) in to_spawn {
-                                    let child = spawn_string_stream(&bin, script.as_deref(), stream_tx.clone(), wake_tx.clone());
-                                    stream_children.insert((bin, script), child);
-                                }
-                                for bin in &module_calls {
-                                    if !bi_stream_children.contains_key(bin) {
-                                        let bi = spawn_bi_stream(bin, &mod_init, stream_tx.clone(), wake_tx.clone());
-                                        module_event_txs.insert(bin.clone(), bi.event_tx);
-                                        bi_stream_children.insert(bin.clone(), bi.child);
-                                    }
-                                }
-                                apply_panel_specs(&mut panels, specs);
+                                apply_eval_result(
+                                    &value, &stream_calls, &module_calls,
+                                    &[], &mut registry, &mut panels,
+                                    &stream_tx, &wake_tx,
+                                    &make_mod_init, &mut apply_panel_specs,
+                                );
                                 jsx_evaluator = Some(evaluator);
                             }
                             Err(e) => tracing::error!(error = %e, "JSX eval error"),
@@ -431,32 +474,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 match evaluator.eval(&stream_values) {
                     Ok((new_value, new_calls, new_module_calls)) => {
                         tracing::debug!(elapsed_us = t.elapsed().as_micros(), "jsx re-eval");
-                        let specs = match costae::parse_root_node(&new_value) {
-                            Ok(s) => s,
-                            Err(e) => { tracing::error!(error = %e, "root node parse error"); vec![] }
-                        };
-                        let mod_init = make_mod_init(&specs);
-                        let current_calls: Vec<_> = stream_children.keys().cloned().collect();
-                        let (to_spawn, to_kill) = reconcile_streams(&current_calls, &new_calls);
-                        for (b, s) in to_kill {
-                            if let Some(mut child) = stream_children.remove(&(b, s)) {
-                                let _ = child.kill();
-                                let _ = child.wait();
-                            }
+                        let current_calls: Vec<_> = registry.stream_children.keys().cloned().collect();
+                        let did_apply = apply_eval_result(
+                            &new_value, &new_calls, &new_module_calls,
+                            &current_calls, &mut registry, &mut panels,
+                            &stream_tx, &wake_tx,
+                            &make_mod_init, &mut apply_panel_specs,
+                        );
+                        if did_apply {
+                            changed = true;
                         }
-                        for (b, s) in to_spawn {
-                            let child = spawn_string_stream(&b, s.as_deref(), stream_tx.clone(), wake_tx.clone());
-                            stream_children.insert((b, s), child);
-                        }
-                        for b in &new_module_calls {
-                            if !bi_stream_children.contains_key(b) {
-                                let bi = spawn_bi_stream(b, &mod_init, stream_tx.clone(), wake_tx.clone());
-                                module_event_txs.insert(b.clone(), bi.event_tx);
-                                bi_stream_children.insert(b.clone(), bi.child);
-                            }
-                        }
-                        apply_panel_specs(&mut panels, specs);
-                        changed = true;
                     }
                     Err(e) => tracing::error!(error = %e, "JSX re-eval error"),
                 }
@@ -476,7 +503,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 x11rb::protocol::Event::ButtonPress(e) => {
                     if let Some(panel) = panels.iter().find(|p| p.win_id == e.event) {
                         do_hit_test(
-                            &panel.raw_layout, &module_event_txs,
+                            &panel.raw_layout, &registry.module_event_txs,
                             &global, panel.phys_width, panel.phys_height, dpr,
                             e.event_x as f32, e.event_y as f32,
                         );
