@@ -46,7 +46,7 @@ pub fn spawn_module(bin: &str, script: Option<&str>) -> SpawnedModule {
     // If a script is provided, write it to a memfd and pass the path as argument
     let _memfd_file = if let Some(content) = script {
         let fd = unsafe {
-            libc::memfd_create(b"costae-script\0".as_ptr() as *const libc::c_char, 0)
+            libc::memfd_create(c"costae-script".as_ptr(), 0)
         };
         let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
         let _ = file.write_all(content.as_bytes());
@@ -132,6 +132,7 @@ pub fn spawn_bi_stream(
 }
 
 /// Spawn a string-streaming subprocess (e.g. a bash script that prints one line per tick).
+///
 /// Each line emitted by the process is forwarded to `tx` as `(bin, script, line)`.
 /// The returned `Child` must be kept alive; drop it to kill the process.
 pub fn spawn_string_stream(

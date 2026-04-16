@@ -2,7 +2,7 @@ use takumi::layout::node::Node;
 
 /// Which screen edge a panel is anchored to. Drives both window placement and EWMH strut
 /// reservation. Panels without an anchor are free-floating (no strut).
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub enum PanelAnchor {
     Left,
     Right,
@@ -13,10 +13,10 @@ pub enum PanelAnchor {
 impl PanelAnchor {
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
-            "left"   => Some(PanelAnchor::Left),
-            "right"  => Some(PanelAnchor::Right),
-            "top"    => Some(PanelAnchor::Top),
-            "bottom" => Some(PanelAnchor::Bottom),
+            "left"   => Some(Self::Left),
+            "right"  => Some(Self::Right),
+            "top"    => Some(Self::Top),
+            "bottom" => Some(Self::Bottom),
             _        => None,
         }
     }

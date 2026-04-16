@@ -18,7 +18,7 @@ pub struct CommandSpec {
     pub key: Option<String>,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum StreamKind {
     Stdout,
     Stderr,
@@ -39,10 +39,16 @@ pub struct DataLoop {
     rx: mpsc::Receiver<StreamItem>,
 }
 
+impl Default for DataLoop {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DataLoop {
     pub fn new() -> Self {
         let (tx, rx) = mpsc::channel();
-        DataLoop {
+        Self {
             pool: HashMap::new(),
             desired: Vec::new(),
             timeout: None,
@@ -51,7 +57,7 @@ impl DataLoop {
         }
     }
 
-    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+    pub const fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
         self
     }
@@ -66,7 +72,7 @@ impl DataLoop {
             .collect();
 
         // Save desired set for reconciliation in run().
-        self.desired = desired_unique.clone();
+        self.desired = desired_unique;
 
         // Kill and remove specs no longer desired.
         let to_remove: Vec<CommandSpec> = self

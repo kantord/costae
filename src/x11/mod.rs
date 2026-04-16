@@ -42,7 +42,7 @@ pub fn inject_root_bg(global: &GlobalContext, rgba: Vec<u8>, width: u32, height:
 ///   [10] bottom_start_x, [11] bottom_end_x
 ///
 /// All values are in physical pixels, absolute from the screen origin.
-pub fn strut_partial_values_for_anchor(
+pub const fn strut_partial_values_for_anchor(
     anchor: PanelAnchor,
     mon_x: i16,
     mon_y: i16,

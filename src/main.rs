@@ -106,7 +106,7 @@ fn drain_stream_updates(
 
 fn handle_x11_events(
     conn: &RustConnection,
-    panels: &mut Vec<Panel>,
+    panels: &mut [Panel],
     module_event_txs: &HashMap<String, mpsc::Sender<serde_json::Value>>,
     global: &GlobalContext,
     dpr: f32,
@@ -242,7 +242,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let last_tick = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     {
         let last_tick = std::sync::Arc::clone(&last_tick);
-        let log_path = log_path.clone();
         thread::spawn(move || {
             loop {
                 thread::sleep(Duration::from_secs(10));
@@ -530,7 +529,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let _ = child.kill();
                 let _ = child.wait();
             }
-            for panel in panels.drain(..) {
+            for panel in std::mem::take(&mut panels) {
                 destroy_panel(panel, &conn);
             }
             let _ = conn.flush();
