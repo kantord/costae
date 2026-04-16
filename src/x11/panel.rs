@@ -137,6 +137,32 @@ pub fn i3_dpi(conn: &RustConnection, root: Window, screen: &Screen) -> f32 {
     96.0
 }
 
+fn dispatch_click(
+    module_event_txs: &HashMap<String, mpsc::Sender<serde_json::Value>>,
+    hit_path: &str,
+    on_click: &serde_json::Value,
+) {
+    if let Some(channel) = on_click.get("__channel__").and_then(|v| v.as_str()) {
+        if let Some(tx) = module_event_txs.get(channel) {
+            let mut payload = on_click.clone();
+            if let Some(obj) = payload.as_object_mut() { obj.remove("__channel__"); }
+            let _ = tx.send(serde_json::json!({"event": "click", "data": payload}));
+        }
+        return;
+    }
+    let mut path = hit_path.to_string();
+    loop {
+        if let Some(tx) = module_event_txs.get(&path) {
+            let _ = tx.send(serde_json::json!({"event": "click", "data": on_click}));
+            return;
+        }
+        match path.rfind('/') {
+            Some(pos) => path.truncate(pos),
+            None => return,
+        }
+    }
+}
+
 pub fn do_hit_test(
     raw_layout: &Option<serde_json::Value>,
     module_event_txs: &HashMap<String, mpsc::Sender<serde_json::Value>>,
@@ -175,26 +201,7 @@ pub fn do_hit_test(
         None => return,
     };
 
-    if let Some(channel) = on_click.get("__channel__").and_then(|v| v.as_str()) {
-        if let Some(tx) = module_event_txs.get(channel) {
-            let mut payload = on_click.clone();
-            if let Some(obj) = payload.as_object_mut() { obj.remove("__channel__"); }
-            let _ = tx.send(serde_json::json!({"event": "click", "data": payload}));
-            return;
-        }
-    }
-
-    let mut path = hit_path.clone();
-    loop {
-        if let Some(tx) = module_event_txs.get(&path) {
-            let _ = tx.send(serde_json::json!({"event": "click", "data": on_click}));
-            return;
-        }
-        match path.rfind('/') {
-            Some(pos) => path.truncate(pos),
-            None => return,
-        }
-    }
+    dispatch_click(module_event_txs, &hit_path, &on_click);
 }
 
 pub fn create_panel(
@@ -284,4 +291,90 @@ pub fn create_panel(
 pub fn destroy_panel(panel: Panel, conn: &RustConnection) {
     let _ = conn.free_gc(panel.gc);
     let _ = conn.destroy_window(panel.win_id);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dispatch_click;
+    use std::collections::HashMap;
+    use std::sync::mpsc;
+
+    /// Helper: build a map of one named channel and return the sender + receiver pair.
+    fn make_txs(names: &[&str]) -> (HashMap<String, mpsc::Sender<serde_json::Value>>, Vec<mpsc::Receiver<serde_json::Value>>) {
+        let mut txs = HashMap::new();
+        let mut rxs = Vec::new();
+        for &name in names {
+            let (tx, rx) = mpsc::channel();
+            txs.insert(name.to_string(), tx);
+            rxs.push(rx);
+        }
+        (txs, rxs)
+    }
+
+    // Test 1: `__channel__` key routes to the named channel (not the path).
+    #[test]
+    fn channel_key_routes_to_named_channel_not_path() {
+        let (txs, rxs) = make_txs(&["my-module", "some/path/module"]);
+        let on_click = serde_json::json!({
+            "__channel__": "my-module",
+            "action": "do-thing"
+        });
+        dispatch_click(&txs, "some/path/module", &on_click);
+        // The named channel should have received a message.
+        assert!(rxs[0].try_recv().is_ok(), "named channel should receive a message");
+        // The path-matching channel should NOT have received anything.
+        assert!(rxs[1].try_recv().is_err(), "path channel should NOT receive a message");
+    }
+
+    // Test 2: `__channel__` is stripped from the payload before sending.
+    #[test]
+    fn channel_key_is_stripped_from_payload() {
+        let (txs, rxs) = make_txs(&["my-module"]);
+        let on_click = serde_json::json!({
+            "__channel__": "my-module",
+            "action": "do-thing"
+        });
+        dispatch_click(&txs, "irrelevant/path", &on_click);
+        let msg = rxs[0].try_recv().expect("should receive a message");
+        // The data field should NOT contain __channel__.
+        let data = &msg["data"];
+        assert!(data.get("__channel__").is_none(), "__channel__ should be stripped from data");
+        // But other fields should still be present.
+        assert_eq!(data["action"], "do-thing");
+    }
+
+    // Test 3: Unknown `__channel__` sends nothing (no channel match).
+    #[test]
+    fn unknown_channel_key_sends_nothing() {
+        let (txs, rxs) = make_txs(&["known-module"]);
+        let on_click = serde_json::json!({
+            "__channel__": "unknown-module",
+            "action": "do-thing"
+        });
+        dispatch_click(&txs, "known-module", &on_click);
+        // Even though path matches, __channel__ takes priority and the named channel doesn't exist.
+        assert!(rxs[0].try_recv().is_err(), "no message should be sent when __channel__ is unknown");
+    }
+
+    // Test 4: No `__channel__`: walks path to find nearest parent channel.
+    #[test]
+    fn no_channel_key_walks_path_to_find_sender() {
+        // Register "some/path" (a parent of "some/path/module").
+        let (txs, rxs) = make_txs(&["some/path"]);
+        let on_click = serde_json::json!({"action": "click"});
+        dispatch_click(&txs, "some/path/module", &on_click);
+        // "some/path/module" not found → try "some/path" → found.
+        let msg = rxs[0].try_recv().expect("parent path should receive a message");
+        assert_eq!(msg["event"], "click");
+        assert_eq!(msg["data"]["action"], "click");
+    }
+
+    // Test 5: No `__channel__` and no path match: sends nothing.
+    #[test]
+    fn no_channel_key_and_no_path_match_sends_nothing() {
+        let (txs, rxs) = make_txs(&["unrelated-module"]);
+        let on_click = serde_json::json!({"action": "click"});
+        dispatch_click(&txs, "some/path/module", &on_click);
+        assert!(rxs[0].try_recv().is_err(), "no message should be sent when no path matches");
+    }
 }

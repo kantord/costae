@@ -27,14 +27,7 @@ pub use render::{
 };
 
 // modules
-pub use modules::{
-    find_modules,
-    substitute,
-    ModuleNode,
-    is_module_node,
-    hit_test,
-    update_module_value,
-};
+pub use modules::hit_test;
 
 // x11
 pub use x11::{

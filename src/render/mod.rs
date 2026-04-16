@@ -67,13 +67,163 @@ pub fn render_frame(layout: Option<Node>, global: &GlobalContext, width: u32, he
 }
 
 pub fn load_fonts(global: &mut GlobalContext) {
-    for path in [
-        "/usr/share/fonts/TTF/JetBrainsMono-Regular.ttf",
-        "/usr/share/fonts/TTF/JetBrainsMono-Bold.ttf",
-    ] {
-        if let Ok(bytes) = std::fs::read(path) {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let local_fonts = format!("{home}/.local/share/fonts");
+    let dot_fonts = format!("{home}/.fonts");
+
+    let candidate_dirs: Vec<std::path::PathBuf> = vec![
+        std::path::PathBuf::from("/usr/share/fonts/TTF"),
+        std::path::PathBuf::from("/usr/share/fonts/truetype"),
+        std::path::PathBuf::from("/usr/share/fonts/OTF"),
+        std::path::PathBuf::from("/usr/share/fonts/opentype"),
+        std::path::PathBuf::from(&local_fonts),
+        std::path::PathBuf::from(&dot_fonts),
+    ];
+
+    let dir_refs: Vec<&std::path::Path> = candidate_dirs.iter().map(|p| p.as_path()).collect();
+    for path in find_font_files(&dir_refs) {
+        if let Ok(bytes) = std::fs::read(&path) {
             let _ = global.font_context.load_and_store(FontResource::new(bytes));
         }
+    }
+}
+
+pub fn find_font_files(dirs: &[&std::path::Path]) -> Vec<std::path::PathBuf> {
+    let mut results = Vec::new();
+    for &dir in dirs {
+        let read_dir = match std::fs::read_dir(dir) {
+            Ok(rd) => rd,
+            Err(_) => continue,
+        };
+        for entry in read_dir.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                let ext_lower = ext.to_ascii_lowercase();
+                if ext_lower == "ttf" || ext_lower == "otf" {
+                    results.push(path);
+                }
+            }
+        }
+    }
+    results
+}
+
+#[cfg(test)]
+mod tests {
+    use super::find_font_files;
+    use std::fs;
+    use std::path::PathBuf;
+
+    /// Create a uniquely-named subdirectory inside `std::env::temp_dir()` and
+    /// return its path. The caller is responsible for cleanup via `fs::remove_dir_all`.
+    fn make_temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("costae_find_font_files_{}", name));
+        let _ = fs::remove_dir_all(&dir); // clean up leftovers from previous runs
+        fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    #[test]
+    fn empty_dirs_slice_returns_empty_vec() {
+        let result = find_font_files(&[]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn ttf_file_is_returned() {
+        let dir = make_temp_dir("ttf");
+        let font_path = dir.join("MyFont.ttf");
+        fs::write(&font_path, b"fake ttf").unwrap();
+
+        let result = find_font_files(&[dir.as_path()]);
+
+        fs::remove_dir_all(&dir).ok();
+        assert_eq!(result, vec![font_path]);
+    }
+
+    #[test]
+    fn otf_file_is_returned() {
+        let dir = make_temp_dir("otf");
+        let font_path = dir.join("MyFont.otf");
+        fs::write(&font_path, b"fake otf").unwrap();
+
+        let result = find_font_files(&[dir.as_path()]);
+
+        fs::remove_dir_all(&dir).ok();
+        assert_eq!(result, vec![font_path]);
+    }
+
+    #[test]
+    fn non_font_extensions_are_ignored() {
+        let dir = make_temp_dir("nonfont");
+        fs::write(dir.join("readme.txt"), b"text").unwrap();
+        fs::write(dir.join("icon.woff"), b"woff").unwrap();
+
+        let result = find_font_files(&[dir.as_path()]);
+
+        fs::remove_dir_all(&dir).ok();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn nonexistent_directory_is_skipped_silently() {
+        let missing = std::env::temp_dir().join("costae_find_font_files_does_not_exist_xyz123");
+        let result = find_font_files(&[missing.as_path()]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn files_from_multiple_directories_are_combined() {
+        let dir_a = make_temp_dir("multi_a");
+        let dir_b = make_temp_dir("multi_b");
+        let font_a = dir_a.join("A.ttf");
+        let font_b = dir_b.join("B.otf");
+        fs::write(&font_a, b"ttf").unwrap();
+        fs::write(&font_b, b"otf").unwrap();
+
+        let mut result = find_font_files(&[dir_a.as_path(), dir_b.as_path()]);
+        result.sort();
+
+        let mut expected = vec![font_a, font_b];
+        expected.sort();
+
+        fs::remove_dir_all(&dir_a).ok();
+        fs::remove_dir_all(&dir_b).ok();
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn subdirectory_fonts_are_not_included() {
+        let dir = make_temp_dir("subdir");
+        let subdir = dir.join("nested");
+        fs::create_dir_all(&subdir).unwrap();
+        fs::write(subdir.join("deep.ttf"), b"ttf").unwrap();
+
+        let result = find_font_files(&[dir.as_path()]);
+
+        fs::remove_dir_all(&dir).ok();
+        assert!(result.is_empty(), "expected no files from subdirectory, got {:?}", result);
+    }
+
+    #[test]
+    fn extension_match_is_case_insensitive() {
+        let dir = make_temp_dir("case");
+        let upper_ttf = dir.join("UPPER.TTF");
+        let mixed_otf = dir.join("Mixed.OtF");
+        fs::write(&upper_ttf, b"ttf").unwrap();
+        fs::write(&mixed_otf, b"otf").unwrap();
+
+        let mut result = find_font_files(&[dir.as_path()]);
+        result.sort();
+
+        let mut expected = vec![upper_ttf, mixed_otf];
+        expected.sort();
+
+        fs::remove_dir_all(&dir).ok();
+        assert_eq!(result, expected);
     }
 }
 

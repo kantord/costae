@@ -200,7 +200,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut registry = StreamRegistry::new();
-    let mut stream_values: HashMap<String, String> = HashMap::new();
+    let mut stream_values: HashMap<(String, Option<String>), String> = HashMap::new();
     let (stream_tx, stream_rx) = mpsc::channel::<(String, Option<String>, String)>();
     let mut jsx_evaluator: Option<costae::jsx::JsxEvaluator> = None;
 
@@ -462,7 +462,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let mut streams_updated = false;
         while let Ok((bin, script, value)) = stream_rx.try_recv() {
-            let key = format!("{}\0{}", bin, script.as_deref().unwrap_or_default());
+            let key = (bin, script);
             if stream_values.get(&key).map(|s| s.as_str()) != Some(value.as_str()) {
                 stream_values.insert(key, value);
                 streams_updated = true;

@@ -15,6 +15,28 @@ impl SpawnedModule {
     pub fn send_event(&self, event: &serde_json::Value) {
         let _ = self.event_tx.send(event.clone());
     }
+
+    /// Consume the struct into its parts without running `Drop`.
+    fn into_parts(
+        self,
+    ) -> (
+        mpsc::Receiver<String>,
+        std::process::Child,
+        mpsc::Sender<serde_json::Value>,
+    ) {
+        let md = std::mem::ManuallyDrop::new(self);
+        let rx = unsafe { std::ptr::read(&md.rx) };
+        let child = unsafe { std::ptr::read(&md.child) };
+        let event_tx = unsafe { std::ptr::read(&md.event_tx) };
+        (rx, child, event_tx)
+    }
+}
+
+impl Drop for SpawnedModule {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 pub fn spawn_module(bin: &str, script: Option<&str>) -> SpawnedModule {
@@ -71,12 +93,27 @@ pub fn spawn_module(bin: &str, script: Option<&str>) -> SpawnedModule {
     SpawnedModule { rx, child, event_tx }
 }
 
-/// Spawn a string-streaming subprocess (e.g. a bash script that prints one line per tick).
-/// Each line emitted by the process is sent to `tx` as `(bin, script, line)`.
-/// The returned `Child` must be kept alive; drop it to kill the process.
 pub struct SpawnedBiStream {
     pub child: std::process::Child,
     pub event_tx: mpsc::Sender<serde_json::Value>,
+}
+
+fn forward_stdout(
+    rx: mpsc::Receiver<String>,
+    tx: mpsc::Sender<(String, Option<String>, String)>,
+    wake_tx: mpsc::SyncSender<()>,
+    bin: String,
+    script: Option<String>,
+) {
+    thread::spawn(move || {
+        while let Ok(line) = rx.recv() {
+            if tx.send((bin.clone(), script.clone(), line)).is_err() {
+                break;
+            }
+            let _ = wake_tx.try_send(());
+        }
+        tracing::warn!(bin = %bin, script = ?script, "stream subprocess exited");
+    });
 }
 
 /// Spawn a bidirectional module subprocess (stdin for events, stdout for data).
@@ -89,18 +126,14 @@ pub fn spawn_bi_stream(
 ) -> SpawnedBiStream {
     let spawned = spawn_module(bin, None);
     spawned.send_event(init_event);
-    let bin_owned = bin.to_string();
-    thread::spawn(move || {
-        while let Ok(line) = spawned.rx.recv() {
-            if tx.send((bin_owned.clone(), None, line)).is_err() {
-                break;
-            }
-            let _ = wake_tx.try_send(());
-        }
-    });
-    SpawnedBiStream { child: spawned.child, event_tx: spawned.event_tx }
+    let (rx, child, event_tx) = spawned.into_parts();
+    forward_stdout(rx, tx, wake_tx, bin.to_string(), None);
+    SpawnedBiStream { child, event_tx }
 }
 
+/// Spawn a string-streaming subprocess (e.g. a bash script that prints one line per tick).
+/// Each line emitted by the process is forwarded to `tx` as `(bin, script, line)`.
+/// The returned `Child` must be kept alive; drop it to kill the process.
 pub fn spawn_string_stream(
     bin: &str,
     script: Option<&str>,
@@ -110,14 +143,7 @@ pub fn spawn_string_stream(
     let spawned = spawn_module(bin, script);
     let bin_owned = bin.to_string();
     let script_owned = script.map(str::to_string);
-    thread::spawn(move || {
-        while let Ok(line) = spawned.rx.recv() {
-            if tx.send((bin_owned.clone(), script_owned.clone(), line)).is_err() {
-                break;
-            }
-            let _ = wake_tx.try_send(());
-        }
-        tracing::warn!(bin = %bin_owned, script = ?script_owned, "stream subprocess exited");
-    });
-    spawned.child
+    let (rx, child, _event_tx) = spawned.into_parts();
+    forward_stdout(rx, tx, wake_tx, bin_owned, script_owned);
+    child
 }
