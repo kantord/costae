@@ -1,5 +1,13 @@
+use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
+
+/// Shared map of stream values: keyed by `(bin, script)`, holds the latest stdout line.
+type StreamValues = Arc<RwLock<HashMap<(String, Option<String>), String>>>;
+/// Recorded `useStringStream` calls made during the last `_render()` invocation.
+type StreamCalls = Arc<Mutex<Vec<(String, Option<String>)>>>;
+/// Return type of a successful JSX evaluation.
+type EvalResult = rquickjs::Result<(serde_json::Value, Vec<(String, Option<String>)>, Vec<String>)>;
 
 use rquickjs::CatchResultExt;
 
@@ -35,14 +43,14 @@ fn wrap_source_as_render_fn(source: &str) -> String {
         }
     });
 
-    if let Some(start) = split_at {
-        let before = &source[..start];
-        let after = &source[start..];
-        format!("globalThis._render = function() {{\n{}return {};\n}};\n", before, after)
-    } else {
-        // Fallback: no top-level expression found — wrap the whole source.
-        format!("globalThis._render = function() {{\nreturn {};\n}};\n", source)
-    }
+    split_at.map_or_else(
+        || format!("globalThis._render = function() {{\nreturn {source};\n}};\n"),
+        |start| {
+            let before = &source[..start];
+            let after = &source[start..];
+            format!("globalThis._render = function() {{\n{before}return {after};\n}};\n")
+        },
+    )
 }
 
 const JSX_GLOBALS_JS: &str = r#"
@@ -83,8 +91,8 @@ const JSX_GLOBALS_JS: &str = r#"
 pub struct JsxEvaluator {
     context: rquickjs::Context,
     _runtime: rquickjs::Runtime,
-    stream_values: Arc<std::sync::RwLock<std::collections::HashMap<(String, Option<String>), String>>>,
-    calls: Arc<Mutex<Vec<(String, Option<String>)>>>,
+    stream_values: StreamValues,
+    calls: StreamCalls,
     module_calls: Arc<Mutex<Vec<String>>>,
     global_state: Arc<Mutex<serde_json::Map<String, serde_json::Value>>>,
 }
@@ -94,8 +102,8 @@ impl JsxEvaluator {
         let render_js = transform_jsx(&wrap_source_as_render_fn(source));
         let runtime = rquickjs::Runtime::new()?;
         let context = rquickjs::Context::full(&runtime)?;
-        let stream_values: Arc<std::sync::RwLock<std::collections::HashMap<(String, Option<String>), String>>> = Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
-        let calls: Arc<Mutex<Vec<(String, Option<String>)>>> = Arc::new(Mutex::new(Vec::new()));
+        let stream_values: StreamValues = Arc::new(RwLock::new(HashMap::new()));
+        let calls: StreamCalls = Arc::new(Mutex::new(Vec::new()));
         let module_calls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
 
         {
@@ -129,8 +137,8 @@ impl JsxEvaluator {
 
     pub fn eval(
         &self,
-        new_stream_values: &std::collections::HashMap<(String, Option<String>), String>,
-    ) -> rquickjs::Result<(serde_json::Value, Vec<(String, Option<String>)>, Vec<String>)> {
+        new_stream_values: &HashMap<(String, Option<String>), String>,
+    ) -> EvalResult {
         *self.stream_values.write().unwrap() = new_stream_values.clone();
         self.calls.lock().unwrap().clear();
         self.module_calls.lock().unwrap().clear();
@@ -165,7 +173,7 @@ impl JsxEvaluator {
     }
 }
 
-pub fn eval_jsx(source: &str, ctx: serde_json::Value, stream_values: &std::collections::HashMap<(String, Option<String>), String>) -> rquickjs::Result<(serde_json::Value, Vec<(String, Option<String>)>, Vec<String>)> {
+pub fn eval_jsx(source: &str, ctx: serde_json::Value, stream_values: &HashMap<(String, Option<String>), String>) -> EvalResult {
     JsxEvaluator::new(source, ctx)?.eval(stream_values)
 }
 

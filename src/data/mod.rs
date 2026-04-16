@@ -44,6 +44,7 @@ pub fn spawn_module(bin: &str, script: Option<&str>) -> SpawnedModule {
     let mut cmd = std::process::Command::new(bin);
 
     // If a script is provided, write it to a memfd and pass the path as argument
+    #[allow(clippy::option_if_let_else)]
     let _memfd_file = if let Some(content) = script {
         let fd = unsafe {
             libc::memfd_create(c"costae-script".as_ptr(), 0)

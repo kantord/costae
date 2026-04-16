@@ -163,6 +163,7 @@ fn dispatch_click(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn do_hit_test(
     raw_layout: &Option<serde_json::Value>,
     module_event_txs: &HashMap<String, mpsc::Sender<serde_json::Value>>,

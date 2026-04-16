@@ -104,6 +104,7 @@ fn drain_stream_updates(
     changed
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_x11_events(
     conn: &RustConnection,
     panels: &mut [Panel],

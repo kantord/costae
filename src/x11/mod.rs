@@ -17,13 +17,11 @@ pub fn x11_bgrx_to_rgba(bgrx: &[u8]) -> Vec<u8> {
     rgba
 }
 
-/// Store a raw RGBA wallpaper slice (already cropped to bar dimensions) in the
-/// persistent image store under the key `"root-bg"` so layout nodes can
-/// reference it via `backgroundImage: "url(root-bg)"` in the config.
+/// Store a cropped RGBA wallpaper slice in the image store under `"root-bg"`.
 ///
-/// Because takumi sees this as real pixel content behind elements in the render
-/// tree, CSS `backdrop-filter: blur()` on cards will correctly blur the wallpaper
-/// — the same effect that a compositor would produce, but in pure software.
+/// Layout nodes can reference it via `backgroundImage: "url(root-bg)"`.
+/// Because takumi treats this as real pixel content, `backdrop-filter: blur()`
+/// will correctly blur the wallpaper — the same effect a compositor would produce.
 pub fn inject_root_bg(global: &GlobalContext, rgba: Vec<u8>, width: u32, height: u32) {
     if let Some(size) = IntSize::from_wh(width, height) {
         if let Some(pixmap) = Pixmap::from_vec(rgba, size) {
@@ -77,8 +75,9 @@ pub const fn strut_partial_values_for_anchor(
     v
 }
 
-/// Convert an X11 TrueColor pixel value (0x00RRGGBB for standard 24bpp visuals)
-/// to a flat RGBA buffer of `width × height` pixels, all the same solid color.
+/// Convert an X11 TrueColor pixel (`0x00RRGGBB`) to a solid-color RGBA buffer.
+///
+/// Fills `width × height` pixels with the same colour.
 /// Used as a fallback when no wallpaper pixmap is set (e.g. i3 solid background).
 pub fn solid_color_rgba(pixel: u32, width: u32, height: u32) -> Vec<u8> {
     let r = ((pixel >> 16) & 0xFF) as u8;

@@ -1,5 +1,8 @@
 use takumi::layout::node::Node;
 
+/// A stream key identifying a subprocess by its binary and optional script.
+pub type StreamKey = (String, Option<String>);
+
 /// Which screen edge a panel is anchored to. Drives both window placement and EWMH strut
 /// reservation. Panels without an anchor are free-floating (no strut).
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -11,7 +14,7 @@ pub enum PanelAnchor {
 }
 
 impl PanelAnchor {
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s {
             "left"   => Some(Self::Left),
             "right"  => Some(Self::Right),
@@ -79,7 +82,7 @@ pub fn parse_root_node(root: &serde_json::Value) -> Result<Vec<PanelSpec>, Strin
                 .ok_or_else(|| format!("panel '{id}' missing height"))? as u32;
             let anchor = panel.get("anchor")
                 .and_then(|v| v.as_str())
-                .and_then(PanelAnchor::from_str);
+                .and_then(PanelAnchor::parse);
             let x = panel.get("x").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
             let y = panel.get("y").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
             let outer_gap = panel.get("outer_gap")
@@ -121,9 +124,9 @@ pub fn reconcile_panels<'a>(
 }
 
 pub fn reconcile_streams(
-    old: &[(String, Option<String>)],
-    new: &[(String, Option<String>)],
-) -> (Vec<(String, Option<String>)>, Vec<(String, Option<String>)>) {
+    old: &[StreamKey],
+    new: &[StreamKey],
+) -> (Vec<StreamKey>, Vec<StreamKey>) {
     let old_set: std::collections::HashSet<_> = old.iter().collect();
     let new_set: std::collections::HashSet<_> = new.iter().collect();
     let to_spawn = new.iter().filter(|x| !old_set.contains(x)).cloned().collect();
