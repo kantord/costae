@@ -16,7 +16,6 @@ pub use layout::{
     parse_layout,
     parse_root_node,
     reconcile_panels,
-    reconcile_streams,
 };
 
 // render
@@ -187,18 +186,5 @@ mod tests {
         assert_eq!(to_destroy, vec!["bottombar".to_string()]);
     }
 
-    #[test]
-    fn reconcile_streams_returns_additions_and_removals() {
-        let old = vec![
-            ("bash".to_string(), Some("script_a".to_string())),
-            ("bash".to_string(), Some("script_b".to_string())),
-        ];
-        let new_calls = vec![
-            ("bash".to_string(), Some("script_b".to_string())),
-            ("bash".to_string(), Some("script_c".to_string())),
-        ];
-        let (to_spawn, to_kill) = reconcile_streams(&old, &new_calls);
-        assert_eq!(to_spawn, vec![("bash".to_string(), Some("script_c".to_string()))]);
-        assert_eq!(to_kill, vec![("bash".to_string(), Some("script_a".to_string()))]);
-    }
+
 }

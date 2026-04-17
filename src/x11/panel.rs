@@ -143,7 +143,7 @@ fn dispatch_click(
     on_click: &serde_json::Value,
 ) {
     if let Some(channel) = on_click.get("__channel__").and_then(|v| v.as_str()) {
-        if let Some(tx) = module_event_txs.get(channel) {
+if let Some(tx) = module_event_txs.get(channel) {
             let mut payload = on_click.clone();
             if let Some(obj) = payload.as_object_mut() { obj.remove("__channel__"); }
             let _ = tx.send(serde_json::json!({"event": "click", "data": payload}));

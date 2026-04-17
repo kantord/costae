@@ -1,25 +1,33 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, Seek, SeekFrom, Write as IoWrite};
 use std::os::unix::io::FromRawFd;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
 use crate::managed_set::{HasKey, Lifecycle, ManagedSet};
 
+/// Stable identity for a process: uniquely identifies which process to manage.
+/// Used as the key in `HasKey` so that `ManagedSet` can track processes by identity.
+#[derive(Hash, Eq, PartialEq, Clone, Debug)]
+pub struct ProcessIdentity {
+    pub bin: String,
+    pub key: String,
+}
+
 // NOTE: env uses BTreeMap (not HashMap) so that CommandSpec can derive Hash.
 // HashMap does not implement Hash; BTreeMap does because it has deterministic iteration order.
-#[derive(Hash, Eq, PartialEq, Clone, Debug)]
+#[derive(Clone, Debug)]
 pub struct CommandSpec {
-    pub bin: String,
+    pub identity: ProcessIdentity,
+    pub script: Option<String>,
     pub args: Vec<String>,
     pub env: BTreeMap<String, String>,
     pub current_dir: Option<PathBuf>,
-    pub key: Option<String>,
-    pub script: Option<String>,
+    pub props: Option<serde_json::Value>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -35,8 +43,13 @@ pub struct StreamItem {
     pub line: String,
 }
 
-fn spawn_process(spec: CommandSpec, tx: &mpsc::Sender<StreamItem>) -> Option<std::process::Child> {
-    let mut cmd = std::process::Command::new(&spec.bin);
+pub struct ProcessState {
+    pub child: std::process::Child,
+    pub event_tx: mpsc::Sender<serde_json::Value>,
+}
+
+fn spawn_process(spec: CommandSpec, tx: &mpsc::Sender<StreamItem>) -> Option<ProcessState> {
+    let mut cmd = std::process::Command::new(&spec.identity.bin);
     cmd.args(&spec.args);
     for (k, v) in &spec.env {
         cmd.env(k, v);
@@ -50,7 +63,7 @@ fn spawn_process(spec: CommandSpec, tx: &mpsc::Sender<StreamItem>) -> Option<std
     let _memfd_file = if let Some(ref content) = spec.script {
         let fd = unsafe { libc::memfd_create(c"costae-script".as_ptr(), 0) };
         if fd < 0 {
-            tracing::error!(bin = %spec.bin, "memfd_create failed");
+            tracing::error!(bin = %spec.identity.bin, "memfd_create failed");
             return None;
         }
         let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
@@ -64,11 +77,12 @@ fn spawn_process(spec: CommandSpec, tx: &mpsc::Sender<StreamItem>) -> Option<std
 
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
+    cmd.stdin(Stdio::piped());
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            tracing::error!(bin = %spec.bin, error = %e, "failed to spawn");
+            tracing::error!(bin = %spec.identity.bin, error = %e, "failed to spawn");
             return None;
         }
     };
@@ -97,7 +111,7 @@ fn spawn_process(spec: CommandSpec, tx: &mpsc::Sender<StreamItem>) -> Option<std
     }
 
     if let Some(stderr) = child.stderr.take() {
-        let bin_name = spec.bin.clone();
+        let bin_name = spec.identity.bin.clone();
         thread::spawn(move || {
             let reader = std::io::BufReader::new(stderr);
             for line in reader.lines() {
@@ -109,35 +123,55 @@ fn spawn_process(spec: CommandSpec, tx: &mpsc::Sender<StreamItem>) -> Option<std
         });
     }
 
-    Some(child)
+    // Wire up a stdin writer thread backed by an mpsc channel.
+    let (event_tx, event_rx) = mpsc::channel::<serde_json::Value>();
+    if let Some(mut stdin) = child.stdin.take() {
+        thread::spawn(move || {
+            while let Ok(event) = event_rx.recv() {
+                let line = serde_json::to_string(&event).unwrap_or_default() + "\n";
+                if stdin.write_all(line.as_bytes()).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+
+    Some(ProcessState { child, event_tx })
 }
 
 impl HasKey for CommandSpec {
-    type Key = Self;
-    fn key(&self) -> Self {
-        self.clone()
+    type Key = ProcessIdentity;
+    fn key(&self) -> ProcessIdentity {
+        self.identity.clone()
     }
 }
 
 impl Lifecycle for CommandSpec {
-    type State = std::process::Child;
+    type State = ProcessState;
     type Context = mpsc::Sender<StreamItem>;
 
     fn enter(self, ctx: &Self::Context) -> Option<Self::State> {
-        spawn_process(self, ctx)
+        let props = self.props.clone();
+        let state = spawn_process(self, ctx)?;
+        if let Some(p) = props {
+            let _ = state.event_tx.send(p);
+        }
+        Some(state)
     }
 
     fn update(self, state: &mut Self::State, ctx: &Self::Context) {
-        if matches!(state.try_wait(), Ok(Some(_))) {
-            tracing::warn!(bin = %self.bin, "process exited");
-            if let Some(new_child) = spawn_process(self, ctx) {
-                *state = new_child;
+        if matches!(state.child.try_wait(), Ok(Some(_))) {
+            tracing::warn!(bin = %self.identity.bin, "process exited");
+            if let Some(new_state) = spawn_process(self, ctx) {
+                *state = new_state;
             }
+        } else if let Some(p) = self.props.clone() {
+            let _ = state.event_tx.send(p);
         }
     }
 
     fn exit(mut state: Self::State, _ctx: &Self::Context) {
-        let _ = state.kill();
+        let _ = state.child.kill();
     }
 }
 
@@ -158,12 +192,16 @@ pub struct DataLoop {
     rx: mpsc::Receiver<StreamItem>,
     extra_rx: Option<mpsc::Receiver<()>>,
     desired_rx: mpsc::Receiver<Vec<CommandSpec>>,
+    /// Shared snapshot of event senders, keyed by bin name.
+    /// Updated on every `set_desired` call so callers outside `run` can route events.
+    event_txs_snapshot: Arc<Mutex<HashMap<String, mpsc::Sender<serde_json::Value>>>>,
 }
 
 impl DataLoop {
     pub fn new() -> (Self, DataLoopHandle) {
         let (tx, rx) = mpsc::channel();
         let (desired_tx, desired_rx) = mpsc::channel();
+        let event_txs_snapshot = Arc::new(Mutex::new(HashMap::new()));
         let data_loop = Self {
             pool: ManagedSet::new(tx),
             desired: Vec::new(),
@@ -171,9 +209,16 @@ impl DataLoop {
             rx,
             extra_rx: None,
             desired_rx,
+            event_txs_snapshot,
         };
         let handle = DataLoopHandle { tx: desired_tx };
         (data_loop, handle)
+    }
+
+    /// Returns a clone of the shared event_txs snapshot Arc.
+    /// Callers can hold this Arc and read from it while `run` is executing.
+    pub fn event_txs_handle(&self) -> Arc<Mutex<HashMap<String, mpsc::Sender<serde_json::Value>>>> {
+        Arc::clone(&self.event_txs_snapshot)
     }
 
     pub fn with_extra_rx(mut self, rx: mpsc::Receiver<()>) -> Self {
@@ -186,17 +231,46 @@ impl DataLoop {
         self
     }
 
+    pub fn collect_event_txs(&self) -> HashMap<ProcessIdentity, mpsc::Sender<serde_json::Value>> {
+        self.pool.iter()
+            .map(|(identity, state)| (identity.clone(), state.event_tx.clone()))
+            .collect()
+    }
+
+    pub fn send_event(&mut self, identity: &ProcessIdentity, event: serde_json::Value) {
+        // Drain desired_rx and reconcile so processes are spawned before we look them up.
+        loop {
+            match self.desired_rx.try_recv() {
+                Ok(specs) => self.set_desired(&specs),
+                Err(_) => break,
+            }
+        }
+        self.pool.update(self.desired.clone());
+        if let Some(state) = self.pool.get(identity) {
+            let _ = state.event_tx.send(event);
+        }
+    }
+
     fn set_desired(&mut self, desired: &[CommandSpec]) {
         // Deduplicate desired specs while preserving first occurrence order.
+        // Use ProcessIdentity (the HasKey type) as the deduplication key.
         let mut seen = std::collections::HashSet::new();
         let desired_unique: Vec<CommandSpec> = desired
             .iter()
-            .filter(|s| seen.insert((*s).clone()))
+            .filter(|s| seen.insert(s.identity.clone()))
             .cloned()
             .collect();
 
         self.desired = desired_unique;
         self.pool.update(self.desired.clone());
+        self.update_event_txs_snapshot();
+    }
+
+    fn update_event_txs_snapshot(&self) {
+        let mut snapshot = self.event_txs_snapshot.lock().unwrap();
+        *snapshot = self.pool.iter()
+            .map(|(identity, state)| (identity.bin.clone(), state.event_tx.clone()))
+            .collect();
     }
 
     pub fn run(
@@ -235,11 +309,17 @@ impl DataLoop {
 
             // Reconcile: enter new, exit removed, update existing (restarts crashed processes).
             self.pool.update(self.desired.clone());
+            self.update_event_txs_snapshot();
 
             on_tick();
 
             if awake {
-                // Skip blocking recv so stop and further extra_rx signals are detected quickly.
+                awake = false;
+                match self.rx.try_recv() {
+                    Ok(item) => on_item(item),
+                    Err(mpsc::TryRecvError::Empty) => {}
+                    Err(mpsc::TryRecvError::Disconnected) => break,
+                }
                 continue;
             }
 
@@ -264,11 +344,11 @@ mod tests {
     #[test]
     fn command_spec_has_script_field() {
         let spec = CommandSpec {
-            bin: "/bin/sh".to_string(),
+            identity: ProcessIdentity { bin: "/bin/sh".to_string(), key: "/bin/sh".to_string() },
             args: vec![],
             env: BTreeMap::new(),
             current_dir: None,
-            key: None,
+            props: None,
             script: Some("echo from_script".to_string()),
         };
         assert!(spec.script.is_some());
@@ -279,11 +359,11 @@ mod tests {
     #[test]
     fn script_content_is_executed_and_output_delivered() {
         let spec = CommandSpec {
-            bin: "/bin/sh".to_string(),
+            identity: ProcessIdentity { bin: "/bin/sh".to_string(), key: "/bin/sh".to_string() },
             args: vec![],
             env: BTreeMap::new(),
             current_dir: None,
-            key: None,
+            props: None,
             script: Some("echo from_script".to_string()),
         };
 
@@ -316,11 +396,11 @@ mod tests {
         // Use a process that emits once then sleeps — stays alive for the test window
         // so no restart occurs. This isolates the deduplication invariant from restart behavior.
         let spec = CommandSpec {
-            bin: "/bin/sh".to_string(),
+            identity: ProcessIdentity { bin: "/bin/sh".to_string(), key: "/bin/sh".to_string() },
             args: vec!["-c".to_string(), "echo hello; sleep 10".to_string()],
             env: BTreeMap::new(),
             current_dir: None,
-            key: None,
+            props: None,
             script: None,
         };
 
@@ -365,11 +445,11 @@ mod tests {
     #[test]
     fn stdout_line_is_delivered_to_handler_with_correct_source_and_kind() {
         let spec = CommandSpec {
-            bin: "/bin/sh".to_string(),
+            identity: ProcessIdentity { bin: "/bin/sh".to_string(), key: "/bin/sh".to_string() },
             args: vec!["-c".to_string(), "echo hello".to_string()],
             env: BTreeMap::new(),
             current_dir: None,
-            key: None,
+            props: None,
             script: None,
         };
 
@@ -390,7 +470,7 @@ mod tests {
         assert_eq!(items.len(), 1);
         let item = &items[0];
         assert_eq!(item.line, "hello");
-        assert_eq!(item.source, spec);
+        assert_eq!(item.source.identity, spec.identity);
         assert_eq!(item.stream, StreamKind::Stdout);
     }
 
@@ -398,11 +478,11 @@ mod tests {
     fn crashed_process_is_restarted_and_output_continues() {
         // Use a command that emits one line then exits immediately.
         let spec = CommandSpec {
-            bin: "/bin/sh".to_string(),
+            identity: ProcessIdentity { bin: "/bin/sh".to_string(), key: "/bin/sh".to_string() },
             args: vec!["-c".to_string(), "echo hello".to_string()],
             env: BTreeMap::new(),
             current_dir: None,
-            key: None,
+            props: None,
             script: None,
         };
 
@@ -451,14 +531,14 @@ mod tests {
     #[test]
     fn run_stops_when_cancellation_token_is_set() {
         let spec = CommandSpec {
-            bin: "/bin/sh".to_string(),
+            identity: ProcessIdentity { bin: "/bin/sh".to_string(), key: "/bin/sh".to_string() },
             args: vec![
                 "-c".to_string(),
                 "while true; do echo tick; sleep 0.1; done".to_string(),
             ],
             env: BTreeMap::new(),
             current_dir: None,
-            key: None,
+            props: None,
             script: None,
         };
 
@@ -562,6 +642,76 @@ mod tests {
         );
     }
 
+    // ── ProcessIdentity / CommandSpec refactor ───────────────────────────────
+
+    /// Compile-time: `ProcessIdentity` must exist with `bin: String` and `key: String`
+    /// fields and derive `Hash`, `Eq`, `PartialEq`, `Clone`.
+    #[test]
+    fn process_identity_has_bin_and_key_fields() {
+        let id = ProcessIdentity {
+            bin: "mybin".to_string(),
+            key: "mykey".to_string(),
+        };
+        assert_eq!(id.bin, "mybin");
+        assert_eq!(id.key, "mykey");
+    }
+
+    /// Compile-time: `ProcessIdentity` must implement `Hash + Eq + PartialEq + Clone`
+    /// so it can be used as a `HashMap` key.
+    #[test]
+    fn process_identity_derives_hash_eq_partialeq_clone() {
+        use std::collections::HashSet;
+        let a = ProcessIdentity { bin: "bin".to_string(), key: "k".to_string() };
+        let b = a.clone();
+        assert_eq!(a, b);
+        let mut set = HashSet::new();
+        set.insert(a);
+        // Inserting a clone of the same identity should not grow the set.
+        assert!(!set.insert(b));
+    }
+
+    /// Compile-time: `CommandSpec` must have an `identity: ProcessIdentity` field
+    /// plus the runtime fields `script`, `args`, `env`, `current_dir`, `props`.
+    #[test]
+    fn command_spec_composed_of_identity_and_runtime_fields() {
+        let spec = CommandSpec {
+            identity: ProcessIdentity {
+                bin: "/bin/sh".to_string(),
+                key: "my-key".to_string(),
+            },
+            script: Some("echo hello".to_string()),
+            args: vec!["--flag".to_string()],
+            env: BTreeMap::new(),
+            current_dir: None,
+            props: None,
+        };
+        assert_eq!(spec.identity.bin, "/bin/sh");
+        assert_eq!(spec.identity.key, "my-key");
+        assert!(spec.script.is_some());
+    }
+
+    /// Compile-time + runtime: `HasKey for CommandSpec` must use `type Key = ProcessIdentity`
+    /// and `key()` must return `self.identity.clone()`.
+    #[test]
+    fn has_key_for_command_spec_returns_process_identity() {
+        use crate::managed_set::HasKey;
+        let id = ProcessIdentity {
+            bin: "/usr/bin/cat".to_string(),
+            key: "cat-key".to_string(),
+        };
+        let spec = CommandSpec {
+            identity: id.clone(),
+            script: None,
+            args: vec![],
+            env: BTreeMap::new(),
+            current_dir: None,
+            props: None,
+        };
+        // The returned key must be a `ProcessIdentity` equal to `spec.identity`.
+        let returned: ProcessIdentity = spec.key();
+        assert_eq!(returned, id);
+    }
+
     // ── DataLoopHandle ────────────────────────────────────────────────────────
 
     /// Compile-time test: `DataLoop::new()` must return a `(DataLoop, DataLoopHandle)` tuple.
@@ -571,6 +721,239 @@ mod tests {
         let (_data_loop, _handle): (DataLoop, DataLoopHandle) = DataLoop::new();
     }
 
+    // ── props / init / update / send_event ───────────────────────────────────
+
+    /// Claim A — runtime: when `CommandSpec` has `props: Some(value)`, the subprocess
+    /// receives `<value>\n` on its stdin before producing output (sent directly, no wrapping).
+    ///
+    /// The script reads one line from stdin and echoes it back prefixed with "got:".
+    #[test]
+    fn props_init_message_is_sent_to_subprocess_stdin() {
+        let props_value = serde_json::json!({"color": "red"});
+        let expected_payload = serde_json::json!({"color": "red"});
+        let spec = CommandSpec {
+            identity: ProcessIdentity { bin: "/bin/sh".to_string(), key: "init-test".to_string() },
+            // Script: read one line from stdin, echo it back
+            args: vec!["-c".to_string(), "read line; echo \"got:$line\"".to_string()],
+            env: BTreeMap::new(),
+            current_dir: None,
+            props: Some(props_value),
+            script: None,
+        };
+
+        let (mut data_loop, handle) = DataLoop::new();
+        handle.set_desired(vec![spec.clone()]);
+
+        let collected: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let collected_clone = Arc::clone(&collected);
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_for_run = Arc::clone(&stop);
+
+        let run_handle = thread::spawn(move || {
+            data_loop.run(
+                stop_for_run,
+                |item| {
+                    collected_clone.lock().unwrap().push(item.line);
+                },
+                || {},
+            );
+        });
+
+        // Wait up to 3 s for the echoed init line.
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            if !collected.lock().unwrap().is_empty() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for subprocess to echo init message"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        stop.store(true, Ordering::Relaxed);
+        let _ = run_handle.join();
+
+        let items = collected.lock().unwrap();
+        let expected_got = format!("got:{}", expected_payload);
+        assert!(
+            items.iter().any(|l| l == &expected_got),
+            "expected echoed init payload {:?}, got: {:?}",
+            expected_got,
+            *items
+        );
+    }
+
+    /// Claim B — runtime: when a running process's spec is updated with the same
+    /// `ProcessIdentity` but different `props`, the subprocess receives
+    /// `{"type":"update","props":<new_value>}\n` on its stdin.
+    ///
+    /// The script loops reading lines from stdin and echoing each one back.
+    /// After the update we assert that the echoed update payload appears in output.
+    #[test]
+    fn props_update_message_is_sent_to_subprocess_stdin_on_spec_update() {
+        let initial_props = serde_json::json!({"step": 1});
+        let updated_props = serde_json::json!({"step": 2});
+        let expected_update_payload = serde_json::json!({"step": 2});
+
+        let identity = ProcessIdentity {
+            bin: "/bin/sh".to_string(),
+            key: "update-test".to_string(),
+        };
+
+        // Script: loop-reads lines from stdin and echoes each one.
+        let spec_v1 = CommandSpec {
+            identity: identity.clone(),
+            args: vec![
+                "-c".to_string(),
+                "while read line; do echo \"got:$line\"; done".to_string(),
+            ],
+            env: BTreeMap::new(),
+            current_dir: None,
+            props: Some(initial_props),
+            script: None,
+        };
+
+        let (mut data_loop, handle) = DataLoop::new();
+        handle.set_desired(vec![spec_v1.clone()]);
+
+        let collected: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let collected_clone = Arc::clone(&collected);
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_for_run = Arc::clone(&stop);
+
+        let run_handle = thread::spawn(move || {
+            data_loop.run(
+                stop_for_run,
+                |item| {
+                    collected_clone.lock().unwrap().push(item.line);
+                },
+                || {},
+            );
+        });
+
+        // Wait for the init echo to confirm the process is running and reading stdin.
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            if !collected.lock().unwrap().is_empty() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for subprocess to echo init message"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        // Now update the spec with new props — same identity, different props.
+        let spec_v2 = CommandSpec {
+            identity: identity.clone(),
+            args: vec![
+                "-c".to_string(),
+                "while read line; do echo \"got:$line\"; done".to_string(),
+            ],
+            env: BTreeMap::new(),
+            current_dir: None,
+            props: Some(updated_props),
+            script: None,
+        };
+        handle.set_desired(vec![spec_v2]);
+
+        // Wait for the update echo to appear.
+        let expected_got = format!("got:{}", expected_update_payload);
+        let update_deadline = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            if collected.lock().unwrap().iter().any(|l| l == &expected_got) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < update_deadline,
+                "timed out waiting for subprocess to echo update message"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        stop.store(true, Ordering::Relaxed);
+        let _ = run_handle.join();
+
+        let items = collected.lock().unwrap();
+        assert!(
+            items.iter().any(|l| l == &expected_got),
+            "expected echoed update payload {:?}, got: {:?}",
+            expected_got,
+            *items
+        );
+    }
+
+    /// Claim C — compile-time + runtime: `DataLoop` must expose a
+    /// `send_event(identity: &ProcessIdentity, event: serde_json::Value)` method that
+    /// writes an arbitrary JSON event to the stdin of the matching running process.
+    ///
+    /// The script loops reading lines from stdin and echoing each one back.
+    /// After calling `send_event` we assert the echoed payload appears in output.
+    #[test]
+    fn send_event_writes_arbitrary_json_to_subprocess_stdin() {
+        let identity = ProcessIdentity {
+            bin: "/bin/sh".to_string(),
+            key: "send-event-test".to_string(),
+        };
+        let spec = CommandSpec {
+            identity: identity.clone(),
+            args: vec![
+                "-c".to_string(),
+                "while read line; do echo \"got:$line\"; done".to_string(),
+            ],
+            env: BTreeMap::new(),
+            current_dir: None,
+            props: None,
+            script: None,
+        };
+
+        let (mut data_loop, handle) = DataLoop::new();
+        handle.set_desired(vec![spec]);
+
+        let event = serde_json::json!({"type": "ping", "id": 42});
+        let collected: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let collected_clone = Arc::clone(&collected);
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_for_run = Arc::clone(&stop);
+
+        let run_handle = thread::spawn(move || {
+            // Small delay to let the loop start and the process be spawned.
+            thread::sleep(Duration::from_millis(50));
+            data_loop.send_event(&identity, event.clone());
+            data_loop.run(
+                stop_for_run,
+                |item| {
+                    collected_clone.lock().unwrap().push(item.line);
+                },
+                || {},
+            );
+        });
+
+        let expected_got = format!("got:{}", serde_json::json!({"type": "ping", "id": 42}));
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            if collected.lock().unwrap().iter().any(|l| l == &expected_got) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for send_event echo"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        stop.store(true, Ordering::Relaxed);
+        let _ = run_handle.join();
+
+        let items = collected.lock().unwrap();
+        assert!(
+            items.iter().any(|l| l == &expected_got),
+            "expected echoed event payload {:?}, got: {:?}",
+            expected_got,
+            *items
+        );
+    }
+
     /// Runtime test: calling `handle.set_desired(specs)` from outside the `run` loop
     /// updates the running pool — a new spec is spawned — and output arrives on the
     /// `on_item` callback, proving the handle can communicate with the running loop
@@ -578,11 +961,11 @@ mod tests {
     #[test]
     fn handle_set_desired_spawns_process_into_running_loop() {
         let spec = CommandSpec {
-            bin: "/bin/sh".to_string(),
+            identity: ProcessIdentity { bin: "/bin/sh".to_string(), key: "/bin/sh".to_string() },
             args: vec!["-c".to_string(), "echo handle_output".to_string()],
             env: BTreeMap::new(),
             current_dir: None,
-            key: None,
+            props: None,
             script: None,
         };
 

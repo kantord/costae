@@ -1,9 +1,11 @@
 use std::collections::HashMap;
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::Duration;
 
-use costae::{GlobalContext, RenderCache, inject_root_bg, load_fonts, parse_layout, preload_layout_images, reconcile_panels, reconcile_streams, render_frame, spawn_bi_stream, spawn_string_stream};
+use costae::{GlobalContext, RenderCache, inject_root_bg, load_fonts, parse_layout, preload_layout_images, reconcile_panels, render_frame};
+use costae::data::data_loop::{CommandSpec, DataLoop, DataLoopHandle, ProcessIdentity, StreamItem};
 use costae::x11::panel::{Panel, X11Context, create_panel, destroy_panel, sample_root_bg, i3_dpi, do_hit_test};
 use x11rb::{
     connection::Connection,
@@ -19,41 +21,37 @@ fn resolve_layout(raw_layout: &Option<serde_json::Value>) -> Option<takumi::layo
     })
 }
 
-/// Tracks all running child processes and their communication channels.
-struct StreamRegistry {
-    stream_children: HashMap<(String, Option<String>), std::process::Child>,
-    bi_stream_children: HashMap<String, std::process::Child>,
-    module_event_txs: HashMap<String, mpsc::Sender<serde_json::Value>>,
+fn stream_calls_to_specs(calls: &[(String, Option<String>)]) -> Vec<costae::data::data_loop::CommandSpec> {
+    calls.iter().map(|(bin, script)| CommandSpec {
+        identity: ProcessIdentity {
+            bin: bin.clone(),
+            key: format!("{}:{}", bin, script.as_deref().unwrap_or("")),
+        },
+        script: script.clone(),
+        args: vec![],
+        env: std::collections::BTreeMap::new(),
+        current_dir: None,
+        props: None,
+    }).collect()
 }
 
-impl StreamRegistry {
-    fn new() -> Self {
-        Self {
-            stream_children: HashMap::new(),
-            bi_stream_children: HashMap::new(),
-            module_event_txs: HashMap::new(),
-        }
-    }
+fn module_calls_to_specs(calls: &[(String, serde_json::Value)]) -> Vec<CommandSpec> {
+    calls.iter().map(|(bin, props)| CommandSpec {
+        identity: ProcessIdentity { bin: bin.clone(), key: bin.clone() },
+        script: None,
+        args: vec![],
+        env: std::collections::BTreeMap::new(),
+        current_dir: None,
+        props: Some(props.clone()),
+    }).collect()
 }
 
-/// Apply the result of a JSX evaluation: parse specs, reconcile streams, spawn/kill children,
-/// and update panels.
-///
-/// `current_calls` should be `&[]` on a fresh load (blocks 1 & 2) so that all stream_calls are
-/// treated as new spawns. On a re-eval (block 3) pass the currently running keys so that removed
-/// streams are killed.
-///
-/// Returns `true` on success, `false` if `parse_root_node` fails.
-#[allow(clippy::too_many_arguments)]
 fn apply_eval_result(
     value: &serde_json::Value,
     stream_calls: &[(String, Option<String>)],
-    module_calls: &[String],
-    current_calls: &[(String, Option<String>)],
-    registry: &mut StreamRegistry,
+    module_calls: &[(String, serde_json::Value)],
+    handle: &DataLoopHandle,
     panels: &mut Vec<Panel>,
-    stream_tx: &mpsc::Sender<costae::data::data_loop::StreamItem>,
-    wake_tx: &mpsc::SyncSender<()>,
     mod_init_fn: &dyn Fn(&[costae::PanelSpec]) -> serde_json::Value,
     apply_panel_specs_fn: &mut dyn FnMut(&mut Vec<Panel>, Vec<costae::PanelSpec>),
 ) -> bool {
@@ -66,62 +64,43 @@ fn apply_eval_result(
     };
     let mod_init = mod_init_fn(&specs);
 
-    let (to_spawn, to_kill) = reconcile_streams(current_calls, stream_calls);
-    for (b, s) in to_kill {
-        if let Some(mut child) = registry.stream_children.remove(&(b, s)) {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-    }
-    for (bin, script) in to_spawn {
-        let child = spawn_string_stream(&bin, script.as_deref(), stream_tx.clone(), wake_tx.clone());
-        registry.stream_children.insert((bin, script), child);
-    }
-    for bin in module_calls {
-        if !registry.bi_stream_children.contains_key(bin) {
-            let bi = spawn_bi_stream(bin, &mod_init, stream_tx.clone(), wake_tx.clone());
-            registry.module_event_txs.insert(bin.clone(), bi.event_tx);
-            registry.bi_stream_children.insert(bin.clone(), bi.child);
-        }
-    }
+    let mut combined = stream_calls_to_specs(stream_calls);
+    let module_specs: Vec<CommandSpec> = module_calls.iter().map(|(bin, _)| CommandSpec {
+        identity: ProcessIdentity { bin: bin.clone(), key: bin.clone() },
+        script: None,
+        args: vec![],
+        env: std::collections::BTreeMap::new(),
+        current_dir: None,
+        props: Some(mod_init.clone()),
+    }).collect();
+    combined.extend(module_specs);
+    handle.set_desired(combined);
 
     apply_panel_specs_fn(panels, specs);
     true
 }
 
+#[cfg(test)]
 fn drain_stream_updates(
     rx: &mpsc::Receiver<costae::data::data_loop::StreamItem>,
     values: &mut HashMap<(String, Option<String>), String>,
 ) -> bool {
     let mut changed = false;
     while let Ok(item) = rx.try_recv() {
-        let key = (item.source.bin, item.source.script);
-        let value = item.line;
-        if values.get(&key).map(|s| s.as_str()) != Some(value.as_str()) {
-            values.insert(key, value);
+        let key = (item.source.identity.bin.clone(), item.source.script.clone());
+        if values.get(&key).map(|s| s.as_str()) != Some(item.line.as_str()) {
+            values.insert(key, item.line);
             changed = true;
         }
     }
     changed
 }
 
-fn stream_calls_to_specs(calls: &[(String, Option<String>)]) -> Vec<costae::data::data_loop::CommandSpec> {
-    use std::collections::BTreeMap;
-    calls.iter().map(|(bin, script)| costae::data::data_loop::CommandSpec {
-        bin: bin.clone(),
-        script: script.clone(),
-        args: vec![],
-        env: BTreeMap::new(),
-        current_dir: None,
-        key: None,
-    }).collect()
-}
-
 #[allow(clippy::too_many_arguments)]
 fn handle_x11_events(
     conn: &RustConnection,
     panels: &mut [Panel],
-    module_event_txs: &HashMap<String, mpsc::Sender<serde_json::Value>>,
+    module_event_txs: &std::sync::Mutex<HashMap<String, mpsc::Sender<serde_json::Value>>>,
     global: &GlobalContext,
     dpr: f32,
     depth: u8,
@@ -140,8 +119,9 @@ fn handle_x11_events(
             }
             x11rb::protocol::Event::ButtonPress(e) => {
                 if let Some(panel) = panels.iter().find(|p| p.win_id == e.event) {
+                    let txs = module_event_txs.lock().unwrap();
                     do_hit_test(
-                        &panel.raw_layout, module_event_txs,
+                        &panel.raw_layout, &*txs,
                         global, panel.phys_width, panel.phys_height, dpr,
                         e.event_x as f32, e.event_y as f32,
                     );
@@ -149,9 +129,6 @@ fn handle_x11_events(
             }
             x11rb::protocol::Event::PropertyNotify(e) => {
                 if xrootpmap_atom == Some(e.atom) {
-                    // Wallpaper changed: re-sample each panel's own region using the
-                    // same 3-tier fallback as initial sampling so every monitor gets
-                    // the correct pixels regardless of pixmap layout.
                     for panel in panels.iter_mut() {
                         if let Some(rgba) = sample_root_bg(conn, root, panel.win_x, panel.win_y, panel.phys_width, panel.phys_height, xrootpmap_atom) {
                             panel.root_bg_rgba = rgba;
@@ -174,29 +151,19 @@ fn handle_x11_events(
 #[allow(clippy::too_many_arguments)]
 fn handle_layout_reload(
     reload_rx: &mpsc::Receiver<()>,
-    registry: &mut StreamRegistry,
+    handle: &DataLoopHandle,
     stream_values: &mut HashMap<(String, Option<String>), String>,
     jsx_evaluator: &mut Option<costae::jsx::JsxEvaluator>,
     layout_jsx_path: &std::path::Path,
     jsx_ctx: &serde_json::Value,
     panels: &mut Vec<Panel>,
-    stream_tx: &mpsc::Sender<costae::data::data_loop::StreamItem>,
-    wake_tx: &mpsc::SyncSender<()>,
     mod_init_fn: &dyn Fn(&[costae::PanelSpec]) -> serde_json::Value,
     apply_panel_specs_fn: &mut dyn FnMut(&mut Vec<Panel>, Vec<costae::PanelSpec>),
 ) -> bool {
     if reload_rx.try_recv().is_err() {
         return false;
     }
-    for (_, mut child) in registry.stream_children.drain() {
-        let _ = child.kill();
-        let _ = child.wait();
-    }
-    for (_, mut child) in registry.bi_stream_children.drain() {
-        let _ = child.kill();
-        let _ = child.wait();
-    }
-    registry.module_event_txs.clear();
+    handle.set_desired(vec![]);
     stream_values.clear();
     *jsx_evaluator = None;
 
@@ -207,8 +174,7 @@ fn handle_layout_reload(
                     Ok((value, stream_calls, module_calls)) => {
                         apply_eval_result(
                             &value, &stream_calls, &module_calls,
-                            &[], registry, panels,
-                            stream_tx, wake_tx,
+                            handle, panels,
                             mod_init_fn, apply_panel_specs_fn,
                         );
                         *jsx_evaluator = Some(evaluator);
@@ -256,6 +222,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let last_tick = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     {
         let last_tick = std::sync::Arc::clone(&last_tick);
+        let log_path = log_path.clone();
         thread::spawn(move || {
             loop {
                 thread::sleep(Duration::from_secs(10));
@@ -278,12 +245,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    let (wake_tx, wake_rx) = mpsc::sync_channel::<()>(1);
+    // Shared wake channel: file watchers and bi-streams ping this to interrupt
+    // DataLoop's recv_timeout early.
+    let (dl_wake_tx, dl_wake_rx) = mpsc::sync_channel::<()>(1);
 
     let (reload_tx, reload_rx) = mpsc::channel::<()>();
     {
         let path = layout_jsx_path.clone();
-        let wake_tx = wake_tx.clone();
+        let dl_wake_tx = dl_wake_tx.clone();
         thread::spawn(move || {
             let mut last_modified = std::fs::metadata(&path)
                 .and_then(|m| m.modified())
@@ -296,14 +265,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if modified != last_modified {
                     last_modified = modified;
                     let _ = reload_tx.send(());
-                    let _ = wake_tx.try_send(());
+                    let _ = dl_wake_tx.try_send(());
                 }
             }
         });
     }
 
-    // If we were exec'd by a previous instance, it passes the mtime it saw so we
-    // don't immediately re-trigger on the same installation.
     let exe_baseline: Option<std::time::SystemTime> =
         std::env::var("COSTAE_EXE_MTIME_NS")
             .ok()
@@ -316,7 +283,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (bin_reload_tx, bin_reload_rx) = mpsc::channel::<()>();
     if exe_path.exists() {
         let path = exe_path.clone();
-        let wake_tx = wake_tx.clone();
+        let dl_wake_tx = dl_wake_tx.clone();
         thread::spawn(move || {
             let mut last_modified = exe_baseline;
             loop {
@@ -327,15 +294,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if modified != last_modified {
                     last_modified = modified;
                     let _ = bin_reload_tx.send(());
-                    let _ = wake_tx.try_send(());
+                    let _ = dl_wake_tx.try_send(());
                 }
             }
         });
     }
 
-    let mut registry = StreamRegistry::new();
+    // DataLoop manages all subprocesses (string streams and modules).
+    let (mut data_loop, handle) = DataLoop::new();
+    data_loop = data_loop.with_extra_rx(dl_wake_rx);
+    let module_event_txs = data_loop.event_txs_handle();
+
     let mut stream_values: HashMap<(String, Option<String>), String> = HashMap::new();
-    let (stream_tx, stream_rx) = mpsc::channel::<costae::data::data_loop::StreamItem>();
     let mut jsx_evaluator: Option<costae::jsx::JsxEvaluator> = None;
 
     let (conn, screen_num) = RustConnection::connect(None)?;
@@ -354,14 +324,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mon_width = crtc_info.width as u32;
     let dpr = dpi / 96.0;
 
-    // Enumerate all connected outputs: name → (x, y, phys_width, phys_height).
     let mut output_map: HashMap<String, (i16, i16, u32, u32)> = HashMap::new();
     if let Ok(cookie) = conn.randr_get_screen_resources_current(screen.root) {
         if let Ok(resources) = cookie.reply() {
             for &out_id in &resources.outputs {
                 if let Ok(info_cookie) = conn.randr_get_output_info(out_id, 0) {
                     if let Ok(info) = info_cookie.reply() {
-                        if info.crtc == 0 { continue; } // not active
+                        if info.crtc == 0 { continue; }
                         if let Ok(crtc_cookie) = conn.randr_get_crtc_info(info.crtc, 0) {
                             if let Ok(crtc) = crtc_cookie.reply() {
                                 let name = String::from_utf8_lossy(&info.name).into_owned();
@@ -377,8 +346,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut global = GlobalContext::default();
     load_fonts(&mut global);
 
-    // Watch for wallpaper changes: wallpaper setters (feh, nitrogen, etc.) signal a new
-    // wallpaper by updating the _XROOTPMAP_ID property on the root window.
     conn.change_window_attributes(
         screen.root,
         &ChangeWindowAttributesAux::new().event_mask(EventMask::PROPERTY_CHANGE),
@@ -407,13 +374,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         output_map: &output_map,
     };
 
-    // Express screen dimensions in logical CSS px (physical ÷ DPR) so that layout code
-    // can use ctx.screen_height directly in panel height props without double-scaling.
-    // create_panel multiplies by DPR to recover physical pixels.
     let screen_width_logical = (mon_width as f32 / dpr).round() as u32;
     let screen_height_logical = (mon_height as f32 / dpr).round() as u32;
 
-    // Build outputs array for jsx: all connected monitors with logical dimensions.
     let outputs_json: Vec<serde_json::Value> = output_map.iter().map(|(name, &(_, _, pw, ph))| {
         serde_json::json!({
             "name": name,
@@ -432,9 +395,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut panels: Vec<Panel> = Vec::new();
 
-    // Build the init_event that is sent to bi-stream modules (e.g. costae-i3).
-    // Uses the left-anchored panel spec so costae-i3 gets the correct bar_width for
-    // its i3 gap command. Falls back to first spec if no left-anchored panel exists.
     let make_mod_init = |specs: &[costae::PanelSpec]| -> serde_json::Value {
         let spec = specs.iter()
             .find(|p| p.anchor == Some(costae::PanelAnchor::Left))
@@ -455,8 +415,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
     };
 
-    // Helper: apply a new set of PanelSpecs — create/destroy panels and update raw_layout.
-    // Module spawning is done by the caller before invoking this.
     let mut apply_panel_specs = |panels: &mut Vec<Panel>, specs: Vec<costae::PanelSpec>| {
         let existing_ids: Vec<&str> = panels.iter().map(|p| p.id.as_str()).collect();
         let (to_create, to_update, to_destroy) = reconcile_panels(&existing_ids, &specs);
@@ -507,8 +465,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 tracing::debug!(elapsed_ms = t.elapsed().as_millis(), "jsx eval");
                                 apply_eval_result(
                                     &value, &stream_calls, &module_calls,
-                                    &[], &mut registry, &mut panels,
-                                    &stream_tx, &wake_tx,
+                                    &handle, &mut panels,
                                     &make_mod_init, &mut apply_panel_specs,
                                 );
                                 jsx_evaluator = Some(evaluator);
@@ -523,117 +480,139 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    loop {
-        last_tick.store(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
-            std::sync::atomic::Ordering::Relaxed,
-        );
-        let mut changed = false;
+    // Cross-closure channel: on_item sends key/value here, on_tick processes them.
+    let (item_tx, item_rx) = mpsc::channel::<((String, Option<String>), String)>();
 
-        if bin_reload_rx.try_recv().is_ok() {
-            tracing::info!("binary changed, restarting...");
-            for child in registry.stream_children.values_mut() {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
-            for child in registry.bi_stream_children.values_mut() {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
-            for panel in std::mem::take(&mut panels) {
-                destroy_panel(panel, &conn);
-            }
-            let _ = conn.flush();
-            use std::os::unix::process::CommandExt;
-            let mut cmd = std::process::Command::new(&exe_path);
-            if let Ok(mtime) = std::fs::metadata(&exe_path).and_then(|m| m.modified()) {
-                if let Ok(dur) = mtime.duration_since(std::time::UNIX_EPOCH) {
-                    cmd.env("COSTAE_EXE_MTIME_NS", dur.as_nanos().to_string());
+    let stop = Arc::new(AtomicBool::new(false));
+
+    data_loop.run(
+        Arc::clone(&stop),
+        // on_item: relay line to on_tick via channel (avoids dual mutable capture)
+        move |item: StreamItem| {
+            let key = (item.source.identity.bin.clone(), item.source.script.clone());
+            let _ = item_tx.send((key, item.line));
+        },
+        // on_tick: all stateful work — stream processing, reloads, X11, render
+        || {
+            last_tick.store(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+                Ordering::Relaxed,
+            );
+
+            let mut needs_render = false;
+
+            // Drain stream updates from DataLoop (string streams and modules share the same channel)
+            let mut changed = false;
+            while let Ok((key, value)) = item_rx.try_recv() {
+                if stream_values.get(&key).map(|s| s.as_str()) != Some(value.as_str()) {
+                    stream_values.insert(key, value);
+                    changed = true;
                 }
             }
-            let _ = cmd.exec();
-        }
 
-        if handle_layout_reload(
-            &reload_rx, &mut registry, &mut stream_values, &mut jsx_evaluator,
-            &layout_jsx_path, &jsx_ctx, &mut panels, &stream_tx, &wake_tx,
-            &make_mod_init, &mut apply_panel_specs,
-        ) {
-            changed = true;
-        }
-
-        let streams_updated = drain_stream_updates(&stream_rx, &mut stream_values);
-        if streams_updated {
-            if let Some(ref evaluator) = jsx_evaluator {
-                let t = std::time::Instant::now();
-                match evaluator.eval(&stream_values) {
-                    Ok((new_value, new_calls, new_module_calls)) => {
-                        tracing::debug!(elapsed_us = t.elapsed().as_micros(), "jsx re-eval");
-                        let current_calls: Vec<_> = registry.stream_children.keys().cloned().collect();
-                        let did_apply = apply_eval_result(
-                            &new_value, &new_calls, &new_module_calls,
-                            &current_calls, &mut registry, &mut panels,
-                            &stream_tx, &wake_tx,
-                            &make_mod_init, &mut apply_panel_specs,
-                        );
-                        if did_apply {
-                            changed = true;
-                        }
-                    }
-                    Err(e) => tracing::error!(error = %e, "JSX re-eval error"),
-                }
-            }
-        }
-
-        // Process X11 events
-        if handle_x11_events(
-            &conn, &mut panels, &registry.module_event_txs,
-            &global, dpr, depth, screen.root, xrootpmap_atom,
-        )? {
-            changed = true;
-        }
-
-        if changed {
-            let key = serde_json::to_value(&stream_values).unwrap_or_default();
-            for panel in panels.iter_mut() {
-                // Re-inject this panel's own wallpaper snapshot as "root-bg" before
-                // rendering so backdrop-blur and background-image read the correct pixels.
-                inject_root_bg(&global, panel.root_bg_rgba.clone(), panel.phys_width, panel.phys_height);
-                panel.bgrx = panel.render_cache.get_or_render(&key, || {
+            if changed {
+                if let Some(ref evaluator) = jsx_evaluator {
                     let t = std::time::Instant::now();
-                    let layout = resolve_layout(&panel.raw_layout);
-                    tracing::debug!(elapsed_us = t.elapsed().as_micros(), "resolve_layout");
-                    render_frame(layout, &global, panel.phys_width, panel.phys_height, dpr)
-                });
-                tracing::debug!(panel = %panel.id, win_id = panel.win_id, "put_image");
-                conn.put_image(ImageFormat::Z_PIXMAP, panel.win_id, panel.gc, panel.phys_width as u16, panel.phys_height as u16, 0, 0, 0, depth, &panel.bgrx[..])?;
+                    match evaluator.eval(&stream_values) {
+                        Ok((new_value, new_calls, new_module_calls)) => {
+                            tracing::debug!(elapsed_us = t.elapsed().as_micros(), "jsx re-eval");
+                            if apply_eval_result(
+                                &new_value, &new_calls, &new_module_calls,
+                                &handle, &mut panels,
+                                &make_mod_init, &mut apply_panel_specs,
+                            ) {
+                                needs_render = true;
+                            }
+                        }
+                        Err(e) => tracing::error!(error = %e, "JSX re-eval error"),
+                    }
+                }
             }
-            conn.flush()?;
-            tracing::debug!("flush ok");
-        }
 
-        let _ = wake_rx.recv_timeout(Duration::from_millis(50));
+            // Binary reload: set stop flag; cleanup + re-exec happens after run() returns
+            if bin_reload_rx.try_recv().is_ok() {
+                tracing::info!("binary changed, restarting...");
+                stop.store(true, Ordering::Relaxed);
+                return;
+            }
+
+            // Layout reload
+            if handle_layout_reload(
+                &reload_rx, &handle, &mut stream_values,
+                &mut jsx_evaluator, &layout_jsx_path, &jsx_ctx, &mut panels,
+                &make_mod_init, &mut apply_panel_specs,
+            ) {
+                needs_render = true;
+            }
+
+            // X11 events
+            match handle_x11_events(
+                &conn, &mut panels, &*module_event_txs,
+                &global, dpr, depth, screen.root, xrootpmap_atom,
+            ) {
+                Ok(wallpaper_changed) => { if wallpaper_changed { needs_render = true; } }
+                Err(e) => tracing::error!(error = %e, "X11 event error"),
+            }
+
+            // Render
+            if needs_render {
+                let key = serde_json::to_value(&stream_values).unwrap_or_default();
+                for panel in panels.iter_mut() {
+                    inject_root_bg(&global, panel.root_bg_rgba.clone(), panel.phys_width, panel.phys_height);
+                    panel.bgrx = panel.render_cache.get_or_render(&key, || {
+                        let t = std::time::Instant::now();
+                        let layout = resolve_layout(&panel.raw_layout);
+                        tracing::debug!(elapsed_us = t.elapsed().as_micros(), "resolve_layout");
+                        render_frame(layout, &global, panel.phys_width, panel.phys_height, dpr)
+                    });
+                    tracing::debug!(panel = %panel.id, win_id = panel.win_id, "put_image");
+                    if let Err(e) = conn.put_image(ImageFormat::Z_PIXMAP, panel.win_id, panel.gc, panel.phys_width as u16, panel.phys_height as u16, 0, 0, 0, depth, &panel.bgrx[..]) {
+                        tracing::error!(error = %e, "put_image failed");
+                    }
+                }
+                if let Err(e) = conn.flush() {
+                    tracing::error!(error = %e, "flush failed");
+                }
+                tracing::debug!("flush ok");
+            }
+        },
+    );
+
+    // run() returned because stop was set (binary reload). Clean up and re-exec.
+    for panel in std::mem::take(&mut panels) {
+        destroy_panel(panel, &conn);
     }
+    let _ = conn.flush();
+    use std::os::unix::process::CommandExt;
+    let mut cmd = std::process::Command::new(&exe_path);
+    if let Ok(mtime) = std::fs::metadata(&exe_path).and_then(|m| m.modified()) {
+        if let Ok(dur) = mtime.duration_since(std::time::UNIX_EPOCH) {
+            cmd.env("COSTAE_EXE_MTIME_NS", dur.as_nanos().to_string());
+        }
+    }
+    let _ = cmd.exec();
+
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{drain_stream_updates, stream_calls_to_specs};
-    use costae::data::data_loop::{CommandSpec, StreamItem, StreamKind};
+    use super::{drain_stream_updates, module_calls_to_specs, stream_calls_to_specs};
+    use costae::data::data_loop::{CommandSpec, ProcessIdentity, StreamItem, StreamKind};
     use std::collections::{BTreeMap, HashMap};
     use std::sync::mpsc;
 
     fn make_spec(bin: &str, script: Option<&str>) -> CommandSpec {
         CommandSpec {
-            bin: bin.to_string(),
+            identity: ProcessIdentity { bin: bin.to_string(), key: bin.to_string() },
+            script: script.map(str::to_string),
             args: vec![],
             env: BTreeMap::new(),
             current_dir: None,
-            key: None,
-            script: script.map(|s| s.to_string()),
+            props: None,
         }
     }
 
@@ -645,7 +624,6 @@ mod tests {
         }
     }
 
-    // helper: create a channel, send items, drop the sender, return receiver
     fn make_rx(items: Vec<StreamItem>) -> mpsc::Receiver<StreamItem> {
         let (tx, rx) = mpsc::channel();
         for item in items {
@@ -663,9 +641,7 @@ mod tests {
 
     #[test]
     fn new_key_returns_true_and_inserts_value() {
-        let rx = make_rx(vec![
-            make_item("bin", None, "hello"),
-        ]);
+        let rx = make_rx(vec![make_item("bin", None, "hello")]);
         let mut values: HashMap<(String, Option<String>), String> = HashMap::new();
         assert!(drain_stream_updates(&rx, &mut values));
         assert_eq!(values.get(&("bin".to_string(), None)).map(|s| s.as_str()), Some("hello"));
@@ -675,13 +651,9 @@ mod tests {
     fn same_value_on_second_drain_returns_false() {
         let (tx, rx) = mpsc::channel::<StreamItem>();
         let mut values: HashMap<(String, Option<String>), String> = HashMap::new();
-
         tx.send(make_item("bin", None, "v1")).unwrap();
-        // first drain: value is new → true
         assert!(drain_stream_updates(&rx, &mut values));
-
         tx.send(make_item("bin", None, "v1")).unwrap();
-        // second drain: same value → false
         assert!(!drain_stream_updates(&rx, &mut values));
     }
 
@@ -689,10 +661,8 @@ mod tests {
     fn changed_value_returns_true() {
         let (tx, rx) = mpsc::channel::<StreamItem>();
         let mut values: HashMap<(String, Option<String>), String> = HashMap::new();
-
         tx.send(make_item("bin", Some("script"), "v1")).unwrap();
         drain_stream_updates(&rx, &mut values);
-
         tx.send(make_item("bin", Some("script"), "v2")).unwrap();
         assert!(drain_stream_updates(&rx, &mut values));
     }
@@ -701,52 +671,55 @@ mod tests {
     fn multiple_keys_one_changes_returns_true() {
         let (tx, rx) = mpsc::channel::<StreamItem>();
         let mut values: HashMap<(String, Option<String>), String> = HashMap::new();
-
-        // seed two keys
         tx.send(make_item("bin_a", None, "stable")).unwrap();
         tx.send(make_item("bin_b", None, "old")).unwrap();
         drain_stream_updates(&rx, &mut values);
-
-        // only bin_b changes
         tx.send(make_item("bin_a", None, "stable")).unwrap();
         tx.send(make_item("bin_b", None, "new")).unwrap();
         assert!(drain_stream_updates(&rx, &mut values));
     }
 
-    /// `stream_calls_to_specs` maps JSX stream call tuples to `CommandSpec` values.
-    ///
-    /// Each `(bin, script)` pair produces a `CommandSpec` where `bin` and `script`
-    /// are forwarded verbatim, and `args`, `env`, `current_dir`, and `key` are at
-    /// their zero/empty defaults.
     #[test]
     fn stream_calls_to_specs_maps_calls_to_command_specs() {
-        let calls: Vec<(String, Option<String>)> = vec![
-            ("my-bin".to_string(), None),
-            ("other-bin".to_string(), Some("echo hello".to_string())),
+        let calls = vec![
+            ("bash".to_string(), None),
+            ("python".to_string(), Some("print('hi')".to_string())),
         ];
-
         let specs = stream_calls_to_specs(&calls);
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0].identity.bin, "bash");
+        assert_eq!(specs[0].script, None);
+        assert_eq!(specs[0].args, Vec::<String>::new());
+        assert_eq!(specs[1].identity.bin, "python");
+        assert_eq!(specs[1].script, Some("print('hi')".to_string()));
+    }
 
+    /// module_calls_to_specs converts (bin, props) pairs into CommandSpecs routed
+    /// through DataLoop — not BiStreamRegistry.  Each spec must have:
+    ///   - identity.bin == the supplied bin string
+    ///   - props == Some(the supplied serde_json::Value)
+    ///   - script == None  (modules are long-running processes, not scripts)
+    #[test]
+    fn module_calls_to_specs_sets_props_on_each_spec() {
+        let calls = vec![
+            (
+                "/usr/bin/clock-module".to_string(),
+                serde_json::json!({"interval": 1000}),
+            ),
+            (
+                "/usr/bin/workspace-module".to_string(),
+                serde_json::json!({"output": "DP-1"}),
+            ),
+        ];
+        let specs = module_calls_to_specs(&calls);
         assert_eq!(specs.len(), 2);
 
-        // First entry: no script
-        assert_eq!(specs[0], CommandSpec {
-            bin: "my-bin".to_string(),
-            script: None,
-            args: vec![],
-            env: BTreeMap::new(),
-            current_dir: None,
-            key: None,
-        });
+        assert_eq!(specs[0].identity.bin, "/usr/bin/clock-module");
+        assert_eq!(specs[0].props, Some(serde_json::json!({"interval": 1000})));
+        assert_eq!(specs[0].script, None);
 
-        // Second entry: script is preserved
-        assert_eq!(specs[1], CommandSpec {
-            bin: "other-bin".to_string(),
-            script: Some("echo hello".to_string()),
-            args: vec![],
-            env: BTreeMap::new(),
-            current_dir: None,
-            key: None,
-        });
+        assert_eq!(specs[1].identity.bin, "/usr/bin/workspace-module");
+        assert_eq!(specs[1].props, Some(serde_json::json!({"output": "DP-1"})));
+        assert_eq!(specs[1].script, None);
     }
 }

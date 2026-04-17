@@ -1,7 +1,6 @@
 use takumi::layout::node::Node;
 
 /// A stream key identifying a subprocess by its binary and optional script.
-pub type StreamKey = (String, Option<String>);
 
 /// Which screen edge a panel is anchored to. Drives both window placement and EWMH strut
 /// reservation. Panels without an anchor are free-floating (no strut).
@@ -121,15 +120,4 @@ pub fn reconcile_panels<'a>(
     let to_update = new_specs.iter().filter(|p| existing_set.contains(p.id.as_str())).collect();
     let to_destroy = existing_ids.iter().filter(|id| !new_ids.contains(*id)).map(|s| s.to_string()).collect();
     (to_create, to_update, to_destroy)
-}
-
-pub fn reconcile_streams(
-    old: &[StreamKey],
-    new: &[StreamKey],
-) -> (Vec<StreamKey>, Vec<StreamKey>) {
-    let old_set: std::collections::HashSet<_> = old.iter().collect();
-    let new_set: std::collections::HashSet<_> = new.iter().collect();
-    let to_spawn = new.iter().filter(|x| !old_set.contains(x)).cloned().collect();
-    let to_kill = old.iter().filter(|x| !new_set.contains(x)).cloned().collect();
-    (to_spawn, to_kill)
 }

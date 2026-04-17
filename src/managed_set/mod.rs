@@ -60,6 +60,10 @@ impl<T: Lifecycle> ManagedSet<T> {
     pub fn get(&self, key: &T::Key) -> Option<&T::State> {
         self.store.get(key)
     }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&T::Key, &T::State)> {
+        self.store.iter()
+    }
 }
 
 #[cfg(test)]
