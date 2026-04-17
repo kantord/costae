@@ -1,5 +1,5 @@
 use std::num::NonZeroUsize;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use lru::LruCache;
 use takumi::{
@@ -8,6 +8,24 @@ use takumi::{
     rendering::{RenderOptions, render},
     resources::{font::FontResource, image::ImageSource},
 };
+
+static GLOBAL_CTX: OnceLock<Mutex<GlobalContext>> = OnceLock::new();
+
+/// Initialize the global rendering context. Must be called once at startup.
+/// Loads fonts into the context before storing it.
+pub fn init_global_ctx() {
+    let mut ctx = GlobalContext::default();
+    load_fonts_impl(&mut ctx);
+    GLOBAL_CTX.set(Mutex::new(ctx)).ok();
+}
+
+pub fn with_global_ctx<F, R>(f: F) -> R
+where
+    F: FnOnce(&GlobalContext) -> R,
+{
+    let g = GLOBAL_CTX.get().expect("GlobalContext not initialized").lock().unwrap();
+    f(&*g)
+}
 
 /// LRU cache of rendered frames keyed on the canonical JSON of `module_values`.
 ///
@@ -51,22 +69,24 @@ impl RenderCache {
 /// `dpr = dpi / 96.0` scales CSS `px` units so that `1px` in the config equals
 /// one logical pixel regardless of display density, matching i3's own scaling.
 /// The returned buffer is always `width × height × 4` bytes (BGRX).
-pub fn render_frame(layout: Option<Node>, global: &GlobalContext, width: u32, height: u32, dpr: f32) -> Vec<u8> {
-    let node = layout.unwrap_or_else(|| Node::container(vec![]));
-    let options = RenderOptions::builder()
-        .global(global)
-        .viewport(Viewport::new((Some(width), Some(height))).with_device_pixel_ratio(dpr))
-        .node(node)
-        .build();
-    let rgba = render(options).expect("render").into_raw();
-    let mut bgrx = Vec::with_capacity(rgba.len());
-    for px in rgba.chunks_exact(4) {
-        bgrx.extend_from_slice(&[px[2], px[1], px[0], 0x00]);
-    }
-    bgrx
+pub fn render_frame(layout: Option<Node>, width: u32, height: u32, dpr: f32) -> Vec<u8> {
+    with_global_ctx(|global| {
+        let node = layout.unwrap_or_else(|| Node::container(vec![]));
+        let options = RenderOptions::builder()
+            .global(global)
+            .viewport(Viewport::new((Some(width), Some(height))).with_device_pixel_ratio(dpr))
+            .node(node)
+            .build();
+        let rgba = render(options).expect("render").into_raw();
+        let mut bgrx = Vec::with_capacity(rgba.len());
+        for px in rgba.chunks_exact(4) {
+            bgrx.extend_from_slice(&[px[2], px[1], px[0], 0x00]);
+        }
+        bgrx
+    })
 }
 
-pub fn load_fonts(global: &mut GlobalContext) {
+fn load_fonts_impl(global: &mut GlobalContext) {
     let home = std::env::var("HOME").unwrap_or_default();
     let local_fonts = format!("{home}/.local/share/fonts");
     let dot_fonts = format!("{home}/.fonts");
@@ -227,7 +247,11 @@ mod tests {
     }
 }
 
-pub fn preload_layout_images(layout: &serde_json::Value, global: &GlobalContext) {
+pub fn preload_layout_images(layout: &serde_json::Value) {
+    with_global_ctx(|global| preload_layout_images_impl(layout, global));
+}
+
+fn preload_layout_images_impl(layout: &serde_json::Value, global: &GlobalContext) {
     fn walk(value: &serde_json::Value, srcs: &mut Vec<String>) {
         match value {
             serde_json::Value::Object(map) => {

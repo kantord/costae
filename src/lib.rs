@@ -15,16 +15,21 @@ pub use layout::{
     PanelSpec,
     parse_layout,
     parse_root_node,
-    reconcile_panels,
-    reconcile_streams,
 };
+
+// managed_set
+pub use managed_set::ManagedSet;
+
+// x11 panel context
+pub use x11::panel::PanelContext;
 
 // render
 pub use render::{
     RenderCache,
     render_frame,
-    load_fonts,
+    init_global_ctx,
     preload_layout_images,
+    with_global_ctx,
 };
 
 // modules
@@ -37,7 +42,6 @@ pub use x11::{
     solid_color_rgba,
     strut_partial_values_for_anchor,
 };
-
 // data spawn functions
 pub use data::{
     spawn_module,
@@ -173,32 +177,4 @@ mod tests {
         assert_eq!(v[9], 1919); // top_end_x
     }
 
-    #[test]
-    fn reconcile_panels_partitions_specs_into_create_update_destroy() {
-        fn spec(id: &str) -> PanelSpec {
-            PanelSpec { id: id.to_string(), anchor: None, width: 100, height: 100, x: 0, y: 0, outer_gap: 0, output: None, above: false, content: serde_json::Value::Null }
-        }
-        let new_specs = vec![spec("sidebar"), spec("topbar")];
-        let (to_create, to_update, to_destroy) = reconcile_panels(&["sidebar", "bottombar"], &new_specs);
-        assert_eq!(to_create.len(), 1);
-        assert_eq!(to_create[0].id, "topbar");
-        assert_eq!(to_update.len(), 1);
-        assert_eq!(to_update[0].id, "sidebar");
-        assert_eq!(to_destroy, vec!["bottombar".to_string()]);
-    }
-
-    #[test]
-    fn reconcile_streams_returns_additions_and_removals() {
-        let old = vec![
-            ("bash".to_string(), Some("script_a".to_string())),
-            ("bash".to_string(), Some("script_b".to_string())),
-        ];
-        let new_calls = vec![
-            ("bash".to_string(), Some("script_b".to_string())),
-            ("bash".to_string(), Some("script_c".to_string())),
-        ];
-        let (to_spawn, to_kill) = reconcile_streams(&old, &new_calls);
-        assert_eq!(to_spawn, vec![("bash".to_string(), Some("script_c".to_string()))]);
-        assert_eq!(to_kill, vec![("bash".to_string(), Some("script_a".to_string()))]);
-    }
 }

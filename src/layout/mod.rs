@@ -1,7 +1,6 @@
 use takumi::layout::node::Node;
 
 /// A stream key identifying a subprocess by its binary and optional script.
-pub type StreamKey = (String, Option<String>);
 
 /// Which screen edge a panel is anchored to. Drives both window placement and EWMH strut
 /// reservation. Panels without an anchor are free-floating (no strut).
@@ -105,31 +104,3 @@ pub fn parse_root_node(root: &serde_json::Value) -> Result<Vec<PanelSpec>, Strin
     }).collect()
 }
 
-/// Partition new panel specs against currently-live panel ids.
-///
-/// Returns `(to_create, to_update, to_destroy)` where:
-/// - `to_create`: specs whose id is not in `existing_ids` — a new X11 window must be created
-/// - `to_update`: specs whose id IS in `existing_ids` — re-render in the existing window
-/// - `to_destroy`: existing ids not present in `new_specs` — the X11 window must be destroyed
-pub fn reconcile_panels<'a>(
-    existing_ids: &[&str],
-    new_specs: &'a [PanelSpec],
-) -> (Vec<&'a PanelSpec>, Vec<&'a PanelSpec>, Vec<String>) {
-    let new_ids: std::collections::HashSet<&str> = new_specs.iter().map(|p| p.id.as_str()).collect();
-    let existing_set: std::collections::HashSet<&str> = existing_ids.iter().copied().collect();
-    let to_create = new_specs.iter().filter(|p| !existing_set.contains(p.id.as_str())).collect();
-    let to_update = new_specs.iter().filter(|p| existing_set.contains(p.id.as_str())).collect();
-    let to_destroy = existing_ids.iter().filter(|id| !new_ids.contains(*id)).map(|s| s.to_string()).collect();
-    (to_create, to_update, to_destroy)
-}
-
-pub fn reconcile_streams(
-    old: &[StreamKey],
-    new: &[StreamKey],
-) -> (Vec<StreamKey>, Vec<StreamKey>) {
-    let old_set: std::collections::HashSet<_> = old.iter().collect();
-    let new_set: std::collections::HashSet<_> = new.iter().collect();
-    let to_spawn = new.iter().filter(|x| !old_set.contains(x)).cloned().collect();
-    let to_kill = old.iter().filter(|x| !new_set.contains(x)).cloned().collect();
-    (to_spawn, to_kill)
-}

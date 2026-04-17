@@ -12,8 +12,8 @@ fn spawn_string_stream_delivers_line_as_triple() {
     let _child = spawn_string_stream("sh", Some("echo hello"), tx, wake_tx);
 
     let item = rx.recv_timeout(Duration::from_secs(2)).unwrap();
-    assert_eq!(item.source.bin, "sh");
-    assert_eq!(item.source.script, Some("echo hello".to_string()));
+    assert_eq!(item.key.0, "sh");
+    assert_eq!(item.key.1, Some("echo hello".to_string()));
     assert_eq!(item.line, "hello");
 
     // wake_tx must have been signalled after the line was sent
@@ -46,7 +46,7 @@ fn spawn_bi_stream_script_field_is_none() {
     // `echo` with no arguments prints a blank line immediately and exits
     let _bi = spawn_bi_stream("echo", &serde_json::json!(null), tx, wake_tx);
     let item = rx.recv_timeout(Duration::from_secs(2)).unwrap();
-    assert_eq!(item.source.bin, "echo");
-    assert_eq!(item.source.script, None, "spawn_bi_stream must forward script=None, not Some(...)");
+    assert_eq!(item.key.0, "echo");
+    assert_eq!(item.key.1, None, "spawn_bi_stream must forward script=None, not Some(...)");
     assert_eq!(item.line, "");
 }

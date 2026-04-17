@@ -1,14 +1,11 @@
 use std::collections::HashMap;
 use std::hash::Hash;
 
-pub trait HasKey {
+pub trait Lifecycle {
     type Key: Hash + Eq + Clone;
-    fn key(&self) -> Self::Key;
-}
-
-pub trait Lifecycle: HasKey {
     type State;
     type Context;
+    fn key(&self) -> Self::Key;
     /// Returns `None` if initialization fails; the item is not added to the store.
     fn enter(self, ctx: &Self::Context) -> Option<Self::State>;
     fn update(self, state: &mut Self::State, ctx: &Self::Context);
@@ -17,18 +14,16 @@ pub trait Lifecycle: HasKey {
 
 pub struct ManagedSet<T: Lifecycle> {
     store: HashMap<T::Key, T::State>,
-    ctx: T::Context,
 }
 
 impl<T: Lifecycle> ManagedSet<T> {
-    pub fn new(ctx: T::Context) -> Self {
+    pub fn new() -> Self {
         Self {
             store: HashMap::new(),
-            ctx,
         }
     }
 
-    pub fn update(&mut self, new_items: Vec<T>) {
+    pub fn update(&mut self, new_items: Vec<T>, ctx: &T::Context) {
         // Build new_map, deduplicating by key
         let mut new_map: HashMap<T::Key, T> = HashMap::new();
         for item in new_items {
@@ -44,14 +39,14 @@ impl<T: Lifecycle> ManagedSet<T> {
             .collect();
         for key in exit_keys {
             let state = self.store.remove(&key).unwrap();
-            T::exit(state, &self.ctx);
+            T::exit(state, ctx);
         }
 
         // Enter or update
         for (key, item) in new_map {
             if let Some(state) = self.store.get_mut(&key) {
-                item.update(state, &self.ctx);
-            } else if let Some(state) = item.enter(&self.ctx) {
+                item.update(state, ctx);
+            } else if let Some(state) = item.enter(ctx) {
                 self.store.insert(key, state);
             }
         }
@@ -59,6 +54,18 @@ impl<T: Lifecycle> ManagedSet<T> {
 
     pub fn get(&self, key: &T::Key) -> Option<&T::State> {
         self.store.get(key)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&T::Key, &T::State)> {
+        self.store.iter()
+    }
+
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = (&T::Key, &mut T::State)> {
+        self.store.iter_mut()
+    }
+
+    pub fn get_mut(&mut self, key: &T::Key) -> Option<&mut T::State> {
+        self.store.get_mut(key)
     }
 }
 
@@ -73,16 +80,14 @@ mod tests {
         value: i32,
     }
 
-    impl HasKey for TestSpec {
+    impl Lifecycle for TestSpec {
         type Key = String;
+        type State = i32;
+        type Context = Arc<Mutex<Vec<String>>>;
+
         fn key(&self) -> String {
             self.id.clone()
         }
-    }
-
-    impl Lifecycle for TestSpec {
-        type State = i32;
-        type Context = Arc<Mutex<Vec<String>>>;
 
         fn enter(self, ctx: &Self::Context) -> Option<Self::State> {
             ctx.lock().unwrap().push(format!("enter:{}", self.id));
@@ -111,8 +116,8 @@ mod tests {
     #[test]
     fn new_item_calls_enter_and_stores_state() {
         let ctx = make_ctx();
-        let mut ms: ManagedSet<TestSpec> = ManagedSet::new(ctx.clone());
-        ms.update(vec![TestSpec { id: "a".to_string(), value: 42 }]);
+        let mut ms: ManagedSet<TestSpec> = ManagedSet::new();
+        ms.update(vec![TestSpec { id: "a".to_string(), value: 42 }], &ctx);
         assert!(calls(&ctx).contains(&"enter:a".to_string()));
         assert_eq!(ms.get(&"a".to_string()), Some(&42));
     }
@@ -121,9 +126,9 @@ mod tests {
     #[test]
     fn removed_item_calls_exit_with_old_state() {
         let ctx = make_ctx();
-        let mut ms: ManagedSet<TestSpec> = ManagedSet::new(ctx.clone());
-        ms.update(vec![TestSpec { id: "a".to_string(), value: 99 }]);
-        ms.update(vec![]);
+        let mut ms: ManagedSet<TestSpec> = ManagedSet::new();
+        ms.update(vec![TestSpec { id: "a".to_string(), value: 99 }], &ctx);
+        ms.update(vec![], &ctx);
         assert!(calls(&ctx).contains(&"exit:99".to_string()));
     }
 
@@ -131,9 +136,9 @@ mod tests {
     #[test]
     fn existing_item_calls_update_not_enter() {
         let ctx = make_ctx();
-        let mut ms: ManagedSet<TestSpec> = ManagedSet::new(ctx.clone());
-        ms.update(vec![TestSpec { id: "a".to_string(), value: 1 }]);
-        ms.update(vec![TestSpec { id: "a".to_string(), value: 2 }]);
+        let mut ms: ManagedSet<TestSpec> = ManagedSet::new();
+        ms.update(vec![TestSpec { id: "a".to_string(), value: 1 }], &ctx);
+        ms.update(vec![TestSpec { id: "a".to_string(), value: 2 }], &ctx);
         let log = calls(&ctx);
         // Only one enter call total
         assert_eq!(log.iter().filter(|c| *c == "enter:a").count(), 1);
@@ -145,11 +150,11 @@ mod tests {
     #[test]
     fn duplicate_keys_in_batch_only_one_enter() {
         let ctx = make_ctx();
-        let mut ms: ManagedSet<TestSpec> = ManagedSet::new(ctx.clone());
+        let mut ms: ManagedSet<TestSpec> = ManagedSet::new();
         ms.update(vec![
             TestSpec { id: "a".to_string(), value: 1 },
             TestSpec { id: "a".to_string(), value: 2 },
-        ]);
+        ], &ctx);
         let log = calls(&ctx);
         assert_eq!(log.iter().filter(|c| *c == "enter:a").count(), 1);
     }
@@ -158,8 +163,8 @@ mod tests {
     #[test]
     fn get_returns_state_after_enter() {
         let ctx = make_ctx();
-        let mut ms: ManagedSet<TestSpec> = ManagedSet::new(ctx.clone());
-        ms.update(vec![TestSpec { id: "b".to_string(), value: 7 }]);
+        let mut ms: ManagedSet<TestSpec> = ManagedSet::new();
+        ms.update(vec![TestSpec { id: "b".to_string(), value: 7 }], &ctx);
         assert_eq!(ms.get(&"b".to_string()), Some(&7));
     }
 
@@ -167,9 +172,35 @@ mod tests {
     #[test]
     fn get_returns_updated_state_after_update() {
         let ctx = make_ctx();
-        let mut ms: ManagedSet<TestSpec> = ManagedSet::new(ctx.clone());
-        ms.update(vec![TestSpec { id: "c".to_string(), value: 10 }]);
-        ms.update(vec![TestSpec { id: "c".to_string(), value: 20 }]);
+        let mut ms: ManagedSet<TestSpec> = ManagedSet::new();
+        ms.update(vec![TestSpec { id: "c".to_string(), value: 10 }], &ctx);
+        ms.update(vec![TestSpec { id: "c".to_string(), value: 20 }], &ctx);
         assert_eq!(ms.get(&"c".to_string()), Some(&20));
+    }
+
+    // Test 7 (Claim A): iter_mut yields (&Key, &mut State) pairs; mutations are
+    // visible through subsequent get calls.
+    #[test]
+    fn iter_mut_yields_mutable_state_visible_via_get() {
+        let ctx = make_ctx();
+        let mut ms: ManagedSet<TestSpec> = ManagedSet::new();
+        ms.update(vec![TestSpec { id: "d".to_string(), value: 5 }], &ctx);
+        for (_k, v) in ms.iter_mut() {
+            *v = 99;
+        }
+        assert_eq!(ms.get(&"d".to_string()), Some(&99));
+    }
+
+    // Test 8 (Claim B): get_mut returns a mutable reference; a mutation through it
+    // is visible via the subsequent get call.
+    #[test]
+    fn get_mut_returns_mutable_reference_visible_via_get() {
+        let ctx = make_ctx();
+        let mut ms: ManagedSet<TestSpec> = ManagedSet::new();
+        ms.update(vec![TestSpec { id: "e".to_string(), value: 3 }], &ctx);
+        if let Some(v) = ms.get_mut(&"e".to_string()) {
+            *v = 77;
+        }
+        assert_eq!(ms.get(&"e".to_string()), Some(&77));
     }
 }

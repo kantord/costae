@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, mpsc};
 
-use takumi::GlobalContext;
 use takumi::layout::Viewport;
 use takumi::rendering::{RenderOptions, measure_layout};
 use x11rb::{
@@ -12,7 +11,8 @@ use x11rb::{
 };
 
 use crate::layout::{PanelSpec, PanelAnchor};
-use crate::render::{RenderCache, render_frame};
+use crate::managed_set::Lifecycle;
+use crate::render::{RenderCache, render_frame, preload_layout_images, init_global_ctx};
 use crate::modules::hit_test;
 use crate::layout::parse_layout;
 use crate::x11::{x11_bgrx_to_rgba, inject_root_bg, solid_color_rgba, strut_partial_values_for_anchor};
@@ -32,24 +32,6 @@ pub struct Panel {
     pub raw_layout: Option<serde_json::Value>,
     pub render_cache: RenderCache,
     pub bgrx: Arc<Vec<u8>>,
-}
-
-pub struct X11Context<'a> {
-    pub conn: &'a RustConnection,
-    pub screen: &'a Screen,
-    pub depth: u8,
-    pub global: &'a GlobalContext,
-    pub dpr: f32,
-    /// Primary monitor coordinates (fallback when panel has no output= prop).
-    pub mon_x: i16,
-    pub mon_y: i16,
-    pub mon_width: u32,
-    pub mon_height: u32,
-    pub xrootpmap_atom: Option<u32>,
-    pub strut_atom: u32,
-    pub strut_legacy_atom: u32,
-    /// All connected outputs: name → (x, y, phys_width, phys_height).
-    pub output_map: &'a HashMap<String, (i16, i16, u32, u32)>,
 }
 
 pub fn sample_root_bg(
@@ -146,7 +128,10 @@ fn dispatch_click(
         if let Some(tx) = module_event_txs.get(channel) {
             let mut payload = on_click.clone();
             if let Some(obj) = payload.as_object_mut() { obj.remove("__channel__"); }
-            let _ = tx.send(serde_json::json!({"event": "click", "data": payload}));
+            let result = tx.send(serde_json::json!({"event": "click", "data": payload}));
+            tracing::debug!(channel, ok = result.is_ok(), "click dispatched via __channel__");
+        } else {
+            tracing::debug!(channel, known_channels = ?module_event_txs.keys().collect::<Vec<_>>(), "click __channel__ not found");
         }
         return;
     }
@@ -154,11 +139,15 @@ fn dispatch_click(
     loop {
         if let Some(tx) = module_event_txs.get(&path) {
             let _ = tx.send(serde_json::json!({"event": "click", "data": on_click}));
+            tracing::debug!(path, "click dispatched via path");
             return;
         }
         match path.rfind('/') {
             Some(pos) => path.truncate(pos),
-            None => return,
+            None => {
+                tracing::debug!(hit_path, "click: no channel matched");
+                return;
+            }
         }
     }
 }
@@ -167,13 +156,13 @@ fn dispatch_click(
 pub fn do_hit_test(
     raw_layout: &Option<serde_json::Value>,
     module_event_txs: &HashMap<String, mpsc::Sender<serde_json::Value>>,
-    global: &GlobalContext,
     phys_width: u32,
     phys_height: u32,
     dpr: f32,
     click_x: f32,
     click_y: f32,
 ) {
+    use crate::render::with_global_ctx;
     let layout_json = match raw_layout {
         Some(l) => l,
         None => return,
@@ -187,92 +176,95 @@ pub fn do_hit_test(
         None => return,
     };
 
-    let options = RenderOptions::builder()
-        .global(global)
-        .viewport(Viewport::new((Some(phys_width), Some(phys_height))).with_device_pixel_ratio(dpr))
-        .node(node)
-        .build();
-    let measured = match measure_layout(options) {
-        Ok(m) => m,
-        Err(_) => return,
+    let measured = with_global_ctx(|global| {
+        let options = RenderOptions::builder()
+            .global(global)
+            .viewport(Viewport::new((Some(phys_width), Some(phys_height))).with_device_pixel_ratio(dpr))
+            .node(node)
+            .build();
+        measure_layout(options).ok()
+    });
+    let measured = match measured {
+        Some(m) => m,
+        None => return,
     };
 
+    tracing::debug!(click_x, click_y, phys_width, phys_height, "hit test");
     let (hit_path, on_click) = match hit_test(&measured, layout_json, click_x, click_y) {
         Some(r) => r,
-        None => return,
+        None => {
+            tracing::debug!(click_x, click_y, "hit test: no clickable node found");
+            return;
+        }
     };
 
     dispatch_click(module_event_txs, &hit_path, &on_click);
 }
 
-pub fn create_panel(
+fn create_panel(
     spec: &PanelSpec,
-    x11: &X11Context,
+    ctx: &PanelContext,
 ) -> Result<Panel, Box<dyn std::error::Error>> {
-    let phys_width = (spec.width as f32 * x11.dpr).round() as u32;
-    let phys_height = (spec.height as f32 * x11.dpr).round() as u32;
+    let phys_width = (spec.width as f32 * ctx.dpr).round() as u32;
+    let phys_height = (spec.height as f32 * ctx.dpr).round() as u32;
 
-    // Resolve which monitor this panel lives on. When spec.output names a known RandR
-    // output, use its coordinates; otherwise fall back to the primary monitor.
     let (mon_x, mon_y, mon_width, mon_height) = spec.output.as_ref()
-        .and_then(|name| x11.output_map.get(name).copied())
-        .unwrap_or((x11.mon_x, x11.mon_y, x11.mon_width, x11.mon_height));
+        .and_then(|name| ctx.output_map.get(name).copied())
+        .unwrap_or((ctx.mon_x, ctx.mon_y, ctx.mon_width, ctx.mon_height));
 
-    // outer_gap is informational (passed to modules so they can tell i3 about tiling gaps),
-    // not a window position offset. Anchored windows sit flush at the monitor edge.
     let (win_x, win_y) = match &spec.anchor {
         Some(PanelAnchor::Left)  => (mon_x, mon_y),
         Some(PanelAnchor::Right) => (mon_x + mon_width as i16 - phys_width as i16, mon_y),
         Some(PanelAnchor::Top)   => (mon_x, mon_y),
         Some(PanelAnchor::Bottom)=> (mon_x, mon_y + mon_height as i16 - phys_height as i16),
         None => (
-            mon_x + (spec.x as f32 * x11.dpr).round() as i16,
-            mon_y + (spec.y as f32 * x11.dpr).round() as i16,
+            mon_x + (spec.x as f32 * ctx.dpr).round() as i16,
+            mon_y + (spec.y as f32 * ctx.dpr).round() as i16,
         ),
     };
 
-    let win_id = x11.conn.generate_id()?;
-    x11.conn.create_window(
+    let win_id = ctx.conn.generate_id()?;
+    ctx.conn.create_window(
         x11rb::COPY_DEPTH_FROM_PARENT,
         win_id,
-        x11.screen.root,
+        ctx.root,
         win_x,
         win_y,
         phys_width as u16,
         phys_height as u16,
         0,
         WindowClass::INPUT_OUTPUT,
-        x11.screen.root_visual,
+        ctx.root_visual,
         &CreateWindowAux::new()
-            .background_pixel(x11.screen.black_pixel)
+            .background_pixel(ctx.black_pixel)
             .override_redirect(1)
             .event_mask(EventMask::EXPOSURE | EventMask::BUTTON_PRESS),
     )?;
 
-    let root_bg_rgba = sample_root_bg(x11.conn, x11.screen.root, win_x, win_y, phys_width, phys_height, x11.xrootpmap_atom)
+    let root_bg_rgba = sample_root_bg(&ctx.conn, ctx.root, win_x, win_y, phys_width, phys_height, ctx.xrootpmap_atom)
         .unwrap_or_default();
-    inject_root_bg(x11.global, root_bg_rgba.clone(), phys_width, phys_height);
+    inject_root_bg(root_bg_rgba.clone(), phys_width, phys_height);
 
-    x11.conn.map_window(win_id)?;
+    ctx.conn.map_window(win_id)?;
     let stack_mode = if spec.above { StackMode::ABOVE } else { StackMode::BELOW };
-    x11.conn.configure_window(win_id, &ConfigureWindowAux::new().stack_mode(stack_mode))?;
+    ctx.conn.configure_window(win_id, &ConfigureWindowAux::new().stack_mode(stack_mode))?;
 
     if let Some(anchor) = spec.anchor.clone() {
         let strut_vals = strut_partial_values_for_anchor(
             anchor, mon_x, mon_y, mon_width, mon_height, phys_width, phys_height,
         );
-        x11.conn.change_property32(PropMode::REPLACE, win_id, x11.strut_atom, AtomEnum::CARDINAL, &strut_vals)?;
-        x11.conn.change_property32(PropMode::REPLACE, win_id, x11.strut_legacy_atom, AtomEnum::CARDINAL, &strut_vals[..4])?;
+        ctx.conn.change_property32(PropMode::REPLACE, win_id, ctx.strut_atom, AtomEnum::CARDINAL, &strut_vals)?;
+        ctx.conn.change_property32(PropMode::REPLACE, win_id, ctx.strut_legacy_atom, AtomEnum::CARDINAL, &strut_vals[..4])?;
     }
 
-    let gc = x11.conn.generate_id()?;
-    x11.conn.create_gc(gc, win_id, &CreateGCAux::new())?;
+    let gc = ctx.conn.generate_id()?;
+    ctx.conn.create_gc(gc, win_id, &CreateGCAux::new())?;
 
-    x11.conn.flush()?;
+    ctx.conn.flush()?;
 
-    let bgrx = Arc::new(render_frame(None, x11.global, phys_width, phys_height, x11.dpr));
-    x11.conn.put_image(ImageFormat::Z_PIXMAP, win_id, gc, phys_width as u16, phys_height as u16, 0, 0, 0, x11.depth, &bgrx[..])?;
-    x11.conn.flush()?;
+    let bgrx = Arc::new(render_frame(None, phys_width, phys_height, ctx.dpr));
+    ctx.conn.put_image(ImageFormat::Z_PIXMAP, win_id, gc, phys_width as u16, phys_height as u16, 0, 0, 0, ctx.depth, &bgrx[..])?;
+    ctx.conn.flush()?;
 
     Ok(Panel {
         id: spec.id.clone(),
@@ -289,16 +281,274 @@ pub fn create_panel(
     })
 }
 
-pub fn destroy_panel(panel: Panel, conn: &RustConnection) {
-    let _ = conn.free_gc(panel.gc);
-    let _ = conn.destroy_window(panel.win_id);
+// ---------------------------------------------------------------------------
+// PanelContext: owned, Arc-wrapped X11 context for use with ManagedSet/Lifecycle.
+// ---------------------------------------------------------------------------
+pub struct PanelContext {
+    pub conn: Arc<RustConnection>,
+    pub root: u32,
+    pub depth: u8,
+    pub root_visual: u32,
+    pub black_pixel: u32,
+    pub dpr: f32,
+    pub mon_x: i16,
+    pub mon_y: i16,
+    pub mon_width: u32,
+    pub mon_height: u32,
+    pub xrootpmap_atom: Option<u32>,
+    pub strut_atom: u32,
+    pub strut_legacy_atom: u32,
+    pub output_map: Arc<HashMap<String, (i16, i16, u32, u32)>>,
+}
+
+impl Lifecycle for PanelSpec {
+    type Key = String;
+    type State = Panel;
+    type Context = PanelContext;
+
+    fn key(&self) -> String {
+        self.id.clone()
+    }
+
+    fn enter(self, ctx: &Self::Context) -> Option<Self::State> {
+        init_global_ctx();
+        match create_panel(&self, ctx) {
+            Ok(mut panel) => {
+                tracing::info!(panel = %self.id, "panel created");
+                if !self.content.is_null() {
+                    preload_layout_images(&self.content);
+                    panel.raw_layout = Some(self.content);
+                }
+                Some(panel)
+            }
+            Err(e) => {
+                tracing::error!(panel = %self.id, error = %e, "panel create failed");
+                None
+            }
+        }
+    }
+
+    fn update(self, state: &mut Self::State, _ctx: &Self::Context) {
+        if !self.content.is_null() {
+            preload_layout_images(&self.content);
+            state.raw_layout = Some(self.content);
+            state.render_cache = RenderCache::new(30);
+        }
+    }
+
+    fn exit(state: Self::State, ctx: &Self::Context) {
+        tracing::info!(panel = %state.id, "panel destroyed");
+        let _ = ctx.conn.free_gc(state.gc);
+        let _ = ctx.conn.destroy_window(state.win_id);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Claim A: PanelContext struct shape check (compile-time)
+// ---------------------------------------------------------------------------
+// This function is never called at runtime; it exists only to assert that
+// `PanelContext` has exactly the fields listed in the spec.  The test module
+// below will fail to compile until `PanelContext` is defined with all fields.
+#[cfg(test)]
+#[allow(dead_code)]
+fn _check_panel_context_fields(ctx: PanelContext) {
+    let _ = ctx.conn;
+    let _ = ctx.root;
+    let _ = ctx.depth;
+    let _ = ctx.root_visual;
+    let _ = ctx.black_pixel;
+    let _ = ctx.dpr;
+    let _ = ctx.mon_x;
+    let _ = ctx.mon_y;
+    let _ = ctx.mon_width;
+    let _ = ctx.mon_height;
+    let _ = ctx.xrootpmap_atom;
+    let _ = ctx.strut_atom;
+    let _ = ctx.strut_legacy_atom;
+    let _ = ctx.output_map;
 }
 
 #[cfg(test)]
 mod tests {
     use super::dispatch_click;
     use std::collections::HashMap;
-    use std::sync::mpsc;
+    use std::sync::{Arc, mpsc};
+
+    // ---------------------------------------------------------------------------
+    // X11 Lifecycle helpers (Claim A / B / C)
+    // ---------------------------------------------------------------------------
+
+    /// Build a minimal PanelContext by connecting to X11.
+    /// Returns `None` if no display is available.
+    fn make_panel_ctx() -> Option<super::PanelContext> {
+        use x11rb::rust_connection::RustConnection;
+        use x11rb::connection::Connection as _;
+        use x11rb::protocol::xproto::ConnectionExt as XprotoConnExt;
+
+        let (conn, screen_num) = RustConnection::connect(None).ok()?;
+        let screen = conn.setup().roots[screen_num].clone();
+        let depth = screen.root_depth;
+        let root_visual = screen.root_visual;
+        let black_pixel = screen.black_pixel;
+        let root = screen.root;
+
+        let strut_atom = XprotoConnExt::intern_atom(&conn, false, b"_NET_WM_STRUT_PARTIAL")
+            .ok()?.reply().ok()?.atom;
+        let strut_legacy_atom = XprotoConnExt::intern_atom(&conn, false, b"_NET_WM_STRUT")
+            .ok()?.reply().ok()?.atom;
+        let xrootpmap_atom = XprotoConnExt::intern_atom(&conn, false, b"_XROOTPMAP_ID").ok()
+            .and_then(|c: x11rb::cookie::Cookie<'_, _, x11rb::protocol::xproto::InternAtomReply>| c.reply().ok())
+            .map(|r| r.atom);
+
+        // Use screen pixel dimensions as monitor size.
+        let mon_width = screen.width_in_pixels as u32;
+        let mon_height = screen.height_in_pixels as u32;
+
+        Some(super::PanelContext {
+            conn: Arc::new(conn),
+            root,
+            depth,
+            root_visual,
+            black_pixel,
+            dpr: 1.0,
+            mon_x: 0,
+            mon_y: 0,
+            mon_width,
+            mon_height,
+            xrootpmap_atom,
+            strut_atom,
+            strut_legacy_atom,
+            output_map: Arc::new(HashMap::new()),
+        })
+    }
+
+    /// Build a minimal PanelSpec with the given id/dimensions.
+    fn make_spec(id: &str, width: u32, height: u32) -> crate::layout::PanelSpec {
+        crate::layout::PanelSpec {
+            id: id.to_string(),
+            anchor: None,
+            width,
+            height,
+            x: 0,
+            y: 0,
+            outer_gap: 0,
+            output: None,
+            above: false,
+            content: serde_json::Value::Null,
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // Claim A: enter creates an X11 window (phys_width > 0 and phys_height > 0).
+    // ---------------------------------------------------------------------------
+    #[test]
+    fn lifecycle_enter_creates_x11_window() {
+        use crate::managed_set::Lifecycle;
+
+        let ctx = match make_panel_ctx() {
+            Some(c) => c,
+            None => {
+                println!("SKIP: no X11 display available");
+                return;
+            }
+        };
+
+        let spec = make_spec("test-enter", 200, 30);
+        let panel = <crate::layout::PanelSpec as Lifecycle>::enter(spec, &ctx);
+
+        assert!(panel.is_some(), "enter should return Some(panel) when X11 is available");
+        let panel = panel.unwrap();
+        assert!(panel.phys_width > 0, "phys_width must be > 0");
+        assert!(panel.phys_height > 0, "phys_height must be > 0");
+
+        // Cleanup
+        <crate::layout::PanelSpec as Lifecycle>::exit(panel, &ctx);
+    }
+
+    // ---------------------------------------------------------------------------
+    // Claim B: exit destroys the X11 window (get_geometry returns an error).
+    // ---------------------------------------------------------------------------
+    #[test]
+    fn lifecycle_exit_destroys_x11_window() {
+        use crate::managed_set::Lifecycle;
+        use x11rb::connection::Connection as _;
+        use x11rb::protocol::xproto::ConnectionExt as XprotoExt;
+
+        let ctx = match make_panel_ctx() {
+            Some(c) => c,
+            None => {
+                println!("SKIP: no X11 display available");
+                return;
+            }
+        };
+
+        let spec = make_spec("test-exit", 200, 30);
+        let panel = <crate::layout::PanelSpec as Lifecycle>::enter(spec, &ctx)
+            .expect("enter must succeed for exit test");
+
+        let win_id = panel.win_id;
+
+        // Sanity: window should exist before exit.
+        ctx.conn.flush().ok();
+        let before = XprotoExt::get_geometry(&*ctx.conn, win_id)
+            .ok()
+            .and_then(|c| c.reply().ok());
+        assert!(before.is_some(), "window should exist before exit");
+
+        <crate::layout::PanelSpec as Lifecycle>::exit(panel, &ctx);
+        ctx.conn.flush().ok();
+
+        // After exit the window must no longer exist.
+        let after = XprotoExt::get_geometry(&*ctx.conn, win_id)
+            .ok()
+            .and_then(|c| c.reply().ok());
+        assert!(after.is_none(), "get_geometry should fail after exit (window destroyed)");
+    }
+
+    // ---------------------------------------------------------------------------
+    // Claim C: update sets raw_layout when content changes.
+    // ---------------------------------------------------------------------------
+    #[test]
+    fn lifecycle_update_sets_raw_layout_when_content_changes() {
+        use crate::managed_set::Lifecycle;
+
+        let ctx = match make_panel_ctx() {
+            Some(c) => c,
+            None => {
+                println!("SKIP: no X11 display available");
+                return;
+            }
+        };
+
+        let spec = make_spec("test-update", 200, 30);
+        let mut panel = <crate::layout::PanelSpec as Lifecycle>::enter(spec, &ctx)
+            .expect("enter must succeed for update test");
+
+        let new_content = serde_json::json!({"type": "text", "text": "hello"});
+        let new_spec = crate::layout::PanelSpec {
+            id: "test-update".to_string(),
+            anchor: None,
+            width: 200,
+            height: 30,
+            x: 0,
+            y: 0,
+            outer_gap: 0,
+            output: None,
+            above: false,
+            content: new_content.clone(),
+        };
+
+        <crate::layout::PanelSpec as Lifecycle>::update(new_spec, &mut panel, &ctx);
+
+        assert_eq!(
+            panel.raw_layout,
+            Some(new_content),
+            "raw_layout should be set to the new content after update"
+        );
+
+        // Cleanup
+        <crate::layout::PanelSpec as Lifecycle>::exit(panel, &ctx);
+    }
 
     /// Helper: build a map of one named channel and return the sender + receiver pair.
     fn make_txs(names: &[&str]) -> (HashMap<String, mpsc::Sender<serde_json::Value>>, Vec<mpsc::Receiver<serde_json::Value>>) {
@@ -377,5 +627,44 @@ mod tests {
         let on_click = serde_json::json!({"action": "click"});
         dispatch_click(&txs, "some/path/module", &on_click);
         assert!(rxs[0].try_recv().is_err(), "no message should be sent when no path matches");
+    }
+
+    // ---------------------------------------------------------------------------
+    // Claim A (compile-time): PanelContext has all required fields.
+    // The helper function `_check_panel_context_fields` above the module will
+    // cause a compile error until `PanelContext` is defined with every field.
+    // This test is a placeholder that passes once the struct compiles.
+    // ---------------------------------------------------------------------------
+    #[test]
+    fn panel_context_struct_fields_exist() {
+        // Compile-time check: the free function `_check_panel_context_fields`
+        // references every required field of PanelContext.  If any field is
+        // missing the crate will not compile and this test will not run.
+        // We just need one statement here so the test is not empty.
+        let _ = std::marker::PhantomData::<super::PanelContext>::default;
+    }
+
+    // ---------------------------------------------------------------------------
+    // Claim B: PanelSpec implements Lifecycle with Key = String and
+    // fn key(&self) -> String returning self.id.clone().
+    // ---------------------------------------------------------------------------
+    #[test]
+    fn panel_spec_lifecycle_key_returns_id() {
+        use crate::layout::PanelSpec;
+        use crate::managed_set::Lifecycle;
+
+        let spec = PanelSpec {
+            id: "my-panel".to_string(),
+            anchor: None,
+            width: 100,
+            height: 30,
+            x: 0,
+            y: 0,
+            outer_gap: 0,
+            output: None,
+            above: false,
+            content: serde_json::Value::Null,
+        };
+        assert_eq!(spec.key(), "my-panel".to_string());
     }
 }

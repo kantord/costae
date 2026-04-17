@@ -7,7 +7,7 @@ type StreamValues = Arc<RwLock<HashMap<(String, Option<String>), String>>>;
 /// Recorded `useStringStream` calls made during the last `_render()` invocation.
 type StreamCalls = Arc<Mutex<Vec<(String, Option<String>)>>>;
 /// Return type of a successful JSX evaluation.
-type EvalResult = rquickjs::Result<(serde_json::Value, Vec<(String, Option<String>)>, Vec<String>)>;
+type EvalResult = rquickjs::Result<(serde_json::Value, Vec<(String, Option<String>)>, Vec<(String, serde_json::Value)>)>;
 
 use rquickjs::CatchResultExt;
 
@@ -75,7 +75,7 @@ const JSX_GLOBALS_JS: &str = r#"
     globalThis.Module = ({ bin, children, ...rest }) => {
         const child = Array.isArray(children) ? children[0] : children;
         if (typeof child === 'function') {
-            registerModule(bin);
+            registerModule(bin, JSON.stringify(rest));
             const data = useJSONStream(bin);
             const events = new Proxy({}, {
                 get: (_, type) => ({ __channel__: bin, type: String(type) })
@@ -93,7 +93,7 @@ pub struct JsxEvaluator {
     _runtime: rquickjs::Runtime,
     stream_values: StreamValues,
     calls: StreamCalls,
-    module_calls: Arc<Mutex<Vec<String>>>,
+    module_calls: Arc<Mutex<Vec<(String, serde_json::Value)>>>,
     global_state: Arc<Mutex<serde_json::Map<String, serde_json::Value>>>,
 }
 
@@ -104,7 +104,7 @@ impl JsxEvaluator {
         let context = rquickjs::Context::full(&runtime)?;
         let stream_values: StreamValues = Arc::new(RwLock::new(HashMap::new()));
         let calls: StreamCalls = Arc::new(Mutex::new(Vec::new()));
-        let module_calls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let module_calls: Arc<Mutex<Vec<(String, serde_json::Value)>>> = Arc::new(Mutex::new(Vec::new()));
 
         {
             let sv = Arc::clone(&stream_values);
@@ -117,9 +117,13 @@ impl JsxEvaluator {
                     sv.read().unwrap().get(&(bin, script)).cloned().unwrap_or_default()
                 })?;
                 qjs_ctx.globals().set("useStringStream", func)?;
-                let func2 = rquickjs::Function::new(qjs_ctx.clone(), move |bin: String| {
+                let func2 = rquickjs::Function::new(qjs_ctx.clone(), move |bin: String, props_json: String| {
+                    let props: serde_json::Value = serde_json::from_str(&props_json)
+                        .unwrap_or(serde_json::Value::Null);
                     let mut mc = module_calls_inner.lock().unwrap();
-                    if !mc.contains(&bin) { mc.push(bin); }
+                    if !mc.iter().any(|(b, _)| b == &bin) {
+                        mc.push((bin, props));
+                    }
                 })?;
                 qjs_ctx.globals().set("registerModule", func2)?;
                 if !ctx.is_null() {
@@ -332,7 +336,7 @@ mod tests {
             serde_json::Value::Null,
             &std::collections::HashMap::new(),
         ).unwrap();
-        assert!(module_calls.contains(&"/usr/bin/test-module".to_string()));
+        assert!(module_calls.iter().any(|(bin, _)| bin == "/usr/bin/test-module"));
     }
 
     #[test]
