@@ -187,6 +187,7 @@ impl DataLoopHandle {
 
 pub struct DataLoop {
     pool: ManagedSet<CommandSpec>,
+    stream_tx: mpsc::Sender<StreamItem>,
     desired: Vec<CommandSpec>,
     timeout: Option<Duration>,
     rx: mpsc::Receiver<StreamItem>,
@@ -199,11 +200,12 @@ pub struct DataLoop {
 
 impl DataLoop {
     pub fn new() -> (Self, DataLoopHandle) {
-        let (tx, rx) = mpsc::channel();
+        let (stream_tx, rx) = mpsc::channel();
         let (desired_tx, desired_rx) = mpsc::channel();
         let event_txs_snapshot = Arc::new(Mutex::new(HashMap::new()));
         let data_loop = Self {
-            pool: ManagedSet::new(tx),
+            pool: ManagedSet::new(),
+            stream_tx,
             desired: Vec::new(),
             timeout: None,
             rx,
@@ -245,7 +247,7 @@ impl DataLoop {
                 Err(_) => break,
             }
         }
-        self.pool.update(self.desired.clone());
+        self.pool.update(self.desired.clone(), &self.stream_tx);
         if let Some(state) = self.pool.get(identity) {
             let _ = state.event_tx.send(event);
         }
@@ -262,7 +264,7 @@ impl DataLoop {
             .collect();
 
         self.desired = desired_unique;
-        self.pool.update(self.desired.clone());
+        self.pool.update(self.desired.clone(), &self.stream_tx);
         self.update_event_txs_snapshot();
     }
 
@@ -308,7 +310,7 @@ impl DataLoop {
             }
 
             // Reconcile: enter new, exit removed, update existing (restarts crashed processes).
-            self.pool.update(self.desired.clone());
+            self.pool.update(self.desired.clone(), &self.stream_tx);
             self.update_event_txs_snapshot();
 
             on_tick();

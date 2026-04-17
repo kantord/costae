@@ -36,6 +36,7 @@ pub use x11::{
     solid_color_rgba,
     strut_partial_values_for_anchor,
 };
+pub use x11::panel::PanelPool;
 
 // data spawn functions
 pub use data::{

@@ -11,8 +11,8 @@ use x11rb::{
     wrapper::ConnectionExt as _,
 };
 
-use crate::layout::{PanelSpec, PanelAnchor};
-use crate::render::{RenderCache, render_frame};
+use crate::layout::{PanelSpec, PanelAnchor, reconcile_panels};
+use crate::render::{RenderCache, render_frame, preload_layout_images};
 use crate::modules::hit_test;
 use crate::layout::parse_layout;
 use crate::x11::{x11_bgrx_to_rgba, inject_root_bg, solid_color_rgba, strut_partial_values_for_anchor};
@@ -292,6 +292,76 @@ pub fn create_panel(
 pub fn destroy_panel(panel: Panel, conn: &RustConnection) {
     let _ = conn.free_gc(panel.gc);
     let _ = conn.destroy_window(panel.win_id);
+}
+
+/// Manages the set of live X11 panel windows, mirroring the `ManagedSet` pattern.
+/// Takes `&X11Context` on each `update` call so no Arc-wrapping of X11 resources is needed.
+pub struct PanelPool {
+    panels: HashMap<String, Panel>,
+}
+
+impl PanelPool {
+    pub fn new() -> Self {
+        Self { panels: HashMap::new() }
+    }
+
+    pub fn update(&mut self, specs: Vec<PanelSpec>, ctx: &X11Context) {
+        let existing_ids: Vec<&str> = self.panels.keys().map(|s| s.as_str()).collect();
+        let (to_create, to_update, to_destroy) = reconcile_panels(&existing_ids, &specs);
+
+        for id in &to_destroy {
+            if let Some(panel) = self.panels.remove(id) {
+                let _ = ctx.conn.free_gc(panel.gc);
+                let _ = ctx.conn.destroy_window(panel.win_id);
+            }
+        }
+
+        for spec in &to_create {
+            match create_panel(spec, ctx) {
+                Ok(mut panel) => {
+                    if !spec.content.is_null() {
+                        preload_layout_images(&spec.content, ctx.global);
+                        panel.raw_layout = Some(spec.content.clone());
+                    }
+                    self.panels.insert(spec.id.clone(), panel);
+                }
+                Err(e) => tracing::error!(panel = %spec.id, error = %e, "failed to create panel"),
+            }
+        }
+
+        for spec in &to_update {
+            if let Some(panel) = self.panels.get_mut(&spec.id) {
+                if !spec.content.is_null() {
+                    preload_layout_images(&spec.content, ctx.global);
+                    panel.raw_layout = Some(spec.content.clone());
+                    panel.render_cache = RenderCache::new(30);
+                }
+            }
+        }
+    }
+
+    pub fn find_by_win_id(&self, win_id: u32) -> Option<&Panel> {
+        self.panels.values().find(|p| p.win_id == win_id)
+    }
+
+    pub fn find_by_win_id_mut(&mut self, win_id: u32) -> Option<&mut Panel> {
+        self.panels.values_mut().find(|p| p.win_id == win_id)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &Panel> {
+        self.panels.values()
+    }
+
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut Panel> {
+        self.panels.values_mut()
+    }
+
+    pub fn destroy_all(self, conn: &RustConnection) {
+        for (_, panel) in self.panels {
+            let _ = conn.free_gc(panel.gc);
+            let _ = conn.destroy_window(panel.win_id);
+        }
+    }
 }
 
 #[cfg(test)]

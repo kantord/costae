@@ -17,18 +17,16 @@ pub trait Lifecycle: HasKey {
 
 pub struct ManagedSet<T: Lifecycle> {
     store: HashMap<T::Key, T::State>,
-    ctx: T::Context,
 }
 
 impl<T: Lifecycle> ManagedSet<T> {
-    pub fn new(ctx: T::Context) -> Self {
+    pub fn new() -> Self {
         Self {
             store: HashMap::new(),
-            ctx,
         }
     }
 
-    pub fn update(&mut self, new_items: Vec<T>) {
+    pub fn update(&mut self, new_items: Vec<T>, ctx: &T::Context) {
         // Build new_map, deduplicating by key
         let mut new_map: HashMap<T::Key, T> = HashMap::new();
         for item in new_items {
@@ -44,14 +42,14 @@ impl<T: Lifecycle> ManagedSet<T> {
             .collect();
         for key in exit_keys {
             let state = self.store.remove(&key).unwrap();
-            T::exit(state, &self.ctx);
+            T::exit(state, ctx);
         }
 
         // Enter or update
         for (key, item) in new_map {
             if let Some(state) = self.store.get_mut(&key) {
-                item.update(state, &self.ctx);
-            } else if let Some(state) = item.enter(&self.ctx) {
+                item.update(state, ctx);
+            } else if let Some(state) = item.enter(ctx) {
                 self.store.insert(key, state);
             }
         }
@@ -115,8 +113,8 @@ mod tests {
     #[test]
     fn new_item_calls_enter_and_stores_state() {
         let ctx = make_ctx();
-        let mut ms: ManagedSet<TestSpec> = ManagedSet::new(ctx.clone());
-        ms.update(vec![TestSpec { id: "a".to_string(), value: 42 }]);
+        let mut ms: ManagedSet<TestSpec> = ManagedSet::new();
+        ms.update(vec![TestSpec { id: "a".to_string(), value: 42 }], &ctx);
         assert!(calls(&ctx).contains(&"enter:a".to_string()));
         assert_eq!(ms.get(&"a".to_string()), Some(&42));
     }
@@ -125,9 +123,9 @@ mod tests {
     #[test]
     fn removed_item_calls_exit_with_old_state() {
         let ctx = make_ctx();
-        let mut ms: ManagedSet<TestSpec> = ManagedSet::new(ctx.clone());
-        ms.update(vec![TestSpec { id: "a".to_string(), value: 99 }]);
-        ms.update(vec![]);
+        let mut ms: ManagedSet<TestSpec> = ManagedSet::new();
+        ms.update(vec![TestSpec { id: "a".to_string(), value: 99 }], &ctx);
+        ms.update(vec![], &ctx);
         assert!(calls(&ctx).contains(&"exit:99".to_string()));
     }
 
@@ -135,9 +133,9 @@ mod tests {
     #[test]
     fn existing_item_calls_update_not_enter() {
         let ctx = make_ctx();
-        let mut ms: ManagedSet<TestSpec> = ManagedSet::new(ctx.clone());
-        ms.update(vec![TestSpec { id: "a".to_string(), value: 1 }]);
-        ms.update(vec![TestSpec { id: "a".to_string(), value: 2 }]);
+        let mut ms: ManagedSet<TestSpec> = ManagedSet::new();
+        ms.update(vec![TestSpec { id: "a".to_string(), value: 1 }], &ctx);
+        ms.update(vec![TestSpec { id: "a".to_string(), value: 2 }], &ctx);
         let log = calls(&ctx);
         // Only one enter call total
         assert_eq!(log.iter().filter(|c| *c == "enter:a").count(), 1);
@@ -149,11 +147,11 @@ mod tests {
     #[test]
     fn duplicate_keys_in_batch_only_one_enter() {
         let ctx = make_ctx();
-        let mut ms: ManagedSet<TestSpec> = ManagedSet::new(ctx.clone());
+        let mut ms: ManagedSet<TestSpec> = ManagedSet::new();
         ms.update(vec![
             TestSpec { id: "a".to_string(), value: 1 },
             TestSpec { id: "a".to_string(), value: 2 },
-        ]);
+        ], &ctx);
         let log = calls(&ctx);
         assert_eq!(log.iter().filter(|c| *c == "enter:a").count(), 1);
     }
@@ -162,8 +160,8 @@ mod tests {
     #[test]
     fn get_returns_state_after_enter() {
         let ctx = make_ctx();
-        let mut ms: ManagedSet<TestSpec> = ManagedSet::new(ctx.clone());
-        ms.update(vec![TestSpec { id: "b".to_string(), value: 7 }]);
+        let mut ms: ManagedSet<TestSpec> = ManagedSet::new();
+        ms.update(vec![TestSpec { id: "b".to_string(), value: 7 }], &ctx);
         assert_eq!(ms.get(&"b".to_string()), Some(&7));
     }
 
@@ -171,9 +169,9 @@ mod tests {
     #[test]
     fn get_returns_updated_state_after_update() {
         let ctx = make_ctx();
-        let mut ms: ManagedSet<TestSpec> = ManagedSet::new(ctx.clone());
-        ms.update(vec![TestSpec { id: "c".to_string(), value: 10 }]);
-        ms.update(vec![TestSpec { id: "c".to_string(), value: 20 }]);
+        let mut ms: ManagedSet<TestSpec> = ManagedSet::new();
+        ms.update(vec![TestSpec { id: "c".to_string(), value: 10 }], &ctx);
+        ms.update(vec![TestSpec { id: "c".to_string(), value: 20 }], &ctx);
         assert_eq!(ms.get(&"c".to_string()), Some(&20));
     }
 }
