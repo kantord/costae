@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::io::BufRead;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -6,6 +6,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::Duration;
+
+use crate::managed_set::{HasKey, Lifecycle, ManagedSet};
 
 // NOTE: env uses BTreeMap (not HashMap) so that CommandSpec can derive Hash.
 // HashMap does not implement Hash; BTreeMap does because it has deterministic iteration order.
@@ -31,11 +33,98 @@ pub struct StreamItem {
     pub line: String,
 }
 
+fn spawn_process(spec: CommandSpec, tx: &mpsc::Sender<StreamItem>) -> Option<std::process::Child> {
+    let mut cmd = std::process::Command::new(&spec.bin);
+    cmd.args(&spec.args);
+    for (k, v) in &spec.env {
+        cmd.env(k, v);
+    }
+    if let Some(ref dir) = spec.current_dir {
+        cmd.current_dir(dir);
+    }
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(bin = %spec.bin, error = %e, "failed to spawn");
+            return None;
+        }
+    };
+
+    if let Some(stdout) = child.stdout.take() {
+        let spec_for_thread = spec.clone();
+        let tx_stdout = tx.clone();
+        thread::spawn(move || {
+            let reader = std::io::BufReader::new(stdout);
+            for line in reader.lines() {
+                match line {
+                    Ok(l) => {
+                        let item = StreamItem {
+                            source: spec_for_thread.clone(),
+                            stream: StreamKind::Stdout,
+                            line: l,
+                        };
+                        if tx_stdout.send(item).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+    }
+
+    if let Some(stderr) = child.stderr.take() {
+        let bin_name = spec.bin.clone();
+        thread::spawn(move || {
+            let reader = std::io::BufReader::new(stderr);
+            for line in reader.lines() {
+                match line {
+                    Ok(l) => tracing::warn!(module = %bin_name, "{l}"),
+                    Err(_) => break,
+                }
+            }
+        });
+    }
+
+    Some(child)
+}
+
+impl HasKey for CommandSpec {
+    type Key = Self;
+    fn key(&self) -> Self {
+        self.clone()
+    }
+}
+
+impl Lifecycle for CommandSpec {
+    type State = std::process::Child;
+    type Context = mpsc::Sender<StreamItem>;
+
+    fn enter(self, ctx: &Self::Context) -> Option<Self::State> {
+        spawn_process(self, ctx)
+    }
+
+    fn update(self, state: &mut Self::State, ctx: &Self::Context) {
+        if matches!(state.try_wait(), Ok(Some(_))) {
+            tracing::warn!(bin = %self.bin, "process exited");
+            if let Some(new_child) = spawn_process(self, ctx) {
+                *state = new_child;
+            }
+        }
+    }
+
+    fn exit(mut state: Self::State, _ctx: &Self::Context) {
+        let _ = state.kill();
+    }
+}
+
 pub struct DataLoop {
-    pool: HashMap<CommandSpec, std::process::Child>,
+    pool: ManagedSet<CommandSpec>,
     desired: Vec<CommandSpec>,
     timeout: Option<Duration>,
-    tx: mpsc::Sender<StreamItem>,
     rx: mpsc::Receiver<StreamItem>,
 }
 
@@ -49,10 +138,9 @@ impl DataLoop {
     pub fn new() -> Self {
         let (tx, rx) = mpsc::channel();
         Self {
-            pool: HashMap::new(),
+            pool: ManagedSet::new(tx),
             desired: Vec::new(),
             timeout: None,
-            tx,
             rx,
         }
     }
@@ -71,101 +159,8 @@ impl DataLoop {
             .cloned()
             .collect();
 
-        // Save desired set for reconciliation in run().
         self.desired = desired_unique;
-
-        // Kill and remove specs no longer desired.
-        let to_remove: Vec<CommandSpec> = self
-            .pool
-            .keys()
-            .filter(|k| !seen.contains(*k))
-            .cloned()
-            .collect();
-        for spec in to_remove {
-            if let Some(mut child) = self.pool.remove(&spec) {
-                let _ = child.kill();
-            }
-        }
-
-        // Spawn specs that are desired but not yet in the pool.
-        self.reconcile_pool();
-    }
-
-    /// Spawn any desired specs that are not currently in the pool.
-    fn reconcile_pool(&mut self) {
-        let desired = self.desired.clone();
-        for spec in desired {
-            if self.pool.contains_key(&spec) {
-                continue;
-            }
-
-            let spec_clone = spec.clone();
-            let tx = self.tx.clone();
-
-            let mut cmd = std::process::Command::new(&spec_clone.bin);
-            cmd.args(&spec_clone.args);
-            for (k, v) in &spec_clone.env {
-                cmd.env(k, v);
-            }
-            if let Some(ref dir) = spec_clone.current_dir {
-                cmd.current_dir(dir);
-            }
-            cmd.stdout(Stdio::piped());
-            cmd.stderr(Stdio::piped());
-
-            let mut child = match cmd.spawn() {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::error!(bin = %spec_clone.bin, error = %e, "failed to spawn");
-                    continue;
-                }
-            };
-
-            let stdout = match child.stdout.take() {
-                Some(s) => s,
-                None => {
-                    self.pool.insert(spec, child);
-                    continue;
-                }
-            };
-
-            let spec_for_stdout = spec_clone.clone();
-            let tx_stdout = tx.clone();
-            thread::spawn(move || {
-                let reader = std::io::BufReader::new(stdout);
-                for line in reader.lines() {
-                    match line {
-                        Ok(l) => {
-                            let item = StreamItem {
-                                source: spec_for_stdout.clone(),
-                                stream: StreamKind::Stdout,
-                                line: l,
-                            };
-                            if tx_stdout.send(item).is_err() {
-                                break;
-                            }
-                        }
-                        Err(_) => break,
-                    }
-                }
-            });
-
-            // Spawn stderr reader thread — lines are forwarded to tracing.
-            if let Some(stderr) = child.stderr.take() {
-                let bin_name = spec_clone.bin.clone();
-                thread::spawn(move || {
-                    let reader = std::io::BufReader::new(stderr);
-                    for line in reader.lines() {
-                        match line {
-                            Ok(l) => tracing::warn!(module = %bin_name, "{l}"),
-                            Err(_) => break,
-                        }
-                    }
-                });
-            }
-
-            self.pool.insert(spec, child);
-        }
+        self.pool.update(self.desired.clone());
     }
 
     pub fn run(&mut self, stop: Arc<AtomicBool>, mut handler: impl FnMut(StreamItem)) {
@@ -174,22 +169,8 @@ impl DataLoop {
                 break;
             }
 
-            // Reconcile: check for exited processes and respawn them.
-            let exited: Vec<CommandSpec> = self
-                .pool
-                .iter_mut()
-                .filter_map(|(spec, child)| {
-                    match child.try_wait() {
-                        Ok(Some(_)) => Some(spec.clone()),
-                        _ => None,
-                    }
-                })
-                .collect();
-            for spec in exited {
-                tracing::warn!(bin = %spec.bin, "process exited");
-                self.pool.remove(&spec);
-            }
-            self.reconcile_pool();
+            // Reconcile: enter new, exit removed, update existing (restarts crashed processes).
+            self.pool.update(self.desired.clone());
 
             match self.rx.recv_timeout(Duration::from_millis(50)) {
                 Ok(item) => handler(item),
