@@ -1,5 +1,6 @@
 pub mod data_loop;
 
+use crate::data::data_loop::{CommandSpec, StreamItem, StreamKind};
 use std::io::{Seek, SeekFrom, Write as IoWrite};
 use std::os::unix::io::FromRawFd;
 use std::sync::mpsc;
@@ -101,51 +102,69 @@ pub struct SpawnedBiStream {
 
 fn forward_stdout(
     rx: mpsc::Receiver<String>,
-    tx: mpsc::Sender<(String, Option<String>, String)>,
+    tx: mpsc::Sender<StreamItem>,
     wake_tx: mpsc::SyncSender<()>,
-    bin: String,
-    script: Option<String>,
+    spec: CommandSpec,
 ) {
     thread::spawn(move || {
         while let Ok(line) = rx.recv() {
-            if tx.send((bin.clone(), script.clone(), line)).is_err() {
+            let item = StreamItem {
+                source: spec.clone(),
+                stream: StreamKind::Stdout,
+                line,
+            };
+            if tx.send(item).is_err() {
                 break;
             }
             let _ = wake_tx.try_send(());
         }
-        tracing::warn!(bin = %bin, script = ?script, "stream subprocess exited");
+        tracing::warn!(bin = %spec.bin, script = ?spec.script, "stream subprocess exited");
     });
 }
 
 /// Spawn a bidirectional module subprocess (stdin for events, stdout for data).
-/// Sends the init event immediately, then forwards stdout lines to `tx` as `(bin, None, line)`.
+/// Sends the init event immediately, then forwards stdout lines to `tx` as `StreamItem`.
 pub fn spawn_bi_stream(
     bin: &str,
     init_event: &serde_json::Value,
-    tx: mpsc::Sender<(String, Option<String>, String)>,
+    tx: mpsc::Sender<StreamItem>,
     wake_tx: mpsc::SyncSender<()>,
 ) -> SpawnedBiStream {
     let spawned = spawn_module(bin, None);
     spawned.send_event(init_event);
     let (rx, child, event_tx) = spawned.into_parts();
-    forward_stdout(rx, tx, wake_tx, bin.to_string(), None);
+    let spec = CommandSpec {
+        bin: bin.to_string(),
+        script: None,
+        args: vec![],
+        env: std::collections::BTreeMap::new(),
+        current_dir: None,
+        key: None,
+    };
+    forward_stdout(rx, tx, wake_tx, spec);
     SpawnedBiStream { child, event_tx }
 }
 
 /// Spawn a string-streaming subprocess (e.g. a bash script that prints one line per tick).
 ///
-/// Each line emitted by the process is forwarded to `tx` as `(bin, script, line)`.
+/// Each line emitted by the process is forwarded to `tx` as a `StreamItem`.
 /// The returned `Child` must be kept alive; drop it to kill the process.
 pub fn spawn_string_stream(
     bin: &str,
     script: Option<&str>,
-    tx: mpsc::Sender<(String, Option<String>, String)>,
+    tx: mpsc::Sender<StreamItem>,
     wake_tx: mpsc::SyncSender<()>,
 ) -> std::process::Child {
     let spawned = spawn_module(bin, script);
-    let bin_owned = bin.to_string();
-    let script_owned = script.map(str::to_string);
+    let spec = CommandSpec {
+        bin: bin.to_string(),
+        script: script.map(str::to_string),
+        args: vec![],
+        env: std::collections::BTreeMap::new(),
+        current_dir: None,
+        key: None,
+    };
     let (rx, child, _event_tx) = spawned.into_parts();
-    forward_stdout(rx, tx, wake_tx, bin_owned, script_owned);
+    forward_stdout(rx, tx, wake_tx, spec);
     child
 }

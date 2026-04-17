@@ -52,7 +52,7 @@ fn apply_eval_result(
     current_calls: &[(String, Option<String>)],
     registry: &mut StreamRegistry,
     panels: &mut Vec<Panel>,
-    stream_tx: &mpsc::Sender<(String, Option<String>, String)>,
+    stream_tx: &mpsc::Sender<costae::data::data_loop::StreamItem>,
     wake_tx: &mpsc::SyncSender<()>,
     mod_init_fn: &dyn Fn(&[costae::PanelSpec]) -> serde_json::Value,
     apply_panel_specs_fn: &mut dyn FnMut(&mut Vec<Panel>, Vec<costae::PanelSpec>),
@@ -90,18 +90,31 @@ fn apply_eval_result(
 }
 
 fn drain_stream_updates(
-    rx: &mpsc::Receiver<(String, Option<String>, String)>,
+    rx: &mpsc::Receiver<costae::data::data_loop::StreamItem>,
     values: &mut HashMap<(String, Option<String>), String>,
 ) -> bool {
     let mut changed = false;
-    while let Ok((bin, script, value)) = rx.try_recv() {
-        let key = (bin, script);
+    while let Ok(item) = rx.try_recv() {
+        let key = (item.source.bin, item.source.script);
+        let value = item.line;
         if values.get(&key).map(|s| s.as_str()) != Some(value.as_str()) {
             values.insert(key, value);
             changed = true;
         }
     }
     changed
+}
+
+fn stream_calls_to_specs(calls: &[(String, Option<String>)]) -> Vec<costae::data::data_loop::CommandSpec> {
+    use std::collections::BTreeMap;
+    calls.iter().map(|(bin, script)| costae::data::data_loop::CommandSpec {
+        bin: bin.clone(),
+        script: script.clone(),
+        args: vec![],
+        env: BTreeMap::new(),
+        current_dir: None,
+        key: None,
+    }).collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -167,7 +180,7 @@ fn handle_layout_reload(
     layout_jsx_path: &std::path::Path,
     jsx_ctx: &serde_json::Value,
     panels: &mut Vec<Panel>,
-    stream_tx: &mpsc::Sender<(String, Option<String>, String)>,
+    stream_tx: &mpsc::Sender<costae::data::data_loop::StreamItem>,
     wake_tx: &mpsc::SyncSender<()>,
     mod_init_fn: &dyn Fn(&[costae::PanelSpec]) -> serde_json::Value,
     apply_panel_specs_fn: &mut dyn FnMut(&mut Vec<Panel>, Vec<costae::PanelSpec>),
@@ -322,7 +335,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut registry = StreamRegistry::new();
     let mut stream_values: HashMap<(String, Option<String>), String> = HashMap::new();
-    let (stream_tx, stream_rx) = mpsc::channel::<(String, Option<String>, String)>();
+    let (stream_tx, stream_rx) = mpsc::channel::<costae::data::data_loop::StreamItem>();
     let mut jsx_evaluator: Option<costae::jsx::JsxEvaluator> = None;
 
     let (conn, screen_num) = RustConnection::connect(None)?;
@@ -608,12 +621,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::drain_stream_updates;
-    use std::collections::HashMap;
+    use super::{drain_stream_updates, stream_calls_to_specs};
+    use costae::data::data_loop::{CommandSpec, StreamItem, StreamKind};
+    use std::collections::{BTreeMap, HashMap};
     use std::sync::mpsc;
 
+    fn make_spec(bin: &str, script: Option<&str>) -> CommandSpec {
+        CommandSpec {
+            bin: bin.to_string(),
+            args: vec![],
+            env: BTreeMap::new(),
+            current_dir: None,
+            key: None,
+            script: script.map(|s| s.to_string()),
+        }
+    }
+
+    fn make_item(bin: &str, script: Option<&str>, line: &str) -> StreamItem {
+        StreamItem {
+            source: make_spec(bin, script),
+            stream: StreamKind::Stdout,
+            line: line.to_string(),
+        }
+    }
+
     // helper: create a channel, send items, drop the sender, return receiver
-    fn make_rx(items: Vec<(String, Option<String>, String)>) -> mpsc::Receiver<(String, Option<String>, String)> {
+    fn make_rx(items: Vec<StreamItem>) -> mpsc::Receiver<StreamItem> {
         let (tx, rx) = mpsc::channel();
         for item in items {
             tx.send(item).unwrap();
@@ -631,7 +664,7 @@ mod tests {
     #[test]
     fn new_key_returns_true_and_inserts_value() {
         let rx = make_rx(vec![
-            ("bin".into(), None, "hello".into()),
+            make_item("bin", None, "hello"),
         ]);
         let mut values: HashMap<(String, Option<String>), String> = HashMap::new();
         assert!(drain_stream_updates(&rx, &mut values));
@@ -640,43 +673,80 @@ mod tests {
 
     #[test]
     fn same_value_on_second_drain_returns_false() {
-        let (tx, rx) = mpsc::channel::<(String, Option<String>, String)>();
+        let (tx, rx) = mpsc::channel::<StreamItem>();
         let mut values: HashMap<(String, Option<String>), String> = HashMap::new();
 
-        tx.send(("bin".into(), None, "v1".into())).unwrap();
+        tx.send(make_item("bin", None, "v1")).unwrap();
         // first drain: value is new → true
         assert!(drain_stream_updates(&rx, &mut values));
 
-        tx.send(("bin".into(), None, "v1".into())).unwrap();
+        tx.send(make_item("bin", None, "v1")).unwrap();
         // second drain: same value → false
         assert!(!drain_stream_updates(&rx, &mut values));
     }
 
     #[test]
     fn changed_value_returns_true() {
-        let (tx, rx) = mpsc::channel::<(String, Option<String>, String)>();
+        let (tx, rx) = mpsc::channel::<StreamItem>();
         let mut values: HashMap<(String, Option<String>), String> = HashMap::new();
 
-        tx.send(("bin".into(), Some("script".into()), "v1".into())).unwrap();
+        tx.send(make_item("bin", Some("script"), "v1")).unwrap();
         drain_stream_updates(&rx, &mut values);
 
-        tx.send(("bin".into(), Some("script".into()), "v2".into())).unwrap();
+        tx.send(make_item("bin", Some("script"), "v2")).unwrap();
         assert!(drain_stream_updates(&rx, &mut values));
     }
 
     #[test]
     fn multiple_keys_one_changes_returns_true() {
-        let (tx, rx) = mpsc::channel::<(String, Option<String>, String)>();
+        let (tx, rx) = mpsc::channel::<StreamItem>();
         let mut values: HashMap<(String, Option<String>), String> = HashMap::new();
 
         // seed two keys
-        tx.send(("bin_a".into(), None, "stable".into())).unwrap();
-        tx.send(("bin_b".into(), None, "old".into())).unwrap();
+        tx.send(make_item("bin_a", None, "stable")).unwrap();
+        tx.send(make_item("bin_b", None, "old")).unwrap();
         drain_stream_updates(&rx, &mut values);
 
         // only bin_b changes
-        tx.send(("bin_a".into(), None, "stable".into())).unwrap();
-        tx.send(("bin_b".into(), None, "new".into())).unwrap();
+        tx.send(make_item("bin_a", None, "stable")).unwrap();
+        tx.send(make_item("bin_b", None, "new")).unwrap();
         assert!(drain_stream_updates(&rx, &mut values));
+    }
+
+    /// `stream_calls_to_specs` maps JSX stream call tuples to `CommandSpec` values.
+    ///
+    /// Each `(bin, script)` pair produces a `CommandSpec` where `bin` and `script`
+    /// are forwarded verbatim, and `args`, `env`, `current_dir`, and `key` are at
+    /// their zero/empty defaults.
+    #[test]
+    fn stream_calls_to_specs_maps_calls_to_command_specs() {
+        let calls: Vec<(String, Option<String>)> = vec![
+            ("my-bin".to_string(), None),
+            ("other-bin".to_string(), Some("echo hello".to_string())),
+        ];
+
+        let specs = stream_calls_to_specs(&calls);
+
+        assert_eq!(specs.len(), 2);
+
+        // First entry: no script
+        assert_eq!(specs[0], CommandSpec {
+            bin: "my-bin".to_string(),
+            script: None,
+            args: vec![],
+            env: BTreeMap::new(),
+            current_dir: None,
+            key: None,
+        });
+
+        // Second entry: script is preserved
+        assert_eq!(specs[1], CommandSpec {
+            bin: "other-bin".to_string(),
+            script: Some("echo hello".to_string()),
+            args: vec![],
+            env: BTreeMap::new(),
+            current_dir: None,
+            key: None,
+        });
     }
 }
