@@ -34,23 +34,6 @@ pub struct Panel {
     pub bgrx: Arc<Vec<u8>>,
 }
 
-pub struct X11Context<'a> {
-    pub conn: &'a RustConnection,
-    pub screen: &'a Screen,
-    pub depth: u8,
-    pub dpr: f32,
-    /// Primary monitor coordinates (fallback when panel has no output= prop).
-    pub mon_x: i16,
-    pub mon_y: i16,
-    pub mon_width: u32,
-    pub mon_height: u32,
-    pub xrootpmap_atom: Option<u32>,
-    pub strut_atom: u32,
-    pub strut_legacy_atom: u32,
-    /// All connected outputs: name → (x, y, phys_width, phys_height).
-    pub output_map: &'a HashMap<String, (i16, i16, u32, u32)>,
-}
-
 pub fn sample_root_bg(
     conn: &RustConnection,
     root: Window,
@@ -218,74 +201,70 @@ pub fn do_hit_test(
     dispatch_click(module_event_txs, &hit_path, &on_click);
 }
 
-pub fn create_panel(
+fn create_panel(
     spec: &PanelSpec,
-    x11: &X11Context,
+    ctx: &PanelContext,
 ) -> Result<Panel, Box<dyn std::error::Error>> {
-    let phys_width = (spec.width as f32 * x11.dpr).round() as u32;
-    let phys_height = (spec.height as f32 * x11.dpr).round() as u32;
+    let phys_width = (spec.width as f32 * ctx.dpr).round() as u32;
+    let phys_height = (spec.height as f32 * ctx.dpr).round() as u32;
 
-    // Resolve which monitor this panel lives on. When spec.output names a known RandR
-    // output, use its coordinates; otherwise fall back to the primary monitor.
     let (mon_x, mon_y, mon_width, mon_height) = spec.output.as_ref()
-        .and_then(|name| x11.output_map.get(name).copied())
-        .unwrap_or((x11.mon_x, x11.mon_y, x11.mon_width, x11.mon_height));
+        .and_then(|name| ctx.output_map.get(name).copied())
+        .unwrap_or((ctx.mon_x, ctx.mon_y, ctx.mon_width, ctx.mon_height));
 
-    // outer_gap is informational (passed to modules so they can tell i3 about tiling gaps),
-    // not a window position offset. Anchored windows sit flush at the monitor edge.
     let (win_x, win_y) = match &spec.anchor {
         Some(PanelAnchor::Left)  => (mon_x, mon_y),
         Some(PanelAnchor::Right) => (mon_x + mon_width as i16 - phys_width as i16, mon_y),
         Some(PanelAnchor::Top)   => (mon_x, mon_y),
         Some(PanelAnchor::Bottom)=> (mon_x, mon_y + mon_height as i16 - phys_height as i16),
         None => (
-            mon_x + (spec.x as f32 * x11.dpr).round() as i16,
-            mon_y + (spec.y as f32 * x11.dpr).round() as i16,
+            mon_x + (spec.x as f32 * ctx.dpr).round() as i16,
+            mon_y + (spec.y as f32 * ctx.dpr).round() as i16,
         ),
     };
 
-    let win_id = x11.conn.generate_id()?;
-    x11.conn.create_window(
+    let win_id = ctx.conn.generate_id()?;
+    ctx.conn.create_window(
         x11rb::COPY_DEPTH_FROM_PARENT,
         win_id,
-        x11.screen.root,
+        ctx.root,
         win_x,
         win_y,
         phys_width as u16,
         phys_height as u16,
         0,
         WindowClass::INPUT_OUTPUT,
-        x11.screen.root_visual,
+        ctx.root_visual,
         &CreateWindowAux::new()
-            .background_pixel(x11.screen.black_pixel)
+            .background_pixel(ctx.black_pixel)
             .override_redirect(1)
             .event_mask(EventMask::EXPOSURE | EventMask::BUTTON_PRESS),
     )?;
 
-    let root_bg_rgba = sample_root_bg(x11.conn, x11.screen.root, win_x, win_y, phys_width, phys_height, x11.xrootpmap_atom)
+    let root_bg_rgba = sample_root_bg(&ctx.conn, ctx.root, win_x, win_y, phys_width, phys_height, ctx.xrootpmap_atom)
         .unwrap_or_default();
     inject_root_bg(root_bg_rgba.clone(), phys_width, phys_height);
 
-    x11.conn.map_window(win_id)?;
+    ctx.conn.map_window(win_id)?;
     let stack_mode = if spec.above { StackMode::ABOVE } else { StackMode::BELOW };
-    x11.conn.configure_window(win_id, &ConfigureWindowAux::new().stack_mode(stack_mode))?;
+    ctx.conn.configure_window(win_id, &ConfigureWindowAux::new().stack_mode(stack_mode))?;
 
     if let Some(anchor) = spec.anchor.clone() {
         let strut_vals = strut_partial_values_for_anchor(
             anchor, mon_x, mon_y, mon_width, mon_height, phys_width, phys_height,
         );
-        x11.conn.change_property32(PropMode::REPLACE, win_id, x11.strut_atom, AtomEnum::CARDINAL, &strut_vals)?;
-        x11.conn.change_property32(PropMode::REPLACE, win_id, x11.strut_legacy_atom, AtomEnum::CARDINAL, &strut_vals[..4])?;
+        ctx.conn.change_property32(PropMode::REPLACE, win_id, ctx.strut_atom, AtomEnum::CARDINAL, &strut_vals)?;
+        ctx.conn.change_property32(PropMode::REPLACE, win_id, ctx.strut_legacy_atom, AtomEnum::CARDINAL, &strut_vals[..4])?;
     }
 
-    let gc = x11.conn.generate_id()?;
-    x11.conn.create_gc(gc, win_id, &CreateGCAux::new())?;
+    let gc = ctx.conn.generate_id()?;
+    ctx.conn.create_gc(gc, win_id, &CreateGCAux::new())?;
 
-    x11.conn.flush()?;
+    ctx.conn.flush()?;
 
-    let bgrx = Arc::new(render_frame(None, phys_width, phys_height, x11.dpr));
-    x11.conn.put_image(ImageFormat::Z_PIXMAP, win_id, gc, phys_width as u16, phys_height as u16, 0, 0, 0, x11.depth, &bgrx[..])?;
-    x11.conn.flush()?;
+    let bgrx = Arc::new(render_frame(None, phys_width, phys_height, ctx.dpr));
+    ctx.conn.put_image(ImageFormat::Z_PIXMAP, win_id, gc, phys_width as u16, phys_height as u16, 0, 0, 0, ctx.depth, &bgrx[..])?;
+    ctx.conn.flush()?;
 
     Ok(Panel {
         id: spec.id.clone(),
@@ -300,11 +279,6 @@ pub fn create_panel(
         render_cache: RenderCache::new(30),
         bgrx,
     })
-}
-
-pub fn destroy_panel(panel: Panel, conn: &RustConnection) {
-    let _ = conn.free_gc(panel.gc);
-    let _ = conn.destroy_window(panel.win_id);
 }
 
 // ---------------------------------------------------------------------------
@@ -338,38 +312,7 @@ impl Lifecycle for PanelSpec {
 
     fn enter(self, ctx: &Self::Context) -> Option<Self::State> {
         init_global_ctx();
-        let x11 = X11Context {
-            conn: &*ctx.conn,
-            screen: &x11rb::protocol::xproto::Screen {
-                root: ctx.root,
-                default_colormap: 0,
-                white_pixel: 0,
-                black_pixel: ctx.black_pixel,
-                current_input_masks: EventMask::NO_EVENT,
-                width_in_pixels: ctx.mon_width as u16,
-                height_in_pixels: ctx.mon_height as u16,
-                width_in_millimeters: 0,
-                height_in_millimeters: 0,
-                min_installed_maps: 0,
-                max_installed_maps: 0,
-                root_visual: ctx.root_visual,
-                backing_stores: x11rb::protocol::xproto::BackingStore::NOT_USEFUL,
-                save_unders: false,
-                root_depth: ctx.depth,
-                allowed_depths: vec![],
-            },
-            depth: ctx.depth,
-            dpr: ctx.dpr,
-            mon_x: ctx.mon_x,
-            mon_y: ctx.mon_y,
-            mon_width: ctx.mon_width,
-            mon_height: ctx.mon_height,
-            xrootpmap_atom: ctx.xrootpmap_atom,
-            strut_atom: ctx.strut_atom,
-            strut_legacy_atom: ctx.strut_legacy_atom,
-            output_map: ctx.output_map.as_ref(),
-        };
-        match create_panel(&self, &x11) {
+        match create_panel(&self, ctx) {
             Ok(mut panel) => {
                 if !self.content.is_null() {
                     preload_layout_images(&self.content);
