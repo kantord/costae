@@ -62,16 +62,16 @@ fn apply_bar_gap(socket: &str, dpi: f32, bar_width: u32, outer_gap: u32) {
 }
 
 fn switch_workspace(socket: &str, name: &str) {
-    eprintln!("[costae-i3] switch_workspace name={name:?} socket={socket:?}");
+    tracing::debug!(name, socket, "switch_workspace");
     match UnixStream::connect(socket) {
         Ok(mut s) => {
             let escaped = name.replace('"', "\\\"");
             let cmd = format!("workspace \"{}\"", escaped);
             let send_ok = i3_send(&mut s, 0, cmd.as_bytes()).is_ok();
             let recv_ok = i3_recv(&mut s).is_ok();
-            eprintln!("[costae-i3] switch_workspace done send_ok={send_ok} recv_ok={recv_ok}");
+            tracing::debug!(send_ok, recv_ok, "switch_workspace done");
         }
-        Err(e) => eprintln!("[costae-i3] switch_workspace connect failed: {e}"),
+        Err(e) => tracing::warn!(error = %e, "switch_workspace connect failed"),
     }
 }
 
@@ -151,6 +151,13 @@ enum ModuleEvent {
 // --- Main ---
 
 fn main() {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
+
     // Read init event then release the stdin lock before spawning threads
     let init = {
         let stdin = std::io::stdin();
@@ -204,14 +211,14 @@ fn main() {
                 let mut sub = match UnixStream::connect(&socket_clone) {
                     Ok(s) => s,
                     Err(e) => {
-                        eprintln!("[costae-i3] failed to connect to i3 socket: {e}, retrying in 1s");
+                        tracing::warn!(error = %e, "failed to connect to i3 socket, retrying in 1s");
                         std::thread::sleep(std::time::Duration::from_secs(1));
                         continue;
                     }
                 };
                 if i3_send(&mut sub, 2, b"[\"workspace\"]").is_err() { continue; }
                 if i3_recv(&mut sub).is_err() { continue; }
-                eprintln!("[costae-i3] i3 subscription connected");
+                tracing::info!("i3 subscription connected");
                 // Trigger an immediate workspace refresh after (re)connect
                 if event_tx.send(ModuleEvent::I3(0x80000000, b"{}".to_vec())).is_err() {
                     return;
@@ -224,7 +231,7 @@ fn main() {
                             }
                         }
                         Err(e) => {
-                            eprintln!("[costae-i3] i3 subscription dropped: {e}, reconnecting...");
+                            tracing::warn!(error = %e, "i3 subscription dropped, reconnecting");
                             break;
                         }
                     }
@@ -248,7 +255,7 @@ fn main() {
             }
             ModuleEvent::I3(_, _) => {}
             ModuleEvent::Stdin(val) => {
-                eprintln!("[costae-i3] stdin event: {val}");
+                tracing::debug!(event = %val, "stdin event");
                 if let Some(name) = parse_click_event(&val) {
                     switch_workspace(&socket, &name);
                 }

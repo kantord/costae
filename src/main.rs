@@ -76,22 +76,6 @@ fn apply_eval_result(
     true
 }
 
-#[cfg(test)]
-fn drain_stream_updates(
-    rx: &mpsc::Receiver<costae::data::data_loop::StreamItem>,
-    values: &mut HashMap<(String, Option<String>), String>,
-) -> bool {
-    let mut changed = false;
-    while let Ok(item) = rx.try_recv() {
-        let key = (item.source.identity.bin.clone(), item.source.script.clone());
-        if values.get(&key).map(|s| s.as_str()) != Some(item.line.as_str()) {
-            values.insert(key, item.line);
-            changed = true;
-        }
-    }
-    changed
-}
-
 #[allow(clippy::too_many_arguments)]
 fn handle_x11_events(
     conn: &RustConnection,
@@ -561,84 +545,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{drain_stream_updates, stream_calls_to_specs};
-    use costae::data::data_loop::{CommandSpec, ProcessIdentity, StreamItem, StreamKind};
-    use std::collections::{BTreeMap, HashMap};
-    use std::sync::mpsc;
-
-    fn make_spec(bin: &str, script: Option<&str>) -> CommandSpec {
-        CommandSpec {
-            identity: ProcessIdentity { bin: bin.to_string(), key: bin.to_string() },
-            script: script.map(str::to_string),
-            args: vec![],
-            env: BTreeMap::new(),
-            current_dir: None,
-            props: None,
-        }
-    }
-
-    fn make_item(bin: &str, script: Option<&str>, line: &str) -> StreamItem {
-        StreamItem {
-            source: make_spec(bin, script),
-            stream: StreamKind::Stdout,
-            line: line.to_string(),
-        }
-    }
-
-    fn make_rx(items: Vec<StreamItem>) -> mpsc::Receiver<StreamItem> {
-        let (tx, rx) = mpsc::channel();
-        for item in items {
-            tx.send(item).unwrap();
-        }
-        rx
-    }
-
-    #[test]
-    fn empty_channel_returns_false() {
-        let rx = make_rx(vec![]);
-        let mut values: HashMap<(String, Option<String>), String> = HashMap::new();
-        assert!(!drain_stream_updates(&rx, &mut values));
-    }
-
-    #[test]
-    fn new_key_returns_true_and_inserts_value() {
-        let rx = make_rx(vec![make_item("bin", None, "hello")]);
-        let mut values: HashMap<(String, Option<String>), String> = HashMap::new();
-        assert!(drain_stream_updates(&rx, &mut values));
-        assert_eq!(values.get(&("bin".to_string(), None)).map(|s| s.as_str()), Some("hello"));
-    }
-
-    #[test]
-    fn same_value_on_second_drain_returns_false() {
-        let (tx, rx) = mpsc::channel::<StreamItem>();
-        let mut values: HashMap<(String, Option<String>), String> = HashMap::new();
-        tx.send(make_item("bin", None, "v1")).unwrap();
-        assert!(drain_stream_updates(&rx, &mut values));
-        tx.send(make_item("bin", None, "v1")).unwrap();
-        assert!(!drain_stream_updates(&rx, &mut values));
-    }
-
-    #[test]
-    fn changed_value_returns_true() {
-        let (tx, rx) = mpsc::channel::<StreamItem>();
-        let mut values: HashMap<(String, Option<String>), String> = HashMap::new();
-        tx.send(make_item("bin", Some("script"), "v1")).unwrap();
-        drain_stream_updates(&rx, &mut values);
-        tx.send(make_item("bin", Some("script"), "v2")).unwrap();
-        assert!(drain_stream_updates(&rx, &mut values));
-    }
-
-    #[test]
-    fn multiple_keys_one_changes_returns_true() {
-        let (tx, rx) = mpsc::channel::<StreamItem>();
-        let mut values: HashMap<(String, Option<String>), String> = HashMap::new();
-        tx.send(make_item("bin_a", None, "stable")).unwrap();
-        tx.send(make_item("bin_b", None, "old")).unwrap();
-        drain_stream_updates(&rx, &mut values);
-        tx.send(make_item("bin_a", None, "stable")).unwrap();
-        tx.send(make_item("bin_b", None, "new")).unwrap();
-        assert!(drain_stream_updates(&rx, &mut values));
-    }
+    use super::stream_calls_to_specs;
 
     #[test]
     fn stream_calls_to_specs_maps_calls_to_command_specs() {
