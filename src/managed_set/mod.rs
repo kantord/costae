@@ -33,7 +33,7 @@ where
         Self::default()
     }
 
-    pub fn update(&mut self, new_items: Vec<T>, ctx: &T::Context) -> Vec<(T::Key, T::Error)> {
+    pub fn reconcile(&mut self, new_items: Vec<T>, ctx: &T::Context) -> Vec<(T::Key, T::Error)> {
         let mut errors: Vec<(T::Key, T::Error)> = Vec::new();
 
         // Build new_map, deduplicating by key
@@ -161,7 +161,7 @@ mod tests {
     fn new_item_calls_enter_and_stores_state() {
         let ctx = make_ctx();
         let mut ms: ManagedSet<TestSpec> = ManagedSet::new();
-        ms.update(vec![TestSpec { id: "a".to_string(), value: 42 }], &ctx);
+        ms.reconcile(vec![TestSpec { id: "a".to_string(), value: 42 }], &ctx);
         assert!(calls(&ctx).contains(&"enter:a".to_string()));
         assert_eq!(ms.get(&"a".to_string()), Some(&42));
     }
@@ -171,8 +171,8 @@ mod tests {
     fn removed_item_calls_exit_with_old_state() {
         let ctx = make_ctx();
         let mut ms: ManagedSet<TestSpec> = ManagedSet::new();
-        ms.update(vec![TestSpec { id: "a".to_string(), value: 99 }], &ctx);
-        ms.update(vec![], &ctx);
+        ms.reconcile(vec![TestSpec { id: "a".to_string(), value: 99 }], &ctx);
+        ms.reconcile(vec![], &ctx);
         assert!(calls(&ctx).contains(&"exit:99".to_string()));
     }
 
@@ -181,8 +181,8 @@ mod tests {
     fn existing_item_calls_update_not_enter() {
         let ctx = make_ctx();
         let mut ms: ManagedSet<TestSpec> = ManagedSet::new();
-        ms.update(vec![TestSpec { id: "a".to_string(), value: 1 }], &ctx);
-        ms.update(vec![TestSpec { id: "a".to_string(), value: 2 }], &ctx);
+        ms.reconcile(vec![TestSpec { id: "a".to_string(), value: 1 }], &ctx);
+        ms.reconcile(vec![TestSpec { id: "a".to_string(), value: 2 }], &ctx);
         let log = calls(&ctx);
         // Only one enter call total
         assert_eq!(log.iter().filter(|c| *c == "enter:a").count(), 1);
@@ -195,7 +195,7 @@ mod tests {
     fn duplicate_keys_in_batch_only_one_enter() {
         let ctx = make_ctx();
         let mut ms: ManagedSet<TestSpec> = ManagedSet::new();
-        ms.update(vec![
+        ms.reconcile(vec![
             TestSpec { id: "a".to_string(), value: 1 },
             TestSpec { id: "a".to_string(), value: 2 },
         ], &ctx);
@@ -208,7 +208,7 @@ mod tests {
     fn get_returns_state_after_enter() {
         let ctx = make_ctx();
         let mut ms: ManagedSet<TestSpec> = ManagedSet::new();
-        ms.update(vec![TestSpec { id: "b".to_string(), value: 7 }], &ctx);
+        ms.reconcile(vec![TestSpec { id: "b".to_string(), value: 7 }], &ctx);
         assert_eq!(ms.get(&"b".to_string()), Some(&7));
     }
 
@@ -217,8 +217,8 @@ mod tests {
     fn get_returns_updated_state_after_update() {
         let ctx = make_ctx();
         let mut ms: ManagedSet<TestSpec> = ManagedSet::new();
-        ms.update(vec![TestSpec { id: "c".to_string(), value: 10 }], &ctx);
-        ms.update(vec![TestSpec { id: "c".to_string(), value: 20 }], &ctx);
+        ms.reconcile(vec![TestSpec { id: "c".to_string(), value: 10 }], &ctx);
+        ms.reconcile(vec![TestSpec { id: "c".to_string(), value: 20 }], &ctx);
         assert_eq!(ms.get(&"c".to_string()), Some(&20));
     }
 
@@ -228,7 +228,7 @@ mod tests {
     fn iter_mut_yields_mutable_state_visible_via_get() {
         let ctx = make_ctx();
         let mut ms: ManagedSet<TestSpec> = ManagedSet::new();
-        ms.update(vec![TestSpec { id: "d".to_string(), value: 5 }], &ctx);
+        ms.reconcile(vec![TestSpec { id: "d".to_string(), value: 5 }], &ctx);
         for (_k, v) in ms.iter_mut() {
             *v = 99;
         }
@@ -241,7 +241,7 @@ mod tests {
     fn get_mut_returns_mutable_reference_visible_via_get() {
         let ctx = make_ctx();
         let mut ms: ManagedSet<TestSpec> = ManagedSet::new();
-        ms.update(vec![TestSpec { id: "e".to_string(), value: 3 }], &ctx);
+        ms.reconcile(vec![TestSpec { id: "e".to_string(), value: 3 }], &ctx);
         if let Some(v) = ms.get_mut(&"e".to_string()) {
             *v = 77;
         }
@@ -292,7 +292,7 @@ mod tests {
     #[test]
     fn enter_err_not_added_to_store_error_returned() {
         let mut ms: ManagedSet<FallibleSpec> = ManagedSet::new();
-        let errors = ms.update(vec![FallibleSpec { id: "x".to_string(), fail: true }], &());
+        let errors = ms.reconcile(vec![FallibleSpec { id: "x".to_string(), fail: true }], &());
         assert!(ms.get(&"x".to_string()).is_none(), "item must not be in store after enter Err");
         assert_eq!(errors.len(), 1, "one error must be returned");
         assert_eq!(errors[0].0, "x");
@@ -303,7 +303,7 @@ mod tests {
     #[test]
     fn enter_ok_adds_item_to_store_no_errors() {
         let mut ms: ManagedSet<FallibleSpec> = ManagedSet::new();
-        let errors = ms.update(vec![FallibleSpec { id: "y".to_string(), fail: false }], &());
+        let errors = ms.reconcile(vec![FallibleSpec { id: "y".to_string(), fail: false }], &());
         assert_eq!(ms.get(&"y".to_string()), Some(&"state:y".to_string()));
         assert!(errors.is_empty(), "no errors when enter returns Ok");
     }
@@ -358,12 +358,12 @@ mod tests {
         let mut ms: ManagedSet<UpdateFallibleSpec> = ManagedSet::new();
 
         // First: enter succeeds
-        let e1 = ms.update(vec![UpdateFallibleSpec { id: "z".to_string(), fail_update: false }], &());
+        let e1 = ms.reconcile(vec![UpdateFallibleSpec { id: "z".to_string(), fail_update: false }], &());
         assert!(e1.is_empty());
         assert!(ms.get(&"z".to_string()).is_some(), "item should be in store after successful enter");
 
         // Second: update fails
-        let errors = ms.update(vec![UpdateFallibleSpec { id: "z".to_string(), fail_update: true }], &());
+        let errors = ms.reconcile(vec![UpdateFallibleSpec { id: "z".to_string(), fail_update: true }], &());
         assert_eq!(errors.len(), 1, "one error must be returned on update failure");
         assert_eq!(errors[0].0, "z");
         assert_eq!(errors[0].1, UpdateError("update failed for z".to_string()));
@@ -372,7 +372,7 @@ mod tests {
 
         // Third: next call uses enter (not update)
         EXIT_CALLED.store(false, std::sync::atomic::Ordering::SeqCst);
-        let e3 = ms.update(vec![UpdateFallibleSpec { id: "z".to_string(), fail_update: false }], &());
+        let e3 = ms.reconcile(vec![UpdateFallibleSpec { id: "z".to_string(), fail_update: false }], &());
         assert!(e3.is_empty(), "third call should succeed via enter");
         assert!(ms.get(&"z".to_string()).is_some(), "item should be re-entered on third call");
     }
