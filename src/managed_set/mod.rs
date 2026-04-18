@@ -2,6 +2,9 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 use std::hash::Hash;
 
+pub mod reconcile;
+pub use reconcile::Reconcile;
+
 pub type ReconcileErrors<K, E> = Vec<(K, E)>;
 
 pub trait Lifecycle {
@@ -107,6 +110,17 @@ where
 
     pub fn get_mut(&mut self, key: &T::Key) -> Option<&mut T::State> {
         self.store.get_mut(key)
+    }
+}
+
+impl<T: Lifecycle + 'static> reconcile::Reconcile<T> for ManagedSet<T>
+where
+    T::Error: Debug,
+{
+    fn reconcile(&mut self, desired: Vec<T>, ctx: &T::Context)
+        -> ReconcileErrors<T::Key, T::Error>
+    {
+        ManagedSet::reconcile(self, desired, ctx)
     }
 }
 
