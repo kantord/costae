@@ -46,6 +46,7 @@ pub struct StreamItem {
 pub struct ProcessState {
     pub child: std::process::Child,
     pub event_tx: mpsc::Sender<serde_json::Value>,
+    pub last_sent_props: Option<serde_json::Value>,
 }
 
 fn spawn_process(spec: CommandSpec, tx: &mpsc::Sender<StreamItem>) -> Option<ProcessState> {
@@ -126,24 +127,17 @@ fn spawn_process(spec: CommandSpec, tx: &mpsc::Sender<StreamItem>) -> Option<Pro
     // Wire up a stdin writer thread backed by an mpsc channel.
     let (event_tx, event_rx) = mpsc::channel::<serde_json::Value>();
     if let Some(mut stdin) = child.stdin.take() {
-        let bin_for_log = spec.identity.bin.clone();
         thread::spawn(move || {
             while let Ok(event) = event_rx.recv() {
-                let event_type = event.get("type").or_else(|| event.get("event")).and_then(|v| v.as_str()).unwrap_or("?");
-                if event_type != "init" {
-                    tracing::debug!(bin = %bin_for_log, event_type, "stdin writer: writing event to pipe");
-                }
                 let line = serde_json::to_string(&event).unwrap_or_default() + "\n";
                 if stdin.write_all(line.as_bytes()).is_err() {
-                    tracing::debug!(bin = %bin_for_log, "stdin writer: write_all failed, exiting");
                     break;
                 }
             }
-            tracing::debug!(bin = %bin_for_log, "stdin writer: channel closed, exiting");
         });
     }
 
-    Some(ProcessState { child, event_tx })
+    Some(ProcessState { child, event_tx, last_sent_props: None })
 }
 
 impl Lifecycle for CommandSpec {
@@ -157,9 +151,10 @@ impl Lifecycle for CommandSpec {
 
     fn enter(self, ctx: &Self::Context) -> Option<Self::State> {
         let props = self.props.clone();
-        let state = spawn_process(self, ctx)?;
+        let mut state = spawn_process(self, ctx)?;
         if let Some(p) = props {
-            let _ = state.event_tx.send(p);
+            let _ = state.event_tx.send(p.clone());
+            state.last_sent_props = Some(p);
         }
         Some(state)
     }
@@ -167,11 +162,19 @@ impl Lifecycle for CommandSpec {
     fn update(self, state: &mut Self::State, ctx: &Self::Context) {
         if matches!(state.child.try_wait(), Ok(Some(_))) {
             tracing::warn!(bin = %self.identity.bin, "process exited");
-            if let Some(new_state) = spawn_process(self, ctx) {
+            let props = self.props.clone();
+            if let Some(mut new_state) = spawn_process(self, ctx) {
+                if let Some(p) = props {
+                    let _ = new_state.event_tx.send(p.clone());
+                    new_state.last_sent_props = Some(p);
+                }
                 *state = new_state;
             }
         } else if let Some(p) = self.props.clone() {
-            let _ = state.event_tx.send(p);
+            if state.last_sent_props.as_ref() != Some(&p) {
+                let _ = state.event_tx.send(p.clone());
+                state.last_sent_props = Some(p);
+            }
         }
     }
 
@@ -877,14 +880,21 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(20));
         }
+
+        // Wait an extra 150 ms after the first echo to give the loop time to deliver
+        // any duplicate sends before we stop and count occurrences.
+        thread::sleep(Duration::from_millis(150));
+
         stop.store(true, Ordering::Relaxed);
         let _ = run_handle.join();
 
         let items = collected.lock().unwrap();
-        assert!(
-            items.iter().any(|l| l == &expected_got),
-            "expected echoed update payload {:?}, got: {:?}",
-            expected_got,
+        let count = items.iter().filter(|l| l.as_str() == expected_got).count();
+        assert_eq!(
+            count,
+            1,
+            "expected updated props payload to be sent exactly once, but got {} occurrences: {:?}",
+            count,
             *items
         );
     }
@@ -955,6 +965,87 @@ mod tests {
             items.iter().any(|l| l == &expected_got),
             "expected echoed event payload {:?}, got: {:?}",
             expected_got,
+            *items
+        );
+    }
+
+    /// Claim D — runtime: when a running process receives two consecutive `set_desired`
+    /// calls with IDENTICAL props, the subprocess's stdin should only receive the props
+    /// payload ONCE (deduplication by props value).
+    ///
+    /// The script loops reading lines from stdin and echoes each back prefixed "got:".
+    /// We call `set_desired` twice with the same spec (same props), wait long enough for
+    /// both ticks to fire, then assert the subprocess echoed the payload exactly once.
+    #[test]
+    fn identical_props_sent_only_once_on_consecutive_set_desired() {
+        let props_value = serde_json::json!({"step": 99});
+        let identity = ProcessIdentity {
+            bin: "/bin/sh".to_string(),
+            key: "dedup-props-test".to_string(),
+        };
+
+        let spec = CommandSpec {
+            identity: identity.clone(),
+            args: vec![
+                "-c".to_string(),
+                "while read line; do echo \"got:$line\"; done".to_string(),
+            ],
+            env: BTreeMap::new(),
+            current_dir: None,
+            props: Some(props_value.clone()),
+            script: None,
+        };
+
+        let (mut data_loop, handle) = DataLoop::new();
+        // First set_desired — spawns the process and sends initial props.
+        handle.set_desired(vec![spec.clone()]);
+
+        let collected: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let collected_clone = Arc::clone(&collected);
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_for_run = Arc::clone(&stop);
+
+        let run_handle = thread::spawn(move || {
+            data_loop.run(
+                stop_for_run,
+                |item| {
+                    collected_clone.lock().unwrap().push(item.line);
+                },
+                || {},
+            );
+        });
+
+        // Wait for the first echo to confirm the process is up and reading stdin.
+        let expected_got = format!("got:{}", props_value);
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            if collected.lock().unwrap().iter().any(|l| l == &expected_got) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for first props echo"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        // Second set_desired with IDENTICAL spec/props — should NOT send props again.
+        handle.set_desired(vec![spec.clone()]);
+
+        // Give enough time for at least two tick cycles (2 × 50 ms = 100 ms)
+        // so that if the bug is present the duplicate would have been delivered and echoed.
+        thread::sleep(Duration::from_millis(300));
+
+        stop.store(true, Ordering::Relaxed);
+        let _ = run_handle.join();
+
+        let items = collected.lock().unwrap();
+        let count = items.iter().filter(|l| l.as_str() == expected_got).count();
+        assert_eq!(
+            count,
+            1,
+            "expected props payload to be delivered exactly once, but got {} occurrences: {:?}",
+            count,
             *items
         );
     }
