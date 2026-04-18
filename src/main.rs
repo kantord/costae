@@ -18,7 +18,7 @@ const FREEZE_WATCHDOG_POLL_SECS: u64 = 10;
 const FREEZE_STALE_THRESHOLD_SECS: u64 = 10;
 const FILE_WATCHER_POLL_MS: u64 = 500;
 
-fn log_lifecycle_errors<K: Debug, E: Debug>(errors: Vec<(K, E)>) {
+fn log_lifecycle_errors<K: Debug, E: Debug>(errors: costae::managed_set::ReconcileErrors<K, E>) {
     for (key, err) in errors {
         tracing::error!(key = ?key, error = ?err, "lifecycle error");
     }

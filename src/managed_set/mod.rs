@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 use std::hash::Hash;
 
+pub type ReconcileErrors<K, E> = Vec<(K, E)>;
+
 pub trait Lifecycle {
     type Key: Hash + Eq + Clone;
     type State;
@@ -33,8 +35,8 @@ where
         Self::default()
     }
 
-    pub fn reconcile(&mut self, new_items: Vec<T>, ctx: &T::Context) -> Vec<(T::Key, T::Error)> {
-        let mut errors: Vec<(T::Key, T::Error)> = Vec::new();
+    pub fn reconcile(&mut self, new_items: Vec<T>, ctx: &T::Context) -> ReconcileErrors<T::Key, T::Error> {
+        let mut errors: ReconcileErrors<T::Key, T::Error> = Vec::new();
 
         // Build new_map, deduplicating by key
         let mut new_map: HashMap<T::Key, T> = HashMap::new();
