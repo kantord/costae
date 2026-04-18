@@ -38,7 +38,7 @@ where
         Self::default()
     }
 
-    pub fn reconcile(&mut self, new_items: Vec<T>, ctx: &T::Context) -> ReconcileErrors<T::Key, T::Error> {
+    pub fn reconcile(&mut self, new_items: impl IntoIterator<Item = T>, ctx: &T::Context) -> ReconcileErrors<T::Key, T::Error> {
         let mut errors = ReconcileErrors::new();
         let mut new_map = Self::dedup_by_key(new_items);
         self.exit_removed(&new_map, ctx);
@@ -47,7 +47,7 @@ where
         errors
     }
 
-    fn dedup_by_key(items: Vec<T>) -> HashMap<T::Key, T> {
+    fn dedup_by_key(items: impl IntoIterator<Item = T>) -> HashMap<T::Key, T> {
         let mut map = HashMap::new();
         for item in items {
             map.insert(item.key(), item);
@@ -117,7 +117,7 @@ impl<T: Lifecycle + 'static> reconcile::Reconcile<T> for ManagedSet<T>
 where
     T::Error: Debug,
 {
-    fn reconcile(&mut self, desired: Vec<T>, ctx: &T::Context)
+    fn reconcile(&mut self, desired: impl IntoIterator<Item = T>, ctx: &T::Context)
         -> ReconcileErrors<T::Key, T::Error>
     {
         ManagedSet::reconcile(self, desired, ctx)

@@ -7,7 +7,7 @@ use super::{Lifecycle, ReconcileErrors};
 /// This trait makes the reconciliation algorithm swappable: callers can
 /// program against `impl Reconcile<T>` rather than `ManagedSet<T>` directly.
 pub trait Reconcile<T: Lifecycle> {
-    fn reconcile(&mut self, desired: Vec<T>, ctx: &T::Context)
+    fn reconcile(&mut self, desired: impl IntoIterator<Item = T>, ctx: &T::Context)
         -> ReconcileErrors<T::Key, T::Error>;
 }
 
@@ -68,10 +68,10 @@ mod tests {
         }
 
         impl Reconcile<Item> for RecordingReconciler {
-            fn reconcile(&mut self, desired: Vec<Item>, _ctx: &Ctx)
+            fn reconcile(&mut self, desired: impl IntoIterator<Item = Item>, _ctx: &Ctx)
                 -> ReconcileErrors<&'static str, Infallible>
             {
-                self.calls.push(desired.iter().map(|i| i.id).collect());
+                self.calls.push(desired.into_iter().map(|i| i.id).collect());
                 vec![]
             }
         }
@@ -113,12 +113,10 @@ mod tests {
         use super::fixtures::{make_ctx, log, Item};
         use crate::managed_set::{ManagedSet, Reconcile};
 
-        fn check(setup: Vec<Item>, action: Vec<Item>, expected_log_entry: &str) {
+        fn check<R: Reconcile<Item>>(reconciler: &mut R, setup: Vec<Item>, action: Vec<Item>, expected_log_entry: &str) {
             let ctx = make_ctx();
-            let mut ms: ManagedSet<Item> = ManagedSet::new();
-            let r: &mut dyn Reconcile<Item> = &mut ms;
-            r.reconcile(setup, &ctx);
-            r.reconcile(action, &ctx);
+            reconciler.reconcile(setup, &ctx);
+            reconciler.reconcile(action, &ctx);
             assert!(
                 log(&ctx).iter().any(|e| e == expected_log_entry),
                 "expected {:?} in log, got {:?}", expected_log_entry, log(&ctx)
@@ -127,12 +125,13 @@ mod tests {
 
         #[test]
         fn calls_enter_for_new_item() {
-            check(vec![], vec![Item { id: "a", value: 1 }], "enter:a");
+            check(&mut ManagedSet::new(), vec![], vec![Item { id: "a", value: 1 }], "enter:a");
         }
 
         #[test]
         fn calls_update_for_existing_item() {
             check(
+                &mut ManagedSet::new(),
                 vec![Item { id: "b", value: 1 }],
                 vec![Item { id: "b", value: 2 }],
                 "update:b",
@@ -141,7 +140,7 @@ mod tests {
 
         #[test]
         fn calls_exit_for_removed_item() {
-            check(vec![Item { id: "c", value: 5 }], vec![], "exit");
+            check(&mut ManagedSet::new(), vec![Item { id: "c", value: 5 }], vec![], "exit");
         }
     }
 
