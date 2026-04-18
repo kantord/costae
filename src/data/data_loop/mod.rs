@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
-use crate::managed_set::ManagedSet;
+use crate::managed_set::{ManagedSet, Reconcile};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum StreamKind {

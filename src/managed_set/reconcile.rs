@@ -1,8 +1,9 @@
-use super::{Lifecycle, ReconcileErrors};
+use super::Lifecycle;
 
-/// A reconciler that can apply a desired state from a `Vec<T>` to a managed
-/// store, producing a list of per-key errors for items that failed to enter
-/// or update.
+pub type ReconcileErrors<K, E> = Vec<(K, E)>;
+
+/// A reconciler that can apply a desired state to a managed store, producing
+/// a list of per-key errors for items that failed to enter or update.
 ///
 /// This trait makes the reconciliation algorithm swappable: callers can
 /// program against `impl Reconcile<T>` rather than `ManagedSet<T>` directly.

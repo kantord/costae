@@ -9,7 +9,7 @@ use costae::{RenderCache, inject_root_bg, init_global_ctx, parse_layout, render_
 use costae::data::data_loop::{DataLoop, DataLoopHandle, BuiltInSource, ProcessIdentity, ProcessSource, StreamItem, StreamSource};
 use costae::x11::click::do_hit_test;
 use costae::x11::panel::{sample_root_bg, i3_dpi, PanelContext};
-use costae::managed_set::ManagedSet;
+use costae::managed_set::{ManagedSet, Reconcile};
 use costae::layout::PanelSpec;
 
 type ModuleEventTxs = Arc<std::sync::Mutex<HashMap<String, mpsc::Sender<serde_json::Value>>>>;
