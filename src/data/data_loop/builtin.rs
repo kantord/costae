@@ -21,21 +21,22 @@ impl Lifecycle for BuiltInSource {
     type Key = String;
     type State = BuiltInState;
     type Context = mpsc::Sender<StreamItem>;
+    type Error = std::convert::Infallible;
 
     fn key(&self) -> String {
         self.key.clone()
     }
 
-    fn enter(self, ctx: &Self::Context) -> Option<Self::State> {
+    fn enter(self, ctx: &Self::Context) -> Result<Self::State, Self::Error> {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_clone = Arc::clone(&stop);
         let ctx_clone = ctx.clone();
         let key = self.key.clone();
         let handle = std::thread::spawn(move || (self.func)(ctx_clone, key, stop_clone));
-        Some(BuiltInState { handle, stop })
+        Ok(BuiltInState { handle, stop })
     }
 
-    fn update(self, state: &mut Self::State, ctx: &Self::Context) {
+    fn update(self, state: &mut Self::State, ctx: &Self::Context) -> Result<(), Self::Error> {
         if state.handle.is_finished() {
             let stop = Arc::new(AtomicBool::new(false));
             let stop_clone = Arc::clone(&stop);
@@ -45,6 +46,7 @@ impl Lifecycle for BuiltInSource {
             state.handle = handle;
             state.stop = stop;
         }
+        Ok(())
     }
 
     fn exit(state: Self::State, _ctx: &Self::Context) {
@@ -79,7 +81,7 @@ mod tests {
             func: send_one_item,
         };
 
-        let _state = source.enter(&tx).expect("enter must return Some(state)");
+        let _state = source.enter(&tx).expect("enter must return Ok(state)");
 
         let item = rx.recv_timeout(Duration::from_millis(500))
             .expect("enter must spawn a thread that delivers a StreamItem");
@@ -114,7 +116,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(100));
 
         // update: should detect finished thread and restart it
-        source.update(&mut state, &tx);
+        source.update(&mut state, &tx).expect("update must return Ok");
 
         let item = rx.recv_timeout(Duration::from_millis(500))
             .expect("update must restart the thread and deliver a new StreamItem");

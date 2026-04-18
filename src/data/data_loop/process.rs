@@ -35,7 +35,16 @@ pub struct ProcessState {
     pub last_sent_props: Option<serde_json::Value>,
 }
 
-pub(super) fn spawn_process(spec: ProcessSource, tx: &mpsc::Sender<StreamItem>) -> Option<ProcessState> {
+/// Error type for process spawning failures.
+#[derive(Debug, thiserror::Error)]
+pub enum SpawnError {
+    #[error("memfd_create failed for {bin}")]
+    MemfdCreateFailed { bin: String },
+    #[error("failed to spawn {bin}: {source}")]
+    ProcessSpawnFailed { bin: String, #[source] source: std::io::Error },
+}
+
+pub(super) fn spawn_process(spec: ProcessSource, tx: &mpsc::Sender<StreamItem>) -> Result<ProcessState, SpawnError> {
     let mut cmd = std::process::Command::new(&spec.identity.bin);
     cmd.args(&spec.args);
     for (k, v) in &spec.env {
@@ -50,8 +59,7 @@ pub(super) fn spawn_process(spec: ProcessSource, tx: &mpsc::Sender<StreamItem>) 
     let _memfd_file = if let Some(ref content) = spec.script {
         let fd = unsafe { libc::memfd_create(c"costae-script".as_ptr(), 0) };
         if fd < 0 {
-            tracing::error!(bin = %spec.identity.bin, "memfd_create failed");
-            return None;
+            return Err(SpawnError::MemfdCreateFailed { bin: spec.identity.bin.clone() });
         }
         let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
         let _ = file.write_all(content.as_bytes());
@@ -69,8 +77,7 @@ pub(super) fn spawn_process(spec: ProcessSource, tx: &mpsc::Sender<StreamItem>) 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            tracing::error!(bin = %spec.identity.bin, error = %e, "failed to spawn");
-            return None;
+            return Err(SpawnError::ProcessSpawnFailed { bin: spec.identity.bin.clone(), source: e });
         }
     };
 
@@ -122,45 +129,46 @@ pub(super) fn spawn_process(spec: ProcessSource, tx: &mpsc::Sender<StreamItem>) 
         });
     }
 
-    Some(ProcessState { child, event_tx, last_sent_props: None })
+    Ok(ProcessState { child, event_tx, last_sent_props: None })
 }
 
 impl Lifecycle for ProcessSource {
     type Key = ProcessIdentity;
     type State = ProcessState;
     type Context = mpsc::Sender<StreamItem>;
+    type Error = SpawnError;
 
     fn key(&self) -> ProcessIdentity {
         self.identity.clone()
     }
 
-    fn enter(self, ctx: &Self::Context) -> Option<Self::State> {
+    fn enter(self, ctx: &Self::Context) -> Result<Self::State, Self::Error> {
         let props = self.props.clone();
         let mut state = spawn_process(self, ctx)?;
         if let Some(p) = props {
             let _ = state.event_tx.send(p.clone());
             state.last_sent_props = Some(p);
         }
-        Some(state)
+        Ok(state)
     }
 
-    fn update(self, state: &mut Self::State, ctx: &Self::Context) {
+    fn update(self, state: &mut Self::State, ctx: &Self::Context) -> Result<(), Self::Error> {
         if matches!(state.child.try_wait(), Ok(Some(_))) {
             tracing::warn!(bin = %self.identity.bin, "process exited");
             let props = self.props.clone();
-            if let Some(mut new_state) = spawn_process(self, ctx) {
-                if let Some(p) = props {
-                    let _ = new_state.event_tx.send(p.clone());
-                    new_state.last_sent_props = Some(p);
-                }
-                *state = new_state;
+            let mut new_state = spawn_process(self, ctx)?;
+            if let Some(p) = props {
+                let _ = new_state.event_tx.send(p.clone());
+                new_state.last_sent_props = Some(p);
             }
+            *state = new_state;
         } else if let Some(p) = self.props {
             if state.last_sent_props.as_ref() != Some(&p) {
                 let _ = state.event_tx.send(p.clone());
                 state.last_sent_props = Some(p);
             }
         }
+        Ok(())
     }
 
     fn exit(mut state: Self::State, _ctx: &Self::Context) {
@@ -242,5 +250,102 @@ mod tests {
         };
         let returned: ProcessIdentity = spec.key();
         assert_eq!(returned, id);
+    }
+
+    // ---------------------------------------------------------------------------
+    // Cycle 3: spawn_process memfd_create failure → SpawnError::MemfdCreateFailed
+    // ---------------------------------------------------------------------------
+
+    // We can't easily make memfd_create fail in a unit test without mocking,
+    // but we can test the error type's Display and structure.
+    #[test]
+    fn spawn_error_memfd_create_failed_display() {
+        let err = super::SpawnError::MemfdCreateFailed { bin: "mybin".to_string() };
+        let msg = err.to_string();
+        assert!(msg.contains("memfd_create failed"), "display must mention memfd_create failed, got: {msg}");
+        assert!(msg.contains("mybin"), "display must include the bin name, got: {msg}");
+    }
+
+    // ---------------------------------------------------------------------------
+    // Cycle 4: spawn_process cmd.spawn() failure → SpawnError::ProcessSpawnFailed
+    // ---------------------------------------------------------------------------
+    #[test]
+    fn spawn_process_nonexistent_binary_returns_process_spawn_failed() {
+        use std::sync::mpsc;
+        use super::spawn_process;
+
+        let (tx, _rx) = mpsc::channel();
+        let spec = ProcessSource {
+            identity: ProcessIdentity {
+                bin: "/nonexistent/binary/that/cannot/exist".to_string(),
+                key: "test".to_string(),
+            },
+            script: None,
+            args: vec![],
+            env: BTreeMap::new(),
+            current_dir: None,
+            props: None,
+        };
+
+        let result = spawn_process(spec, &tx);
+        assert!(result.is_err(), "spawn_process must return Err for nonexistent binary");
+        match result {
+            Err(super::SpawnError::ProcessSpawnFailed { bin, .. }) => {
+                assert_eq!(bin, "/nonexistent/binary/that/cannot/exist");
+            }
+            Err(other) => panic!("expected ProcessSpawnFailed, got: {:?}", other),
+            Ok(_) => panic!("expected Err, got Ok"),
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // Cycle 5: ProcessSource::update crash+restart failure → propagates Err
+    // ---------------------------------------------------------------------------
+    #[test]
+    fn process_source_update_spawn_failure_returns_err() {
+        use std::sync::mpsc;
+        use crate::managed_set::Lifecycle;
+
+        let (tx, _rx) = mpsc::channel();
+
+        // Enter with a valid binary that exits immediately
+        let spec_enter = ProcessSource {
+            identity: ProcessIdentity {
+                bin: "/bin/sh".to_string(),
+                key: "cycle5".to_string(),
+            },
+            script: None,
+            args: vec!["-c".to_string(), "exit 0".to_string()],
+            env: BTreeMap::new(),
+            current_dir: None,
+            props: None,
+        };
+        let mut state = spec_enter.enter(&tx).expect("enter must succeed with /bin/sh");
+
+        // Wait for the process to exit
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        // Confirm it exited
+        assert!(matches!(state.child.try_wait(), Ok(Some(_))), "child should have exited");
+
+        // Now update with a spec pointing to a nonexistent binary — spawn must fail
+        let spec_update = ProcessSource {
+            identity: ProcessIdentity {
+                bin: "/nonexistent/binary/that/cannot/exist".to_string(),
+                key: "cycle5".to_string(),
+            },
+            script: None,
+            args: vec![],
+            env: BTreeMap::new(),
+            current_dir: None,
+            props: None,
+        };
+
+        let result = spec_update.update(&mut state, &tx);
+        assert!(result.is_err(), "update must propagate Err when restart spawn fails");
+        match result {
+            Err(super::SpawnError::ProcessSpawnFailed { .. }) => {}
+            Err(other) => panic!("expected ProcessSpawnFailed, got: {:?}", other),
+            Ok(_) => panic!("expected Err, got Ok"),
+        }
     }
 }
