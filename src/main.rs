@@ -14,6 +14,9 @@ use costae::layout::PanelSpec;
 
 type ModuleEventTxs = Arc<std::sync::Mutex<HashMap<String, mpsc::Sender<serde_json::Value>>>>;
 
+const FREEZE_WATCHDOG_POLL_SECS: u64 = 10;
+const FREEZE_STALE_THRESHOLD_SECS: u64 = 10;
+
 fn log_lifecycle_errors<K: Debug, E: Debug>(errors: Vec<(K, E)>) {
     for (key, err) in errors {
         tracing::error!(key = ?key, error = ?err, "lifecycle error");
@@ -237,7 +240,7 @@ fn install_panic_hook(log_path: String) {
 fn spawn_freeze_watchdog(last_tick: Arc<std::sync::atomic::AtomicU64>, log_path: String) {
     thread::spawn(move || {
         loop {
-            thread::sleep(Duration::from_secs(10));
+            thread::sleep(Duration::from_secs(FREEZE_WATCHDOG_POLL_SECS));
             let last = last_tick.load(Ordering::Relaxed);
             if last == 0 { continue; }
             let now = std::time::SystemTime::now()
@@ -245,7 +248,7 @@ fn spawn_freeze_watchdog(last_tick: Arc<std::sync::atomic::AtomicU64>, log_path:
                 .unwrap_or_default()
                 .as_secs();
             let stale = now.saturating_sub(last);
-            if stale > 10 {
+            if stale > FREEZE_STALE_THRESHOLD_SECS {
                 let msg = format!("FREEZE: main loop stalled for {stale}s");
                 tracing::error!("{msg}");
                 if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
