@@ -46,6 +46,8 @@ impl RenderCache {
         }
     }
 
+    /// Returns a cached render if `key` matches a prior call (by canonical JSON form),
+    /// otherwise invokes `render`, caches the result, and returns it.
     pub fn get_or_render<F>(&mut self, key: &serde_json::Value, render: F) -> Arc<Vec<u8>>
     where
         F: FnOnce() -> Vec<u8>,
@@ -100,18 +102,17 @@ fn load_fonts_impl(global: &mut GlobalContext) {
         std::path::PathBuf::from(&dot_fonts),
     ];
 
-    let dir_refs: Vec<&std::path::Path> = candidate_dirs.iter().map(|p| p.as_path()).collect();
-    for path in find_font_files(&dir_refs) {
+    for path in find_font_files(&candidate_dirs) {
         if let Ok(bytes) = std::fs::read(&path) {
             let _ = global.font_context.load_and_store(FontResource::new(bytes));
         }
     }
 }
 
-pub fn find_font_files(dirs: &[&std::path::Path]) -> Vec<std::path::PathBuf> {
+pub fn find_font_files<P: AsRef<std::path::Path>>(dirs: &[P]) -> Vec<std::path::PathBuf> {
     let mut results = Vec::new();
-    for &dir in dirs {
-        let Ok(read_dir) = std::fs::read_dir(dir) else { continue; };
+    for dir in dirs {
+        let Ok(read_dir) = std::fs::read_dir(dir.as_ref()) else { continue; };
         for entry in read_dir.flatten() {
             let path = entry.path();
             if !path.is_file() {
@@ -145,7 +146,7 @@ mod tests {
 
     #[test]
     fn empty_dirs_slice_returns_empty_vec() {
-        let result = find_font_files(&[]);
+        let result = find_font_files::<&std::path::Path>(&[]);
         assert!(result.is_empty());
     }
 
