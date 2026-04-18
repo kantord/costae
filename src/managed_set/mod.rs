@@ -36,18 +36,24 @@ where
     }
 
     pub fn reconcile(&mut self, new_items: Vec<T>, ctx: &T::Context) -> ReconcileErrors<T::Key, T::Error> {
-        let mut errors: ReconcileErrors<T::Key, T::Error> = Vec::new();
+        let mut errors = ReconcileErrors::new();
+        let mut new_map = Self::dedup_by_key(new_items);
+        self.exit_removed(&new_map, ctx);
+        self.update_existing(&mut new_map, ctx, &mut errors);
+        self.enter_new(new_map, ctx, &mut errors);
+        errors
+    }
 
-        // Build new_map, deduplicating by key
-        let mut new_map: HashMap<T::Key, T> = HashMap::new();
-        for item in new_items {
-            new_map.insert(item.key(), item);
+    fn dedup_by_key(items: Vec<T>) -> HashMap<T::Key, T> {
+        let mut map = HashMap::new();
+        for item in items {
+            map.insert(item.key(), item);
         }
+        map
+    }
 
-        // Exit: keys in store but not in new_map
-        let exit_keys: Vec<T::Key> = self
-            .store
-            .keys()
+    fn exit_removed(&mut self, new_map: &HashMap<T::Key, T>, ctx: &T::Context) {
+        let exit_keys: Vec<T::Key> = self.store.keys()
             .filter(|k| !new_map.contains_key(*k))
             .cloned()
             .collect();
@@ -55,45 +61,36 @@ where
             let state = self.store.remove(&key).unwrap();
             T::exit(state, ctx);
         }
+    }
 
-        // Enter or update
-        // Collect keys to update vs enter to avoid borrow conflicts
+    fn update_existing(&mut self, new_map: &mut HashMap<T::Key, T>, ctx: &T::Context, errors: &mut ReconcileErrors<T::Key, T::Error>) {
         let update_keys: Vec<T::Key> = new_map.keys()
             .filter(|k| self.store.contains_key(*k))
             .cloned()
             .collect();
+        for key in update_keys {
+            let item = new_map.remove(&key).unwrap();
+            let state = self.store.get_mut(&key).unwrap();
+            if let Err(e) = item.update(state, ctx) {
+                let old_state = self.store.remove(&key).unwrap();
+                T::exit(old_state, ctx);
+                errors.push((key, e));
+            }
+        }
+    }
+
+    fn enter_new(&mut self, mut new_map: HashMap<T::Key, T>, ctx: &T::Context, errors: &mut ReconcileErrors<T::Key, T::Error>) {
         let enter_keys: Vec<T::Key> = new_map.keys()
             .filter(|k| !self.store.contains_key(*k))
             .cloned()
             .collect();
-
-        for key in update_keys {
-            let item = new_map.remove(&key).unwrap();
-            let state = self.store.get_mut(&key).unwrap();
-            match item.update(state, ctx) {
-                Ok(()) => {}
-                Err(e) => {
-                    // On update Err: call exit on old state, remove from store, collect error
-                    let old_state = self.store.remove(&key).unwrap();
-                    T::exit(old_state, ctx);
-                    errors.push((key, e));
-                }
-            }
-        }
-
         for key in enter_keys {
             let item = new_map.remove(&key).unwrap();
             match item.enter(ctx) {
-                Ok(state) => {
-                    self.store.insert(key, state);
-                }
-                Err(e) => {
-                    errors.push((key, e));
-                }
+                Ok(state) => { self.store.insert(key, state); }
+                Err(e) => { errors.push((key, e)); }
             }
         }
-
-        errors
     }
 
     pub fn get(&self, key: &T::Key) -> Option<&T::State> {
