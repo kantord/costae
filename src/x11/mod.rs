@@ -93,4 +93,6 @@ pub fn solid_color_rgba(pixel: u32, width: u32, height: u32) -> Vec<u8> {
     rgba
 }
 
+pub mod click;
+pub mod outputs;
 pub mod panel;

@@ -1,105 +1,12 @@
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
+mod model;
+mod server;
+
 use std::time::Duration;
-
 use tokio::sync::mpsc;
-use zbus::interface;
-use zbus::zvariant::OwnedValue;
 
-// ── Notification model ────────────────────────────────────────────────────────
-
-#[derive(serde::Serialize, Clone)]
-struct Notification {
-    id: u32,
-    app_name: String,
-    summary: String,
-    body: String,
-    /// 0=low 1=normal 2=critical
-    urgency: u8,
-    enwiro_env: Option<String>,
-}
-
-// ── Events flowing into the main state loop ───────────────────────────────────
-
-enum Event {
-    Add(Notification, i32 /* expire_timeout from spec */),
-    Remove(u32),
-}
-
-// ── D-Bus notification server ─────────────────────────────────────────────────
-
-struct NotifyServer {
-    tx: mpsc::UnboundedSender<Event>,
-    next_id: AtomicU32,
-}
-
-#[interface(name = "org.freedesktop.Notifications")]
-impl NotifyServer {
-    async fn notify(
-        &self,
-        app_name: &str,
-        replaces_id: u32,
-        _app_icon: &str,
-        summary: &str,
-        body: &str,
-        _actions: Vec<String>,
-        hints: HashMap<String, OwnedValue>,
-        expire_timeout: i32,
-        #[zbus(header)] header: zbus::message::Header<'_>,
-        #[zbus(connection)] connection: &zbus::Connection,
-    ) -> u32 {
-        let id = if replaces_id == 0 {
-            self.next_id.fetch_add(1, Ordering::Relaxed)
-        } else {
-            replaces_id
-        };
-
-        let urgency = hints
-            .get("urgency")
-            .and_then(|v| u8::try_from(v.clone()).ok())
-            .unwrap_or(1);
-
-        let enwiro_env = async {
-            let sender = header.sender()?;
-            let dbus = zbus::fdo::DBusProxy::new(connection).await.ok()?;
-            let pid = dbus.get_connection_unix_process_id(zbus::names::BusName::Unique(sender.clone())).await.ok()?;
-            read_enwiro_env(pid)
-        }.await;
-
-        let _ = self.tx.send(Event::Add(
-            Notification {
-                id,
-                app_name: app_name.to_string(),
-                summary: summary.to_string(),
-                body: body.to_string(),
-                urgency,
-                enwiro_env,
-            },
-            expire_timeout,
-        ));
-
-        id
-    }
-
-    async fn close_notification(&self, id: u32) {
-        let _ = self.tx.send(Event::Remove(id));
-    }
-
-    async fn get_capabilities(&self) -> Vec<String> {
-        vec!["body".to_string()]
-    }
-
-    async fn get_server_information(&self) -> (String, String, String, String) {
-        (
-            "costae-notify".to_string(),
-            "costae".to_string(),
-            "0.1.0".to_string(),
-            "1.3".to_string(),
-        )
-    }
-}
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
+use model::{Event, Notification};
+use server::NotifyServer;
+use std::sync::atomic::AtomicU32;
 
 fn emit(notifications: &[Notification]) {
     if let Ok(json) = serde_json::to_string(&serde_json::json!({ "notifications": notifications })) {
@@ -112,40 +19,6 @@ fn expire_ms(timeout: i32) -> Option<u64> {
         0 => None,            // never
         -1 => Some(5_000),    // server default: 5 s
         ms => Some(ms as u64),
-    }
-}
-
-fn read_enwiro_env(pid: u32) -> Option<String> {
-    let path = format!("/proc/{}/environ", pid);
-    let data = std::fs::read(path).ok()?;
-    parse_enwiro_env(&data)
-}
-
-fn parse_enwiro_env(environ: &[u8]) -> Option<String> {
-    environ
-        .split(|&b| b == b'\0')
-        .filter_map(|entry| entry.strip_prefix(b"ENWIRO_ENV="))
-        .next()
-        .and_then(|val| std::str::from_utf8(val).ok())
-        .map(|s| s.to_string())
-}
-
-// ── Entry point ───────────────────────────────────────────────────────────────
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parse_enwiro_env_extracts_value() {
-        let environ = b"HOME=/home/user\0ENWIRO_ENV=liro\0PATH=/usr/bin\0";
-        assert_eq!(parse_enwiro_env(environ), Some("liro".to_string()));
-    }
-
-    #[test]
-    fn parse_enwiro_env_returns_none_when_absent() {
-        let environ = b"HOME=/home/user\0PATH=/usr/bin\0";
-        assert_eq!(parse_enwiro_env(environ), None);
     }
 }
 

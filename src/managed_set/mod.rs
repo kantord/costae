@@ -16,11 +16,15 @@ pub struct ManagedSet<T: Lifecycle> {
     store: HashMap<T::Key, T::State>,
 }
 
+impl<T: Lifecycle> Default for ManagedSet<T> {
+    fn default() -> Self {
+        Self { store: HashMap::new() }
+    }
+}
+
 impl<T: Lifecycle> ManagedSet<T> {
     pub fn new() -> Self {
-        Self {
-            store: HashMap::new(),
-        }
+        Self::default()
     }
 
     pub fn update(&mut self, new_items: Vec<T>, ctx: &T::Context) {

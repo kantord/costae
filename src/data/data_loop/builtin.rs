@@ -1,0 +1,161 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
+use std::thread::JoinHandle;
+
+use crate::managed_set::Lifecycle;
+
+use super::StreamItem;
+
+pub struct BuiltInState {
+    pub handle: JoinHandle<()>,
+    pub stop: Arc<AtomicBool>,
+}
+
+#[derive(Clone)]
+pub struct BuiltInSource {
+    pub key: String,
+    pub func: fn(mpsc::Sender<StreamItem>, String, Arc<AtomicBool>),
+}
+
+impl Lifecycle for BuiltInSource {
+    type Key = String;
+    type State = BuiltInState;
+    type Context = mpsc::Sender<StreamItem>;
+
+    fn key(&self) -> String {
+        self.key.clone()
+    }
+
+    fn enter(self, ctx: &Self::Context) -> Option<Self::State> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_clone = Arc::clone(&stop);
+        let ctx_clone = ctx.clone();
+        let key = self.key.clone();
+        let handle = std::thread::spawn(move || (self.func)(ctx_clone, key, stop_clone));
+        Some(BuiltInState { handle, stop })
+    }
+
+    fn update(self, state: &mut Self::State, ctx: &Self::Context) {
+        if state.handle.is_finished() {
+            let stop = Arc::new(AtomicBool::new(false));
+            let stop_clone = Arc::clone(&stop);
+            let ctx_clone = ctx.clone();
+            let key = self.key.clone();
+            let handle = std::thread::spawn(move || (self.func)(ctx_clone, key, stop_clone));
+            state.handle = handle;
+            state.stop = stop;
+        }
+    }
+
+    fn exit(state: Self::State, _ctx: &Self::Context) {
+        state.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data::data_loop::StreamKind;
+    use std::sync::atomic::Ordering;
+    use std::sync::{mpsc, Arc};
+    use std::time::Duration;
+
+    /// Test helper: sends exactly one StreamItem then returns.
+    fn send_one_item(tx: mpsc::Sender<StreamItem>, key: String, _stop: Arc<AtomicBool>) {
+        let _ = tx.send(StreamItem {
+            key: (key, None),
+            stream: StreamKind::Stdout,
+            line: "hello-from-builtin".to_string(),
+        });
+    }
+
+    // Claim 1: `enter` spawns a thread; a function that sends one StreamItem then exits
+    // should deliver that item to the receiver.
+    #[test]
+    fn enter_spawns_thread_and_delivers_item() {
+        let (tx, rx) = mpsc::channel::<StreamItem>();
+        let source = BuiltInSource {
+            key: "test-source".to_string(),
+            func: send_one_item,
+        };
+
+        let _state = source.enter(&tx).expect("enter must return Some(state)");
+
+        let item = rx.recv_timeout(Duration::from_millis(500))
+            .expect("enter must spawn a thread that delivers a StreamItem");
+        assert_eq!(
+            item.key.0, "test-source",
+            "StreamItem key must match the source key"
+        );
+        assert_eq!(
+            item.line, "hello-from-builtin",
+            "StreamItem line must match what the helper function sent"
+        );
+    }
+
+    // Claim 2: `update` restarts a finished thread; after the thread from `enter` exits
+    // naturally, calling `update` should spawn a fresh thread that delivers another item.
+    #[test]
+    fn update_restarts_finished_thread() {
+        let (tx, rx) = mpsc::channel::<StreamItem>();
+        let source = BuiltInSource {
+            key: "restart-source".to_string(),
+            func: send_one_item,
+        };
+
+        // enter: thread runs, sends item, then finishes
+        let mut state = source.clone().enter(&tx).expect("enter must succeed");
+
+        // drain the first item
+        let _ = rx.recv_timeout(Duration::from_millis(500))
+            .expect("first item must arrive after enter");
+
+        // wait for the thread to finish naturally
+        std::thread::sleep(Duration::from_millis(100));
+
+        // update: should detect finished thread and restart it
+        source.update(&mut state, &tx);
+
+        let item = rx.recv_timeout(Duration::from_millis(500))
+            .expect("update must restart the thread and deliver a new StreamItem");
+        assert_eq!(
+            item.key.0, "restart-source",
+            "restarted thread must use the source key"
+        );
+        assert_eq!(
+            item.line, "hello-from-builtin",
+            "restarted thread must deliver the expected line"
+        );
+    }
+
+    // Claim 3: `exit` sets the stop flag; calling `exit` on the state should set the
+    // `stop` AtomicBool to true.
+    #[test]
+    fn exit_sets_stop_flag() {
+        let (tx, rx) = mpsc::channel::<StreamItem>();
+        let source = BuiltInSource {
+            key: "exit-source".to_string(),
+            func: send_one_item,
+        };
+
+        let state = source.enter(&tx).expect("enter must succeed");
+
+        // drain item so the channel doesn't block anything
+        let _ = rx.recv_timeout(Duration::from_millis(500));
+
+        // capture the stop Arc before handing state to exit
+        let stop_clone = Arc::clone(&state.stop);
+
+        assert!(
+            !stop_clone.load(Ordering::Relaxed),
+            "stop flag must be false before exit"
+        );
+
+        BuiltInSource::exit(state, &tx);
+
+        assert!(
+            stop_clone.load(Ordering::Relaxed),
+            "exit must set the stop AtomicBool to true"
+        );
+    }
+}

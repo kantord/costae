@@ -1,8 +1,6 @@
 use std::collections::HashMap;
-use std::sync::{Arc, mpsc};
+use std::sync::Arc;
 
-use takumi::layout::Viewport;
-use takumi::rendering::{RenderOptions, measure_layout};
 use x11rb::{
     connection::Connection,
     protocol::xproto::*,
@@ -13,8 +11,6 @@ use x11rb::{
 use crate::layout::{PanelSpec, PanelAnchor};
 use crate::managed_set::Lifecycle;
 use crate::render::{RenderCache, render_frame, preload_layout_images, init_global_ctx};
-use crate::modules::hit_test;
-use crate::layout::parse_layout;
 use crate::x11::{x11_bgrx_to_rgba, inject_root_bg, solid_color_rgba, strut_partial_values_for_anchor};
 
 /// A live X11 panel window, created from a `PanelSpec` at runtime.
@@ -119,88 +115,6 @@ pub fn i3_dpi(conn: &RustConnection, root: Window, screen: &Screen) -> f32 {
     96.0
 }
 
-fn dispatch_click(
-    module_event_txs: &HashMap<String, mpsc::Sender<serde_json::Value>>,
-    hit_path: &str,
-    on_click: &serde_json::Value,
-) {
-    if let Some(channel) = on_click.get("__channel__").and_then(|v| v.as_str()) {
-        if let Some(tx) = module_event_txs.get(channel) {
-            let mut payload = on_click.clone();
-            if let Some(obj) = payload.as_object_mut() { obj.remove("__channel__"); }
-            let result = tx.send(serde_json::json!({"event": "click", "data": payload}));
-            tracing::debug!(channel, ok = result.is_ok(), "click dispatched via __channel__");
-        } else {
-            tracing::debug!(channel, known_channels = ?module_event_txs.keys().collect::<Vec<_>>(), "click __channel__ not found");
-        }
-        return;
-    }
-    let mut path = hit_path.to_string();
-    loop {
-        if let Some(tx) = module_event_txs.get(&path) {
-            let _ = tx.send(serde_json::json!({"event": "click", "data": on_click}));
-            tracing::debug!(path, "click dispatched via path");
-            return;
-        }
-        match path.rfind('/') {
-            Some(pos) => path.truncate(pos),
-            None => {
-                tracing::debug!(hit_path, "click: no channel matched");
-                return;
-            }
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn do_hit_test(
-    raw_layout: &Option<serde_json::Value>,
-    module_event_txs: &HashMap<String, mpsc::Sender<serde_json::Value>>,
-    phys_width: u32,
-    phys_height: u32,
-    dpr: f32,
-    click_x: f32,
-    click_y: f32,
-) {
-    use crate::render::with_global_ctx;
-    let layout_json = match raw_layout {
-        Some(l) => l,
-        None => return,
-    };
-    let node = match raw_layout.as_ref().and_then(|layout| {
-        parse_layout(layout)
-            .map_err(|e| tracing::error!(error = %e, "layout parse error"))
-            .ok()
-    }) {
-        Some(n) => n,
-        None => return,
-    };
-
-    let measured = with_global_ctx(|global| {
-        let options = RenderOptions::builder()
-            .global(global)
-            .viewport(Viewport::new((Some(phys_width), Some(phys_height))).with_device_pixel_ratio(dpr))
-            .node(node)
-            .build();
-        measure_layout(options).ok()
-    });
-    let measured = match measured {
-        Some(m) => m,
-        None => return,
-    };
-
-    tracing::debug!(click_x, click_y, phys_width, phys_height, "hit test");
-    let (hit_path, on_click) = match hit_test(&measured, layout_json, click_x, click_y) {
-        Some(r) => r,
-        None => {
-            tracing::debug!(click_x, click_y, "hit test: no clickable node found");
-            return;
-        }
-    };
-
-    dispatch_click(module_event_txs, &hit_path, &on_click);
-}
-
 fn create_panel(
     spec: &PanelSpec,
     ctx: &PanelContext,
@@ -213,10 +127,9 @@ fn create_panel(
         .unwrap_or((ctx.mon_x, ctx.mon_y, ctx.mon_width, ctx.mon_height));
 
     let (win_x, win_y) = match &spec.anchor {
-        Some(PanelAnchor::Left)  => (mon_x, mon_y),
+        Some(PanelAnchor::Left) | Some(PanelAnchor::Top) => (mon_x, mon_y),
         Some(PanelAnchor::Right) => (mon_x + mon_width as i16 - phys_width as i16, mon_y),
-        Some(PanelAnchor::Top)   => (mon_x, mon_y),
-        Some(PanelAnchor::Bottom)=> (mon_x, mon_y + mon_height as i16 - phys_height as i16),
+        Some(PanelAnchor::Bottom) => (mon_x, mon_y + mon_height as i16 - phys_height as i16),
         None => (
             mon_x + (spec.x as f32 * ctx.dpr).round() as i16,
             mon_y + (spec.y as f32 * ctx.dpr).round() as i16,
@@ -281,9 +194,6 @@ fn create_panel(
     })
 }
 
-// ---------------------------------------------------------------------------
-// PanelContext: owned, Arc-wrapped X11 context for use with ManagedSet/Lifecycle.
-// ---------------------------------------------------------------------------
 pub struct PanelContext {
     pub conn: Arc<RustConnection>,
     pub root: u32,
@@ -370,9 +280,8 @@ fn _check_panel_context_fields(ctx: PanelContext) {
 
 #[cfg(test)]
 mod tests {
-    use super::dispatch_click;
     use std::collections::HashMap;
-    use std::sync::{Arc, mpsc};
+    use std::sync::Arc;
 
     // ---------------------------------------------------------------------------
     // X11 Lifecycle helpers (Claim A / B / C)
@@ -548,85 +457,6 @@ mod tests {
 
         // Cleanup
         <crate::layout::PanelSpec as Lifecycle>::exit(panel, &ctx);
-    }
-
-    /// Helper: build a map of one named channel and return the sender + receiver pair.
-    fn make_txs(names: &[&str]) -> (HashMap<String, mpsc::Sender<serde_json::Value>>, Vec<mpsc::Receiver<serde_json::Value>>) {
-        let mut txs = HashMap::new();
-        let mut rxs = Vec::new();
-        for &name in names {
-            let (tx, rx) = mpsc::channel();
-            txs.insert(name.to_string(), tx);
-            rxs.push(rx);
-        }
-        (txs, rxs)
-    }
-
-    // Test 1: `__channel__` key routes to the named channel (not the path).
-    #[test]
-    fn channel_key_routes_to_named_channel_not_path() {
-        let (txs, rxs) = make_txs(&["my-module", "some/path/module"]);
-        let on_click = serde_json::json!({
-            "__channel__": "my-module",
-            "action": "do-thing"
-        });
-        dispatch_click(&txs, "some/path/module", &on_click);
-        // The named channel should have received a message.
-        assert!(rxs[0].try_recv().is_ok(), "named channel should receive a message");
-        // The path-matching channel should NOT have received anything.
-        assert!(rxs[1].try_recv().is_err(), "path channel should NOT receive a message");
-    }
-
-    // Test 2: `__channel__` is stripped from the payload before sending.
-    #[test]
-    fn channel_key_is_stripped_from_payload() {
-        let (txs, rxs) = make_txs(&["my-module"]);
-        let on_click = serde_json::json!({
-            "__channel__": "my-module",
-            "action": "do-thing"
-        });
-        dispatch_click(&txs, "irrelevant/path", &on_click);
-        let msg = rxs[0].try_recv().expect("should receive a message");
-        // The data field should NOT contain __channel__.
-        let data = &msg["data"];
-        assert!(data.get("__channel__").is_none(), "__channel__ should be stripped from data");
-        // But other fields should still be present.
-        assert_eq!(data["action"], "do-thing");
-    }
-
-    // Test 3: Unknown `__channel__` sends nothing (no channel match).
-    #[test]
-    fn unknown_channel_key_sends_nothing() {
-        let (txs, rxs) = make_txs(&["known-module"]);
-        let on_click = serde_json::json!({
-            "__channel__": "unknown-module",
-            "action": "do-thing"
-        });
-        dispatch_click(&txs, "known-module", &on_click);
-        // Even though path matches, __channel__ takes priority and the named channel doesn't exist.
-        assert!(rxs[0].try_recv().is_err(), "no message should be sent when __channel__ is unknown");
-    }
-
-    // Test 4: No `__channel__`: walks path to find nearest parent channel.
-    #[test]
-    fn no_channel_key_walks_path_to_find_sender() {
-        // Register "some/path" (a parent of "some/path/module").
-        let (txs, rxs) = make_txs(&["some/path"]);
-        let on_click = serde_json::json!({"action": "click"});
-        dispatch_click(&txs, "some/path/module", &on_click);
-        // "some/path/module" not found → try "some/path" → found.
-        let msg = rxs[0].try_recv().expect("parent path should receive a message");
-        assert_eq!(msg["event"], "click");
-        assert_eq!(msg["data"]["action"], "click");
-    }
-
-    // Test 5: No `__channel__` and no path match: sends nothing.
-    #[test]
-    fn no_channel_key_and_no_path_match_sends_nothing() {
-        let (txs, rxs) = make_txs(&["unrelated-module"]);
-        let on_click = serde_json::json!({"action": "click"});
-        dispatch_click(&txs, "some/path/module", &on_click);
-        assert!(rxs[0].try_recv().is_err(), "no message should be sent when no path matches");
     }
 
     // ---------------------------------------------------------------------------
