@@ -12,6 +12,8 @@ use costae::x11::panel::{sample_root_bg, i3_dpi, PanelContext};
 use costae::managed_set::ManagedSet;
 use costae::layout::PanelSpec;
 
+type ModuleEventTxs = Arc<std::sync::Mutex<HashMap<String, mpsc::Sender<serde_json::Value>>>>;
+
 fn log_lifecycle_errors<K: Debug, E: Debug>(errors: Vec<(K, E)>) {
     for (key, err) in errors {
         tracing::error!(key = ?key, error = ?err, "lifecycle error");
@@ -390,8 +392,6 @@ fn make_mod_init_value(
         "screen_height": screen_height_logical,
     })
 }
-
-type ModuleEventTxs = Arc<std::sync::Mutex<HashMap<String, mpsc::Sender<serde_json::Value>>>>;
 
 struct TickReceivers {
     item_rx: mpsc::Receiver<((String, Option<String>), String)>,
