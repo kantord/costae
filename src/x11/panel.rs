@@ -215,35 +215,34 @@ impl Lifecycle for PanelSpec {
     type Key = String;
     type State = Panel;
     type Context = PanelContext;
+    /// Explicitly temporary — a concrete PanelError enum is a separate future task.
+    type Error = Box<dyn std::error::Error>;
 
     fn key(&self) -> String {
         self.id.clone()
     }
 
-    fn enter(self, ctx: &Self::Context) -> Option<Self::State> {
+    fn enter(self, ctx: &Self::Context) -> Result<Self::State, Self::Error> {
         init_global_ctx();
-        match create_panel(&self, ctx) {
-            Ok(mut panel) => {
-                tracing::info!(panel = %self.id, "panel created");
-                if !self.content.is_null() {
-                    preload_layout_images(&self.content);
-                    panel.raw_layout = Some(self.content);
-                }
-                Some(panel)
-            }
-            Err(e) => {
-                tracing::error!(panel = %self.id, error = %e, "panel create failed");
-                None
-            }
+        let mut panel = create_panel(&self, ctx).map_err(|e| {
+            tracing::error!(panel = %self.id, error = %e, "panel create failed");
+            e
+        })?;
+        tracing::info!(panel = %self.id, "panel created");
+        if !self.content.is_null() {
+            preload_layout_images(&self.content);
+            panel.raw_layout = Some(self.content);
         }
+        Ok(panel)
     }
 
-    fn update(self, state: &mut Self::State, _ctx: &Self::Context) {
+    fn update(self, state: &mut Self::State, _ctx: &Self::Context) -> Result<(), Self::Error> {
         if !self.content.is_null() {
             preload_layout_images(&self.content);
             state.raw_layout = Some(self.content);
             state.render_cache = RenderCache::new(30);
         }
+        Ok(())
     }
 
     fn exit(state: Self::State, ctx: &Self::Context) {
@@ -363,10 +362,9 @@ mod tests {
         };
 
         let spec = make_spec("test-enter", 200, 30);
-        let panel = <crate::layout::PanelSpec as Lifecycle>::enter(spec, &ctx);
+        let panel = <crate::layout::PanelSpec as Lifecycle>::enter(spec, &ctx)
+            .expect("enter should succeed when X11 is available");
 
-        assert!(panel.is_some(), "enter should return Some(panel) when X11 is available");
-        let panel = panel.unwrap();
         assert!(panel.phys_width > 0, "phys_width must be > 0");
         assert!(panel.phys_height > 0, "phys_height must be > 0");
 
@@ -447,7 +445,8 @@ mod tests {
             content: new_content.clone(),
         };
 
-        <crate::layout::PanelSpec as Lifecycle>::update(new_spec, &mut panel, &ctx);
+        <crate::layout::PanelSpec as Lifecycle>::update(new_spec, &mut panel, &ctx)
+            .expect("update must succeed");
 
         assert_eq!(
             panel.raw_layout,

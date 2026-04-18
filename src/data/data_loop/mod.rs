@@ -2,9 +2,10 @@ mod builtin;
 mod process;
 
 pub use builtin::{BuiltInSource, BuiltInState};
-pub use process::{ProcessIdentity, ProcessSource, ProcessState};
+pub use process::{ProcessIdentity, ProcessSource, ProcessState, SpawnError};
 
 use std::collections::HashMap;
+use std::fmt::Debug;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
@@ -27,6 +28,12 @@ pub struct StreamItem {
 pub enum StreamSource {
     Process(ProcessSource),
     BuiltIn(BuiltInSource),
+}
+
+fn log_lifecycle_errors<K: Debug, E: Debug>(errors: Vec<(K, E)>) {
+    for (key, err) in errors {
+        tracing::error!(key = ?key, error = ?err, "lifecycle error");
+    }
 }
 
 pub struct DataLoopHandle {
@@ -101,7 +108,8 @@ impl DataLoop {
         while let Ok(sources) = self.desired_rx.try_recv() {
             self.set_desired(sources);
         }
-        self.process_pool.update(self.desired_processes.clone(), &self.stream_tx);
+        let errors = self.process_pool.update(self.desired_processes.clone(), &self.stream_tx);
+        log_lifecycle_errors(errors);
         if let Some(state) = self.process_pool.get(identity) {
             let _ = state.event_tx.send(event);
         }
@@ -122,8 +130,10 @@ impl DataLoop {
             .filter(|s| seen.insert(s.identity.clone()))
             .collect();
         self.desired_builtins = builtins;
-        self.process_pool.update(self.desired_processes.clone(), &self.stream_tx);
-        self.builtin_pool.update(self.desired_builtins.clone(), &self.stream_tx);
+        let proc_errors = self.process_pool.update(self.desired_processes.clone(), &self.stream_tx);
+        log_lifecycle_errors(proc_errors);
+        let builtin_errors = self.builtin_pool.update(self.desired_builtins.clone(), &self.stream_tx);
+        log_lifecycle_errors(builtin_errors);
         self.update_event_txs_snapshot();
     }
 
@@ -165,8 +175,10 @@ impl DataLoop {
             }
 
             // Reconcile: enter new, exit removed, update existing (restarts crashed processes).
-            self.process_pool.update(self.desired_processes.clone(), &self.stream_tx);
-            self.builtin_pool.update(self.desired_builtins.clone(), &self.stream_tx);
+            let proc_errors = self.process_pool.update(self.desired_processes.clone(), &self.stream_tx);
+            log_lifecycle_errors(proc_errors);
+            let builtin_errors = self.builtin_pool.update(self.desired_builtins.clone(), &self.stream_tx);
+            log_lifecycle_errors(builtin_errors);
             self.update_event_txs_snapshot();
 
             on_tick();

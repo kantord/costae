@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fmt::Debug;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread;
@@ -10,6 +11,12 @@ use costae::x11::click::do_hit_test;
 use costae::x11::panel::{sample_root_bg, i3_dpi, PanelContext};
 use costae::managed_set::ManagedSet;
 use costae::layout::PanelSpec;
+
+fn log_lifecycle_errors<K: Debug, E: Debug>(errors: Vec<(K, E)>) {
+    for (key, err) in errors {
+        tracing::error!(key = ?key, error = ?err, "lifecycle error");
+    }
+}
 use x11rb::{
     connection::Connection,
     protocol::{randr::ConnectionExt as RandrExt, xproto::*},
@@ -106,7 +113,8 @@ fn apply_eval_result(
     let combined: Vec<StreamSource> = stream_specs.into_iter().chain(module_specs).collect();
     handle.set_desired(combined);
 
-    panel_set.update(specs, panel_ctx);
+    let panel_errors = panel_set.update(specs, panel_ctx);
+    log_lifecycle_errors(panel_errors);
     true
 }
 
@@ -559,7 +567,8 @@ impl TickState {
 
 impl Drop for TickState {
     fn drop(&mut self) {
-        self.panel_set.update(vec![], &self.panel_ctx);
+        let panel_errors = self.panel_set.update(vec![], &self.panel_ctx);
+        log_lifecycle_errors(panel_errors);
         let _ = self.conn.flush();
     }
 }
