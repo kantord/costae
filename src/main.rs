@@ -6,7 +6,8 @@ use std::time::Duration;
 
 use costae::{RenderCache, inject_root_bg, init_global_ctx, parse_layout, render_frame};
 use costae::data::data_loop::{DataLoop, DataLoopHandle, InternalSource, ProcessIdentity, ProcessSource, StreamItem, StreamSource};
-use costae::x11::panel::{sample_root_bg, i3_dpi, do_hit_test, PanelContext};
+use costae::x11::click::do_hit_test;
+use costae::x11::panel::{sample_root_bg, i3_dpi, PanelContext};
 use costae::managed_set::ManagedSet;
 use costae::layout::PanelSpec;
 use x11rb::{
