@@ -9,6 +9,10 @@ use x11rb::{
 };
 
 use crate::layout::{PanelSpec, PanelAnchor};
+
+const XRESOURCES_PROP_MAX_LEN: u32 = 65536;
+const MM_PER_INCH: f32 = 25.4;
+const FALLBACK_DPI: f32 = 96.0;
 use crate::managed_set::Lifecycle;
 use crate::render::{RenderCache, render_frame, preload_layout_images, init_global_ctx};
 use crate::x11::{x11_bgrx_to_rgba, inject_root_bg, solid_color_rgba, strut_partial_values_for_anchor};
@@ -90,7 +94,7 @@ pub fn i3_dpi(conn: &RustConnection, root: Window, screen: &Screen) -> f32 {
     let from_xresources = (|| -> Option<f32> {
         let atom = conn.intern_atom(false, b"RESOURCE_MANAGER").ok()?.reply().ok()?.atom;
         let prop = conn
-            .get_property(false, root, atom, AtomEnum::ANY, 0, 65536)
+            .get_property(false, root, atom, AtomEnum::ANY, 0, XRESOURCES_PROP_MAX_LEN)
             .ok()?
             .reply()
             .ok()?;
@@ -107,12 +111,12 @@ pub fn i3_dpi(conn: &RustConnection, root: Window, screen: &Screen) -> f32 {
         return dpi;
     }
     if screen.height_in_millimeters > 0 {
-        let dpi = screen.height_in_pixels as f32 * 25.4 / screen.height_in_millimeters as f32;
+        let dpi = screen.height_in_pixels as f32 * MM_PER_INCH / screen.height_in_millimeters as f32;
         tracing::info!(dpi, "DPI detected (from screen physical dimensions)");
         return dpi;
     }
-    tracing::warn!("DPI fallback to 96.0");
-    96.0
+    tracing::warn!("DPI fallback to {FALLBACK_DPI}");
+    FALLBACK_DPI
 }
 
 fn create_panel(
