@@ -11,9 +11,31 @@ use costae::managed_set::ManagedSet;
 use costae::layout::PanelSpec;
 use x11rb::{
     connection::Connection,
-    protocol::{randr::ConnectionExt as RandrExt, xproto::*},
+    protocol::{randr, randr::ConnectionExt as RandrExt, xproto::*},
     rust_connection::RustConnection,
 };
+
+fn build_output_map(conn: &RustConnection, root: u32) -> HashMap<String, (i16, i16, u32, u32)> {
+    let mut map = HashMap::new();
+    if let Ok(cookie) = conn.randr_get_screen_resources_current(root) {
+        if let Ok(resources) = cookie.reply() {
+            for &out_id in &resources.outputs {
+                if let Ok(info_cookie) = conn.randr_get_output_info(out_id, 0) {
+                    if let Ok(info) = info_cookie.reply() {
+                        if info.crtc == 0 { continue; }
+                        if let Ok(crtc_cookie) = conn.randr_get_crtc_info(info.crtc, 0) {
+                            if let Ok(crtc) = crtc_cookie.reply() {
+                                let name = String::from_utf8_lossy(&info.name).into_owned();
+                                map.insert(name, (crtc.x, crtc.y, crtc.width as u32, crtc.height as u32));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    map
+}
 
 fn resolve_layout(raw_layout: &Option<serde_json::Value>) -> Option<takumi::layout::node::Node> {
     raw_layout.as_ref().and_then(|layout| {
@@ -85,8 +107,9 @@ fn handle_x11_events(
     depth: u8,
     root: u32,
     xrootpmap_atom: Option<u32>,
-) -> Result<bool, Box<dyn std::error::Error>> {
+) -> Result<(bool, bool), Box<dyn std::error::Error>> {
     let mut wallpaper_changed = false;
+    let mut outputs_changed = false;
     while let Some(event) = conn.poll_for_event()? {
         match event {
             x11rb::protocol::Event::Expose(e) => {
@@ -120,13 +143,17 @@ fn handle_x11_events(
                     wallpaper_changed = true;
                 }
             }
+            x11rb::protocol::Event::RandrScreenChangeNotify(_) => {
+                tracing::info!("RandR: screen change detected");
+                outputs_changed = true;
+            }
             x11rb::protocol::Event::Error(e) => {
                 tracing::error!(error = ?e, "X11 async error");
             }
             _ => {}
         }
     }
-    Ok(wallpaper_changed)
+    Ok((wallpaper_changed, outputs_changed))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -308,24 +335,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mon_width = crtc_info.width as u32;
     let dpr = dpi / 96.0;
 
-    let mut output_map: HashMap<String, (i16, i16, u32, u32)> = HashMap::new();
-    if let Ok(cookie) = conn.randr_get_screen_resources_current(screen.root) {
-        if let Ok(resources) = cookie.reply() {
-            for &out_id in &resources.outputs {
-                if let Ok(info_cookie) = conn.randr_get_output_info(out_id, 0) {
-                    if let Ok(info) = info_cookie.reply() {
-                        if info.crtc == 0 { continue; }
-                        if let Ok(crtc_cookie) = conn.randr_get_crtc_info(info.crtc, 0) {
-                            if let Ok(crtc) = crtc_cookie.reply() {
-                                let name = String::from_utf8_lossy(&info.name).into_owned();
-                                output_map.insert(name, (crtc.x, crtc.y, crtc.width as u32, crtc.height as u32));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
+    let output_map = build_output_map(&conn, screen.root);
 
     init_global_ctx();
 
@@ -333,6 +343,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         screen.root,
         &ChangeWindowAttributesAux::new().event_mask(EventMask::PROPERTY_CHANGE),
     )?;
+    conn.randr_select_input(screen.root, randr::NotifyMask::SCREEN_CHANGE)?;
     let xrootpmap_atom: Option<u32> = conn
         .intern_atom(false, b"_XROOTPMAP_ID").ok()
         .and_then(|c| c.reply().ok())
@@ -341,7 +352,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let strut_atom = conn.intern_atom(false, b"_NET_WM_STRUT_PARTIAL")?.reply()?.atom;
     let strut_legacy_atom = conn.intern_atom(false, b"_NET_WM_STRUT")?.reply()?.atom;
 
-    let panel_ctx = PanelContext {
+    let mut panel_ctx = PanelContext {
         conn: Arc::clone(&conn),
         root: screen.root,
         depth: screen.root_depth,
@@ -369,7 +380,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
     }).collect();
 
-    let jsx_ctx = serde_json::json!({
+    let mut jsx_ctx = serde_json::json!({
         "output": output_name,
         "dpi": dpi,
         "screen_width": screen_width_logical,
@@ -500,7 +511,49 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &conn, &mut panel_set, &*module_event_txs,
                 dpr, depth, screen.root, xrootpmap_atom,
             ) {
-                Ok(wallpaper_changed) => { if wallpaper_changed { needs_render = true; } }
+                Ok((wallpaper_changed, outputs_changed)) => {
+                    if wallpaper_changed { needs_render = true; }
+                    if outputs_changed {
+                        let new_map = build_output_map(&conn, panel_ctx.root);
+                        let panel_ids: Vec<&str> = panel_set.iter().map(|(_, p)| p.id.as_str()).collect();
+                        let display_list: Vec<String> = new_map.iter()
+                            .map(|(name, &(x, y, w, h))| format!("{name} ({w}x{h}+{x}+{y})"))
+                            .collect();
+                        tracing::info!(
+                            managed_panels = panel_ids.len(),
+                            panels = ?panel_ids,
+                            displays = display_list.len(),
+                            display_list = ?display_list,
+                            "outputs changed"
+                        );
+                        let new_outputs_json: Vec<serde_json::Value> = new_map.iter().map(|(name, &(_, _, pw, ph))| {
+                            serde_json::json!({
+                                "name": name,
+                                "screen_width": (pw as f32 / dpr).round() as u32,
+                                "screen_height": (ph as f32 / dpr).round() as u32,
+                            })
+                        }).collect();
+                        panel_ctx.output_map = Arc::new(new_map);
+                        jsx_ctx["outputs"] = serde_json::Value::Array(new_outputs_json);
+                        // Destroy all panels so they are recreated at updated coordinates.
+                        panel_set.update(vec![], &panel_ctx);
+                        if layout_jsx_path.exists() {
+                            if let Ok(source) = std::fs::read_to_string(&layout_jsx_path) {
+                                match costae::jsx::JsxEvaluator::new(&source, jsx_ctx.clone()) {
+                                    Ok(evaluator) => match evaluator.eval(&stream_values) {
+                                        Ok((value, stream_calls, module_calls)) => {
+                                            apply_eval_result(&value, &stream_calls, &module_calls, &handle, &mut panel_set, &panel_ctx, &make_mod_init);
+                                            jsx_evaluator = Some(evaluator);
+                                            needs_render = true;
+                                        }
+                                        Err(e) => tracing::error!(error = %e, "JSX re-eval error after output change"),
+                                    },
+                                    Err(e) => tracing::error!(error = %e, "JSX compile error after output change"),
+                                }
+                            }
+                        }
+                    }
+                }
                 Err(e) => tracing::error!(error = %e, "X11 event error"),
             }
 

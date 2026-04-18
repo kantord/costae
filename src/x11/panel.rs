@@ -314,6 +314,7 @@ impl Lifecycle for PanelSpec {
         init_global_ctx();
         match create_panel(&self, ctx) {
             Ok(mut panel) => {
+                tracing::info!(panel = %self.id, "panel created");
                 if !self.content.is_null() {
                     preload_layout_images(&self.content);
                     panel.raw_layout = Some(self.content);
@@ -321,7 +322,7 @@ impl Lifecycle for PanelSpec {
                 Some(panel)
             }
             Err(e) => {
-                tracing::error!(panel = %self.id, error = %e, "Lifecycle::enter failed to create panel");
+                tracing::error!(panel = %self.id, error = %e, "panel create failed");
                 None
             }
         }
@@ -336,6 +337,7 @@ impl Lifecycle for PanelSpec {
     }
 
     fn exit(state: Self::State, ctx: &Self::Context) {
+        tracing::info!(panel = %state.id, "panel destroyed");
         let _ = ctx.conn.free_gc(state.gc);
         let _ = ctx.conn.destroy_window(state.win_id);
     }
