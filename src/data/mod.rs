@@ -1,6 +1,6 @@
 pub mod data_loop;
 
-use crate::data::data_loop::{CommandSpec, ProcessIdentity, StreamItem, StreamKind};
+use crate::data::data_loop::{ProcessSource, ProcessIdentity, StreamItem, StreamKind};
 use std::io::{Seek, SeekFrom, Write as IoWrite};
 use std::os::unix::io::FromRawFd;
 use std::sync::mpsc;
@@ -104,12 +104,12 @@ fn forward_stdout(
     rx: mpsc::Receiver<String>,
     tx: mpsc::Sender<StreamItem>,
     wake_tx: mpsc::SyncSender<()>,
-    spec: CommandSpec,
+    spec: ProcessSource,
 ) {
     thread::spawn(move || {
         while let Ok(line) = rx.recv() {
             let item = StreamItem {
-                source: spec.clone(),
+                key: (spec.identity.bin.clone(), spec.script.clone()),
                 stream: StreamKind::Stdout,
                 line,
             };
@@ -133,7 +133,7 @@ pub fn spawn_bi_stream(
     let spawned = spawn_module(bin, None);
     spawned.send_event(init_event);
     let (rx, child, event_tx) = spawned.into_parts();
-    let spec = CommandSpec {
+    let spec = ProcessSource {
         identity: ProcessIdentity { bin: bin.to_string(), key: bin.to_string() },
         script: None,
         args: vec![],
@@ -156,7 +156,7 @@ pub fn spawn_string_stream(
     wake_tx: mpsc::SyncSender<()>,
 ) -> std::process::Child {
     let spawned = spawn_module(bin, script);
-    let spec = CommandSpec {
+    let spec = ProcessSource {
         identity: ProcessIdentity { bin: bin.to_string(), key: bin.to_string() },
         script: script.map(str::to_string),
         args: vec![],

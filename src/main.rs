@@ -5,7 +5,7 @@ use std::thread;
 use std::time::Duration;
 
 use costae::{RenderCache, inject_root_bg, init_global_ctx, parse_layout, render_frame};
-use costae::data::data_loop::{CommandSpec, DataLoop, DataLoopHandle, ProcessIdentity, StreamItem};
+use costae::data::data_loop::{DataLoop, DataLoopHandle, InternalSource, ProcessIdentity, ProcessSource, StreamItem, StreamSource};
 use costae::x11::panel::{sample_root_bg, i3_dpi, do_hit_test, PanelContext};
 use costae::managed_set::ManagedSet;
 use costae::layout::PanelSpec;
@@ -45,8 +45,8 @@ fn resolve_layout(raw_layout: &Option<serde_json::Value>) -> Option<takumi::layo
     })
 }
 
-fn stream_calls_to_specs(calls: &[(String, Option<String>)]) -> Vec<costae::data::data_loop::CommandSpec> {
-    calls.iter().map(|(bin, script)| CommandSpec {
+fn stream_calls_to_specs(calls: &[(String, Option<String>)]) -> Vec<ProcessSource> {
+    calls.iter().map(|(bin, script)| ProcessSource {
         identity: ProcessIdentity {
             bin: bin.clone(),
             key: format!("{}:{}", bin, script.as_deref().unwrap_or("")),
@@ -67,6 +67,7 @@ fn apply_eval_result(
     panel_set: &mut ManagedSet<PanelSpec>,
     panel_ctx: &PanelContext,
     mod_init_fn: &dyn Fn(&[costae::PanelSpec]) -> serde_json::Value,
+    internal_sources: Vec<InternalSource>,
 ) -> bool {
     let specs = match costae::parse_root_node(value) {
         Ok(s) => s,
@@ -81,9 +82,9 @@ fn apply_eval_result(
         module_calls.iter().map(|(b, _)| b.clone()).collect();
     let stream_specs = stream_calls_to_specs(stream_calls)
         .into_iter()
-        .filter(|s| !module_bins.contains(&s.identity.bin))
+        .filter(|s| !module_bins.contains(&s.identity.bin) && s.identity.bin != "costae:outputs")
         .collect::<Vec<_>>();
-    let module_specs: Vec<CommandSpec> = module_calls.iter().map(|(bin, _)| CommandSpec {
+    let module_specs: Vec<ProcessSource> = module_calls.iter().map(|(bin, _)| ProcessSource {
         identity: ProcessIdentity { bin: bin.clone(), key: bin.clone() },
         script: None,
         args: vec![],
@@ -91,7 +92,10 @@ fn apply_eval_result(
         current_dir: None,
         props: Some(mod_init.clone()),
     }).collect();
-    let combined = stream_specs.into_iter().chain(module_specs).collect::<Vec<_>>();
+    let combined: Vec<StreamSource> = stream_specs.into_iter().chain(module_specs)
+        .map(StreamSource::Process)
+        .chain(internal_sources.into_iter().map(StreamSource::Internal))
+        .collect();
     handle.set_desired(combined);
 
     panel_set.update(specs, panel_ctx);
@@ -167,12 +171,17 @@ fn handle_layout_reload(
     panel_set: &mut ManagedSet<PanelSpec>,
     panel_ctx: &PanelContext,
     mod_init_fn: &dyn Fn(&[costae::PanelSpec]) -> serde_json::Value,
+    internal_sources: &[InternalSource],
 ) -> bool {
     if reload_rx.try_recv().is_err() {
         return false;
     }
     handle.set_desired(vec![]);
     stream_values.clear();
+    // Re-inject internal source values so eval sees them without waiting for a tick.
+    for src in internal_sources {
+        stream_values.insert((src.key.clone(), None), serde_json::to_string(&src.value).unwrap_or_default());
+    }
     *jsx_evaluator = None;
 
     if layout_jsx_path.exists() {
@@ -184,6 +193,7 @@ fn handle_layout_reload(
                             &value, &stream_calls, &module_calls,
                             handle, panel_set, panel_ctx,
                             mod_init_fn,
+                            internal_sources.to_vec(),
                         );
                         *jsx_evaluator = Some(evaluator);
                     }
@@ -380,13 +390,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
     }).collect();
 
-    let mut jsx_ctx = serde_json::json!({
+    let mut current_outputs_value = serde_json::Value::Array(outputs_json.clone());
+
+    let jsx_ctx = serde_json::json!({
         "output": output_name,
         "dpi": dpi,
         "screen_width": screen_width_logical,
         "screen_height": screen_height_logical,
         "outputs": outputs_json,
     });
+
+    // Pre-populate stream_values so the first eval sees outputs without waiting for a tick.
+    stream_values.insert(
+        ("costae:outputs".to_string(), None),
+        serde_json::to_string(&current_outputs_value).unwrap_or_default(),
+    );
 
     let mut panel_set: ManagedSet<PanelSpec> = ManagedSet::new();
 
@@ -424,6 +442,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     &value, &stream_calls, &module_calls,
                                     &handle, &mut panel_set, &panel_ctx,
                                     &make_mod_init,
+                                    vec![InternalSource { key: "costae:outputs".to_string(), value: current_outputs_value.clone() }],
                                 );
                                 jsx_evaluator = Some(evaluator);
                             }
@@ -446,8 +465,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::clone(&stop),
         // on_item: relay line to on_tick via channel (avoids dual mutable capture)
         move |item: StreamItem| {
-            let key = (item.source.identity.bin.clone(), item.source.script.clone());
-            let _ = item_tx.send((key, item.line));
+            let _ = item_tx.send((item.key, item.line));
         },
         // on_tick: all stateful work — stream processing, reloads, X11, render
         || {
@@ -480,6 +498,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 &new_value, &new_calls, &new_module_calls,
                                 &handle, &mut panel_set, &panel_ctx,
                                 &make_mod_init,
+                                vec![InternalSource { key: "costae:outputs".to_string(), value: current_outputs_value.clone() }],
                             ) {
                                 needs_render = true;
                             }
@@ -502,6 +521,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &mut jsx_evaluator, &layout_jsx_path, &jsx_ctx,
                 &mut panel_set, &panel_ctx,
                 &make_mod_init,
+                &[InternalSource { key: "costae:outputs".to_string(), value: current_outputs_value.clone() }],
             ) {
                 needs_render = true;
             }
@@ -526,30 +546,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             display_list = ?display_list,
                             "outputs changed"
                         );
-                        let new_outputs_json: Vec<serde_json::Value> = new_map.iter().map(|(name, &(_, _, pw, ph))| {
+                        let new_outputs_array: Vec<serde_json::Value> = new_map.iter().map(|(name, &(_, _, pw, ph))| {
                             serde_json::json!({
                                 "name": name,
                                 "screen_width": (pw as f32 / dpr).round() as u32,
                                 "screen_height": (ph as f32 / dpr).round() as u32,
                             })
                         }).collect();
+                        current_outputs_value = serde_json::Value::Array(new_outputs_array);
+                        // Pre-populate so the immediate re-eval sees the updated value.
+                        stream_values.insert(
+                            ("costae:outputs".to_string(), None),
+                            serde_json::to_string(&current_outputs_value).unwrap_or_default(),
+                        );
                         panel_ctx.output_map = Arc::new(new_map);
-                        jsx_ctx["outputs"] = serde_json::Value::Array(new_outputs_json);
                         // Destroy all panels so they are recreated at updated coordinates.
                         panel_set.update(vec![], &panel_ctx);
-                        if layout_jsx_path.exists() {
-                            if let Ok(source) = std::fs::read_to_string(&layout_jsx_path) {
-                                match costae::jsx::JsxEvaluator::new(&source, jsx_ctx.clone()) {
-                                    Ok(evaluator) => match evaluator.eval(&stream_values) {
-                                        Ok((value, stream_calls, module_calls)) => {
-                                            apply_eval_result(&value, &stream_calls, &module_calls, &handle, &mut panel_set, &panel_ctx, &make_mod_init);
-                                            jsx_evaluator = Some(evaluator);
-                                            needs_render = true;
-                                        }
-                                        Err(e) => tracing::error!(error = %e, "JSX re-eval error after output change"),
-                                    },
-                                    Err(e) => tracing::error!(error = %e, "JSX compile error after output change"),
+                        if let Some(ref evaluator) = jsx_evaluator {
+                            match evaluator.eval(&stream_values) {
+                                Ok((value, stream_calls, module_calls)) => {
+                                    apply_eval_result(
+                                        &value, &stream_calls, &module_calls,
+                                        &handle, &mut panel_set, &panel_ctx,
+                                        &make_mod_init,
+                                        vec![InternalSource { key: "costae:outputs".to_string(), value: current_outputs_value.clone() }],
+                                    );
+                                    needs_render = true;
                                 }
+                                Err(e) => tracing::error!(error = %e, "JSX re-eval error after output change"),
                             }
                         }
                     }

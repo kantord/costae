@@ -1,15 +1,15 @@
 /// Tests that DataLoop still calls on_item even when it is in "awake" mode
 /// (i.e. after extra_rx fires).  The bug: when `awake == true` the loop does
 /// `continue` before calling `recv_timeout`, so `on_item` is never invoked.
-use costae::data::data_loop::{CommandSpec, DataLoop, ProcessIdentity, StreamItem};
+use costae::data::data_loop::{DataLoop, ProcessIdentity, ProcessSource, StreamItem, StreamSource};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-fn echo_spec(msg: &str) -> CommandSpec {
-    CommandSpec {
+fn echo_spec(msg: &str) -> ProcessSource {
+    ProcessSource {
         identity: ProcessIdentity { bin: "/bin/sh".to_string(), key: "/bin/sh".to_string() },
         args: vec!["-c".to_string(), format!("echo {msg}")],
         env: BTreeMap::new(),
@@ -30,7 +30,7 @@ fn awake_mode_still_delivers_stream_items() {
     data_loop = data_loop.with_extra_rx(wake_rx);
 
     // Configure a spec that prints one line and then exits.
-    handle.set_desired(vec![echo_spec("hello_awake")]);
+    handle.set_desired(vec![StreamSource::Process(echo_spec("hello_awake"))]);
 
     let collected: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let collected_for_run = Arc::clone(&collected);

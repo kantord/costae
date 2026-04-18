@@ -18,10 +18,9 @@ pub struct ProcessIdentity {
     pub key: String,
 }
 
-// NOTE: env uses BTreeMap (not HashMap) so that CommandSpec can derive Hash.
-// HashMap does not implement Hash; BTreeMap does because it has deterministic iteration order.
+// NOTE: env uses BTreeMap (not HashMap) for deterministic ordering; HashMap doesn't implement Hash.
 #[derive(Clone, Debug)]
-pub struct CommandSpec {
+pub struct ProcessSource {
     pub identity: ProcessIdentity,
     pub script: Option<String>,
     pub args: Vec<String>,
@@ -38,7 +37,7 @@ pub enum StreamKind {
 
 #[derive(Debug)]
 pub struct StreamItem {
-    pub source: CommandSpec,
+    pub key: (String, Option<String>),
     pub stream: StreamKind,
     pub line: String,
 }
@@ -49,7 +48,7 @@ pub struct ProcessState {
     pub last_sent_props: Option<serde_json::Value>,
 }
 
-fn spawn_process(spec: CommandSpec, tx: &mpsc::Sender<StreamItem>) -> Option<ProcessState> {
+fn spawn_process(spec: ProcessSource, tx: &mpsc::Sender<StreamItem>) -> Option<ProcessState> {
     let mut cmd = std::process::Command::new(&spec.identity.bin);
     cmd.args(&spec.args);
     for (k, v) in &spec.env {
@@ -97,7 +96,7 @@ fn spawn_process(spec: CommandSpec, tx: &mpsc::Sender<StreamItem>) -> Option<Pro
                 match line {
                     Ok(l) => {
                         let item = StreamItem {
-                            source: spec_for_thread.clone(),
+                            key: (spec_for_thread.identity.bin.clone(), spec_for_thread.script.clone()),
                             stream: StreamKind::Stdout,
                             line: l,
                         };
@@ -140,7 +139,7 @@ fn spawn_process(spec: CommandSpec, tx: &mpsc::Sender<StreamItem>) -> Option<Pro
     Some(ProcessState { child, event_tx, last_sent_props: None })
 }
 
-impl Lifecycle for CommandSpec {
+impl Lifecycle for ProcessSource {
     type Key = ProcessIdentity;
     type State = ProcessState;
     type Context = mpsc::Sender<StreamItem>;
@@ -183,24 +182,63 @@ impl Lifecycle for CommandSpec {
     }
 }
 
+#[derive(Clone)]
+pub struct InternalSource {
+    pub key: String,
+    pub value: serde_json::Value,
+}
+
+impl Lifecycle for InternalSource {
+    type Key = String;
+    type State = serde_json::Value;
+    type Context = mpsc::Sender<StreamItem>;
+
+    fn key(&self) -> String {
+        self.key.clone()
+    }
+
+    fn enter(self, ctx: &Self::Context) -> Option<Self::State> {
+        let line = serde_json::to_string(&self.value).unwrap_or_default();
+        let _ = ctx.send(StreamItem { key: (self.key.clone(), None), stream: StreamKind::Stdout, line });
+        Some(self.value)
+    }
+
+    fn update(self, state: &mut Self::State, ctx: &Self::Context) {
+        if *state != self.value {
+            let line = serde_json::to_string(&self.value).unwrap_or_default();
+            let _ = ctx.send(StreamItem { key: (self.key.clone(), None), stream: StreamKind::Stdout, line });
+            *state = self.value.clone();
+        }
+    }
+
+    fn exit(_state: Self::State, _ctx: &Self::Context) {}
+}
+
+pub enum StreamSource {
+    Process(ProcessSource),
+    Internal(InternalSource),
+}
+
 pub struct DataLoopHandle {
-    tx: mpsc::Sender<Vec<CommandSpec>>,
+    tx: mpsc::Sender<Vec<StreamSource>>,
 }
 
 impl DataLoopHandle {
-    pub fn set_desired(&self, specs: Vec<CommandSpec>) {
-        let _ = self.tx.send(specs);
+    pub fn set_desired(&self, sources: Vec<StreamSource>) {
+        let _ = self.tx.send(sources);
     }
 }
 
 pub struct DataLoop {
-    pool: ManagedSet<CommandSpec>,
+    process_pool: ManagedSet<ProcessSource>,
+    internal_pool: ManagedSet<InternalSource>,
     stream_tx: mpsc::Sender<StreamItem>,
-    desired: Vec<CommandSpec>,
+    desired_processes: Vec<ProcessSource>,
+    desired_internals: Vec<InternalSource>,
     timeout: Option<Duration>,
     rx: mpsc::Receiver<StreamItem>,
     extra_rx: Option<mpsc::Receiver<()>>,
-    desired_rx: mpsc::Receiver<Vec<CommandSpec>>,
+    desired_rx: mpsc::Receiver<Vec<StreamSource>>,
     /// Shared snapshot of event senders, keyed by bin name.
     /// Updated on every `set_desired` call so callers outside `run` can route events.
     event_txs_snapshot: Arc<Mutex<HashMap<String, mpsc::Sender<serde_json::Value>>>>,
@@ -212,9 +250,11 @@ impl DataLoop {
         let (desired_tx, desired_rx) = mpsc::channel();
         let event_txs_snapshot = Arc::new(Mutex::new(HashMap::new()));
         let data_loop = Self {
-            pool: ManagedSet::new(),
+            process_pool: ManagedSet::new(),
+            internal_pool: ManagedSet::new(),
             stream_tx,
-            desired: Vec::new(),
+            desired_processes: Vec::new(),
+            desired_internals: Vec::new(),
             timeout: None,
             rx,
             extra_rx: None,
@@ -242,43 +282,47 @@ impl DataLoop {
     }
 
     pub fn collect_event_txs(&self) -> HashMap<ProcessIdentity, mpsc::Sender<serde_json::Value>> {
-        self.pool.iter()
+        self.process_pool.iter()
             .map(|(identity, state)| (identity.clone(), state.event_tx.clone()))
             .collect()
     }
 
     pub fn send_event(&mut self, identity: &ProcessIdentity, event: serde_json::Value) {
-        // Drain desired_rx and reconcile so processes are spawned before we look them up.
         loop {
             match self.desired_rx.try_recv() {
-                Ok(specs) => self.set_desired(&specs),
+                Ok(sources) => self.set_desired(sources),
                 Err(_) => break,
             }
         }
-        self.pool.update(self.desired.clone(), &self.stream_tx);
-        if let Some(state) = self.pool.get(identity) {
+        self.process_pool.update(self.desired_processes.clone(), &self.stream_tx);
+        if let Some(state) = self.process_pool.get(identity) {
             let _ = state.event_tx.send(event);
         }
     }
 
-    fn set_desired(&mut self, desired: &[CommandSpec]) {
-        // Deduplicate desired specs while preserving first occurrence order.
-        // Use ProcessIdentity (the Lifecycle key type) as the deduplication key.
+    fn set_desired(&mut self, sources: Vec<StreamSource>) {
+        let mut processes = vec![];
+        let mut internals = vec![];
+        for s in sources {
+            match s {
+                StreamSource::Process(p) => processes.push(p),
+                StreamSource::Internal(i) => internals.push(i),
+            }
+        }
         let mut seen = std::collections::HashSet::new();
-        let desired_unique: Vec<CommandSpec> = desired
-            .iter()
+        self.desired_processes = processes
+            .into_iter()
             .filter(|s| seen.insert(s.identity.clone()))
-            .cloned()
             .collect();
-
-        self.desired = desired_unique;
-        self.pool.update(self.desired.clone(), &self.stream_tx);
+        self.desired_internals = internals;
+        self.process_pool.update(self.desired_processes.clone(), &self.stream_tx);
+        self.internal_pool.update(self.desired_internals.clone(), &self.stream_tx);
         self.update_event_txs_snapshot();
     }
 
     fn update_event_txs_snapshot(&self) {
         let mut snapshot = self.event_txs_snapshot.lock().unwrap();
-        *snapshot = self.pool.iter()
+        *snapshot = self.process_pool.iter()
             .map(|(identity, state)| (identity.bin.clone(), state.event_tx.clone()))
             .collect();
     }
@@ -298,7 +342,7 @@ impl DataLoop {
             // Drain desired_rx: apply any new desired sets sent via DataLoopHandle.
             loop {
                 match self.desired_rx.try_recv() {
-                    Ok(specs) => self.set_desired(&specs),
+                    Ok(sources) => self.set_desired(sources),
                     Err(mpsc::TryRecvError::Empty) => break,
                     Err(mpsc::TryRecvError::Disconnected) => break,
                 }
@@ -318,7 +362,8 @@ impl DataLoop {
             }
 
             // Reconcile: enter new, exit removed, update existing (restarts crashed processes).
-            self.pool.update(self.desired.clone(), &self.stream_tx);
+            self.process_pool.update(self.desired_processes.clone(), &self.stream_tx);
+            self.internal_pool.update(self.desired_internals.clone(), &self.stream_tx);
             self.update_event_txs_snapshot();
 
             on_tick();
@@ -349,11 +394,11 @@ mod tests {
 
     // ── script field ──────────────────────────────────────────────────────────
 
-    /// Type-system enforcement: `CommandSpec` must carry a `script: Option<String>` field.
+    /// Type-system enforcement: `ProcessSource` must carry a `script: Option<String>` field.
     /// This test fails to compile until the field exists.
     #[test]
     fn command_spec_has_script_field() {
-        let spec = CommandSpec {
+        let spec = ProcessSource {
             identity: ProcessIdentity { bin: "/bin/sh".to_string(), key: "/bin/sh".to_string() },
             args: vec![],
             env: BTreeMap::new(),
@@ -364,11 +409,11 @@ mod tests {
         assert!(spec.script.is_some());
     }
 
-    /// Runtime: when `CommandSpec` carries a script, the subprocess spawned via
+    /// Runtime: when `ProcessSource` carries a script, the subprocess spawned via
     /// `DataLoop` executes that script and its output appears as a `StreamItem`.
     #[test]
     fn script_content_is_executed_and_output_delivered() {
-        let spec = CommandSpec {
+        let spec = ProcessSource {
             identity: ProcessIdentity { bin: "/bin/sh".to_string(), key: "/bin/sh".to_string() },
             args: vec![],
             env: BTreeMap::new(),
@@ -378,7 +423,7 @@ mod tests {
         };
 
         let (mut data_loop, handle) = DataLoop::new();
-        handle.set_desired(vec![spec.clone()]);
+        handle.set_desired(vec![StreamSource::Process(spec.clone())]);
 
         let items: Arc<Mutex<Vec<StreamItem>>> = Arc::new(Mutex::new(Vec::new()));
         let items_clone = Arc::clone(&items);
@@ -405,7 +450,7 @@ mod tests {
     fn duplicate_specs_without_key_spawn_only_one_process() {
         // Use a process that emits once then sleeps — stays alive for the test window
         // so no restart occurs. This isolates the deduplication invariant from restart behavior.
-        let spec = CommandSpec {
+        let spec = ProcessSource {
             identity: ProcessIdentity { bin: "/bin/sh".to_string(), key: "/bin/sh".to_string() },
             args: vec!["-c".to_string(), "echo hello; sleep 10".to_string()],
             env: BTreeMap::new(),
@@ -416,7 +461,7 @@ mod tests {
 
         let (mut data_loop, handle) = DataLoop::new();
         // Pass the same spec twice; no `key` to distinguish them.
-        handle.set_desired(vec![spec.clone(), spec.clone()]);
+        handle.set_desired(vec![StreamSource::Process(spec.clone()), StreamSource::Process(spec.clone())]);
 
         let collected: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let collected_clone = Arc::clone(&collected);
@@ -454,7 +499,7 @@ mod tests {
 
     #[test]
     fn stdout_line_is_delivered_to_handler_with_correct_source_and_kind() {
-        let spec = CommandSpec {
+        let spec = ProcessSource {
             identity: ProcessIdentity { bin: "/bin/sh".to_string(), key: "/bin/sh".to_string() },
             args: vec!["-c".to_string(), "echo hello".to_string()],
             env: BTreeMap::new(),
@@ -464,7 +509,7 @@ mod tests {
         };
 
         let (mut data_loop, handle) = DataLoop::new();
-        handle.set_desired(vec![spec.clone()]);
+        handle.set_desired(vec![StreamSource::Process(spec.clone())]);
 
         let items: Arc<Mutex<Vec<StreamItem>>> = Arc::new(Mutex::new(Vec::new()));
         let items_clone = Arc::clone(&items);
@@ -480,14 +525,14 @@ mod tests {
         assert_eq!(items.len(), 1);
         let item = &items[0];
         assert_eq!(item.line, "hello");
-        assert_eq!(item.source.identity, spec.identity);
+        assert_eq!(item.key.0, spec.identity.bin);
         assert_eq!(item.stream, StreamKind::Stdout);
     }
 
     #[test]
     fn crashed_process_is_restarted_and_output_continues() {
         // Use a command that emits one line then exits immediately.
-        let spec = CommandSpec {
+        let spec = ProcessSource {
             identity: ProcessIdentity { bin: "/bin/sh".to_string(), key: "/bin/sh".to_string() },
             args: vec!["-c".to_string(), "echo hello".to_string()],
             env: BTreeMap::new(),
@@ -497,7 +542,7 @@ mod tests {
         };
 
         let (mut data_loop, handle) = DataLoop::new();
-        handle.set_desired(vec![spec.clone()]);
+        handle.set_desired(vec![StreamSource::Process(spec.clone())]);
 
         let collected: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let collected_for_run = Arc::clone(&collected);
@@ -540,7 +585,7 @@ mod tests {
 
     #[test]
     fn run_stops_when_cancellation_token_is_set() {
-        let spec = CommandSpec {
+        let spec = ProcessSource {
             identity: ProcessIdentity { bin: "/bin/sh".to_string(), key: "/bin/sh".to_string() },
             args: vec![
                 "-c".to_string(),
@@ -553,7 +598,7 @@ mod tests {
         };
 
         let (mut data_loop, handle) = DataLoop::new();
-        handle.set_desired(vec![spec]);
+        handle.set_desired(vec![StreamSource::Process(spec)]);
 
         let stop = Arc::new(AtomicBool::new(false));
         let stop_for_run = Arc::clone(&stop);
@@ -652,7 +697,7 @@ mod tests {
         );
     }
 
-    // ── ProcessIdentity / CommandSpec refactor ───────────────────────────────
+    // ── ProcessIdentity / ProcessSource refactor ───────────────────────────────
 
     /// Compile-time: `ProcessIdentity` must exist with `bin: String` and `key: String`
     /// fields and derive `Hash`, `Eq`, `PartialEq`, `Clone`.
@@ -680,11 +725,11 @@ mod tests {
         assert!(!set.insert(b));
     }
 
-    /// Compile-time: `CommandSpec` must have an `identity: ProcessIdentity` field
+    /// Compile-time: `ProcessSource` must have an `identity: ProcessIdentity` field
     /// plus the runtime fields `script`, `args`, `env`, `current_dir`, `props`.
     #[test]
     fn command_spec_composed_of_identity_and_runtime_fields() {
-        let spec = CommandSpec {
+        let spec = ProcessSource {
             identity: ProcessIdentity {
                 bin: "/bin/sh".to_string(),
                 key: "my-key".to_string(),
@@ -707,7 +752,7 @@ mod tests {
             bin: "/usr/bin/cat".to_string(),
             key: "cat-key".to_string(),
         };
-        let spec = CommandSpec {
+        let spec = ProcessSource {
             identity: id.clone(),
             script: None,
             args: vec![],
@@ -731,7 +776,7 @@ mod tests {
 
     // ── props / init / update / send_event ───────────────────────────────────
 
-    /// Claim A — runtime: when `CommandSpec` has `props: Some(value)`, the subprocess
+    /// Claim A — runtime: when `ProcessSource` has `props: Some(value)`, the subprocess
     /// receives `<value>\n` on its stdin before producing output (sent directly, no wrapping).
     ///
     /// The script reads one line from stdin and echoes it back prefixed with "got:".
@@ -739,7 +784,7 @@ mod tests {
     fn props_init_message_is_sent_to_subprocess_stdin() {
         let props_value = serde_json::json!({"color": "red"});
         let expected_payload = serde_json::json!({"color": "red"});
-        let spec = CommandSpec {
+        let spec = ProcessSource {
             identity: ProcessIdentity { bin: "/bin/sh".to_string(), key: "init-test".to_string() },
             // Script: read one line from stdin, echo it back
             args: vec!["-c".to_string(), "read line; echo \"got:$line\"".to_string()],
@@ -750,7 +795,7 @@ mod tests {
         };
 
         let (mut data_loop, handle) = DataLoop::new();
-        handle.set_desired(vec![spec.clone()]);
+        handle.set_desired(vec![StreamSource::Process(spec.clone())]);
 
         let collected: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let collected_clone = Arc::clone(&collected);
@@ -810,7 +855,7 @@ mod tests {
         };
 
         // Script: loop-reads lines from stdin and echoes each one.
-        let spec_v1 = CommandSpec {
+        let spec_v1 = ProcessSource {
             identity: identity.clone(),
             args: vec![
                 "-c".to_string(),
@@ -823,7 +868,7 @@ mod tests {
         };
 
         let (mut data_loop, handle) = DataLoop::new();
-        handle.set_desired(vec![spec_v1.clone()]);
+        handle.set_desired(vec![StreamSource::Process(spec_v1.clone())]);
 
         let collected: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let collected_clone = Arc::clone(&collected);
@@ -854,7 +899,7 @@ mod tests {
         }
 
         // Now update the spec with new props — same identity, different props.
-        let spec_v2 = CommandSpec {
+        let spec_v2 = ProcessSource {
             identity: identity.clone(),
             args: vec![
                 "-c".to_string(),
@@ -865,7 +910,7 @@ mod tests {
             props: Some(updated_props),
             script: None,
         };
-        handle.set_desired(vec![spec_v2]);
+        handle.set_desired(vec![StreamSource::Process(spec_v2)]);
 
         // Wait for the update echo to appear.
         let expected_got = format!("got:{}", expected_update_payload);
@@ -911,7 +956,7 @@ mod tests {
             bin: "/bin/sh".to_string(),
             key: "send-event-test".to_string(),
         };
-        let spec = CommandSpec {
+        let spec = ProcessSource {
             identity: identity.clone(),
             args: vec![
                 "-c".to_string(),
@@ -924,7 +969,7 @@ mod tests {
         };
 
         let (mut data_loop, handle) = DataLoop::new();
-        handle.set_desired(vec![spec]);
+        handle.set_desired(vec![StreamSource::Process(spec)]);
 
         let event = serde_json::json!({"type": "ping", "id": 42});
         let collected: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
@@ -984,7 +1029,7 @@ mod tests {
             key: "dedup-props-test".to_string(),
         };
 
-        let spec = CommandSpec {
+        let spec = ProcessSource {
             identity: identity.clone(),
             args: vec![
                 "-c".to_string(),
@@ -998,7 +1043,7 @@ mod tests {
 
         let (mut data_loop, handle) = DataLoop::new();
         // First set_desired — spawns the process and sends initial props.
-        handle.set_desired(vec![spec.clone()]);
+        handle.set_desired(vec![StreamSource::Process(spec.clone())]);
 
         let collected: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let collected_clone = Arc::clone(&collected);
@@ -1030,7 +1075,7 @@ mod tests {
         }
 
         // Second set_desired with IDENTICAL spec/props — should NOT send props again.
-        handle.set_desired(vec![spec.clone()]);
+        handle.set_desired(vec![StreamSource::Process(spec.clone())]);
 
         // Give enough time for at least two tick cycles (2 × 50 ms = 100 ms)
         // so that if the bug is present the duplicate would have been delivered and echoed.
@@ -1050,13 +1095,105 @@ mod tests {
         );
     }
 
+    // ── InternalSource ────────────────────────────────────────────────────────
+
+    /// Claim A: `InternalSource::enter` emits exactly one `StreamItem` whose key is
+    /// `(source.key.clone(), None)` and whose line is the JSON-serialised value.
+    #[test]
+    fn internal_source_enter_emits_stream_item_with_correct_key_and_line() {
+        use crate::managed_set::Lifecycle;
+        let (tx, rx) = mpsc::channel::<StreamItem>();
+        let source = InternalSource {
+            key: "my-key".to_string(),
+            value: serde_json::json!({"foo": 42}),
+        };
+        let expected_key = (source.key.clone(), None);
+        let expected_line = serde_json::to_string(&source.value).unwrap();
+
+        let _state = source.enter(&tx);
+
+        let item = rx.recv_timeout(Duration::from_millis(200))
+            .expect("InternalSource::enter must emit a StreamItem");
+        assert_eq!(
+            item.key, expected_key,
+            "StreamItem key must be (source.key, None)"
+        );
+        assert_eq!(
+            item.line, expected_line,
+            "StreamItem line must be JSON-serialised value"
+        );
+        // No further items should be emitted by enter alone.
+        assert!(
+            rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "enter must emit exactly one StreamItem"
+        );
+    }
+
+    /// Claim B: `InternalSource::update` emits a new `StreamItem` when the value changes.
+    #[test]
+    fn internal_source_update_emits_stream_item_when_value_changes() {
+        use crate::managed_set::Lifecycle;
+        let (tx, rx) = mpsc::channel::<StreamItem>();
+        let source_v1 = InternalSource {
+            key: "upd-key".to_string(),
+            value: serde_json::json!(1),
+        };
+        let mut state = source_v1.enter(&tx).expect("enter must succeed");
+        // Drain the enter emission.
+        let _ = rx.recv_timeout(Duration::from_millis(200))
+            .expect("enter must emit an item");
+
+        // Update with a different value.
+        let source_v2 = InternalSource {
+            key: "upd-key".to_string(),
+            value: serde_json::json!(2),
+        };
+        let expected_key = (source_v2.key.clone(), None);
+        let expected_line = serde_json::to_string(&source_v2.value).unwrap();
+
+        source_v2.update(&mut state, &tx);
+
+        let item = rx.recv_timeout(Duration::from_millis(200))
+            .expect("update must emit a StreamItem when value changes");
+        assert_eq!(item.key, expected_key);
+        assert_eq!(item.line, expected_line);
+    }
+
+    /// Claim C: `InternalSource::update` does NOT emit when the value is identical to
+    /// the last emitted value (deduplication).
+    #[test]
+    fn internal_source_update_does_not_emit_when_value_unchanged() {
+        use crate::managed_set::Lifecycle;
+        let (tx, rx) = mpsc::channel::<StreamItem>();
+        let source_v1 = InternalSource {
+            key: "dedup-key".to_string(),
+            value: serde_json::json!({"x": 7}),
+        };
+        let mut state = source_v1.enter(&tx).expect("enter must succeed");
+        // Drain the enter emission.
+        let _ = rx.recv_timeout(Duration::from_millis(200))
+            .expect("enter must emit an item");
+
+        // Update with the same value — must NOT emit.
+        let source_same = InternalSource {
+            key: "dedup-key".to_string(),
+            value: serde_json::json!({"x": 7}),
+        };
+        source_same.update(&mut state, &tx);
+
+        assert!(
+            rx.recv_timeout(Duration::from_millis(100)).is_err(),
+            "update must NOT emit a StreamItem when value is identical to last emitted"
+        );
+    }
+
     /// Runtime test: calling `handle.set_desired(specs)` from outside the `run` loop
     /// updates the running pool — a new spec is spawned — and output arrives on the
     /// `on_item` callback, proving the handle can communicate with the running loop
     /// without stopping it.
     #[test]
     fn handle_set_desired_spawns_process_into_running_loop() {
-        let spec = CommandSpec {
+        let spec = ProcessSource {
             identity: ProcessIdentity { bin: "/bin/sh".to_string(), key: "/bin/sh".to_string() },
             args: vec!["-c".to_string(), "echo handle_output".to_string()],
             env: BTreeMap::new(),
@@ -1084,7 +1221,7 @@ mod tests {
         });
 
         // From the main thread (outside run), call handle.set_desired to inject a spec.
-        handle.set_desired(vec![spec]);
+        handle.set_desired(vec![StreamSource::Process(spec)]);
 
         // Wait up to 3 s for the output to arrive.
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
