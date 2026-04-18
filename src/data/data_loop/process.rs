@@ -44,6 +44,46 @@ pub enum SpawnError {
     ProcessSpawnFailed { bin: String, #[source] source: std::io::Error },
 }
 
+fn spawn_stdout_thread(stdout: std::process::ChildStdout, spec: ProcessSource, tx: mpsc::Sender<StreamItem>) {
+    thread::spawn(move || {
+        let reader = std::io::BufReader::new(stdout);
+        for line in reader.lines() {
+            match line {
+                Ok(l) => {
+                    let item = StreamItem {
+                        key: (spec.identity.bin.clone(), spec.script.clone()),
+                        stream: StreamKind::Stdout,
+                        line: l,
+                    };
+                    if tx.send(item).is_err() { break; }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+}
+
+fn spawn_stderr_thread(stderr: std::process::ChildStderr, bin_name: String) {
+    thread::spawn(move || {
+        let reader = std::io::BufReader::new(stderr);
+        for line in reader.lines() {
+            match line {
+                Ok(l) => tracing::warn!(module = %bin_name, "{l}"),
+                Err(_) => break,
+            }
+        }
+    });
+}
+
+fn spawn_stdin_thread(mut stdin: std::process::ChildStdin, event_rx: mpsc::Receiver<serde_json::Value>) {
+    thread::spawn(move || {
+        while let Ok(event) = event_rx.recv() {
+            let line = serde_json::to_string(&event).unwrap_or_default() + "\n";
+            if stdin.write_all(line.as_bytes()).is_err() { break; }
+        }
+    });
+}
+
 pub(super) fn spawn_process(spec: ProcessSource, tx: &mpsc::Sender<StreamItem>) -> Result<ProcessState, SpawnError> {
     let mut cmd = std::process::Command::new(&spec.identity.bin);
     cmd.args(&spec.args);
@@ -82,51 +122,14 @@ pub(super) fn spawn_process(spec: ProcessSource, tx: &mpsc::Sender<StreamItem>) 
     };
 
     if let Some(stdout) = child.stdout.take() {
-        let spec_for_thread = spec.clone();
-        let tx_stdout = tx.clone();
-        thread::spawn(move || {
-            let reader = std::io::BufReader::new(stdout);
-            for line in reader.lines() {
-                match line {
-                    Ok(l) => {
-                        let item = StreamItem {
-                            key: (spec_for_thread.identity.bin.clone(), spec_for_thread.script.clone()),
-                            stream: StreamKind::Stdout,
-                            line: l,
-                        };
-                        if tx_stdout.send(item).is_err() {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
+        spawn_stdout_thread(stdout, spec.clone(), tx.clone());
     }
-
     if let Some(stderr) = child.stderr.take() {
-        let bin_name = spec.identity.bin.clone();
-        thread::spawn(move || {
-            let reader = std::io::BufReader::new(stderr);
-            for line in reader.lines() {
-                match line {
-                    Ok(l) => tracing::warn!(module = %bin_name, "{l}"),
-                    Err(_) => break,
-                }
-            }
-        });
+        spawn_stderr_thread(stderr, spec.identity.bin.clone());
     }
-
     let (event_tx, event_rx) = mpsc::channel::<serde_json::Value>();
-    if let Some(mut stdin) = child.stdin.take() {
-        thread::spawn(move || {
-            while let Ok(event) = event_rx.recv() {
-                let line = serde_json::to_string(&event).unwrap_or_default() + "\n";
-                if stdin.write_all(line.as_bytes()).is_err() {
-                    break;
-                }
-            }
-        });
+    if let Some(stdin) = child.stdin.take() {
+        spawn_stdin_thread(stdin, event_rx);
     }
 
     Ok(ProcessState { child, event_tx, last_sent_props: None })
