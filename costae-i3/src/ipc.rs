@@ -30,9 +30,11 @@ pub fn i3_socket_path() -> String {
     })
 }
 
+const I3_DPI_SCALE_THRESHOLD: f32 = 1.25;
+
 // i3 only scales gaps if dpi/96 >= 1.25 (logical_px threshold in libi3/dpi.c)
 fn scale_gap(dpi: f32, px: u32) -> u32 {
-    if (dpi / 96.0) < 1.25 {
+    if (dpi / 96.0) < I3_DPI_SCALE_THRESHOLD {
         px
     } else {
         (px as f32 * 96.0 / dpi).floor() as u32

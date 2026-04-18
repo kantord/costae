@@ -4,6 +4,8 @@ use crate::render::with_global_ctx;
 
 pub use crate::layout::{PanelAnchor, PanelSpec};
 
+const RGBA_BYTES_PER_PIXEL: usize = 4;
+
 /// Convert X11 ZPixmap BGRX bytes (4 bytes per pixel, X padding ignored) to RGBA
 /// with alpha=255 (wallpaper is always fully opaque).
 pub fn x11_bgrx_to_rgba(bgrx: &[u8]) -> Vec<u8> {
@@ -86,7 +88,7 @@ pub fn solid_color_rgba(pixel: u32, width: u32, height: u32) -> Vec<u8> {
     let g = ((pixel >> 8) & 0xFF) as u8;
     let b = (pixel & 0xFF) as u8;
     let count = (width * height) as usize;
-    let mut rgba = Vec::with_capacity(count * 4);
+    let mut rgba = Vec::with_capacity(count * RGBA_BYTES_PER_PIXEL);
     for _ in 0..count {
         rgba.extend_from_slice(&[r, g, b, 0xFF]);
     }

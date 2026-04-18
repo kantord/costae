@@ -31,7 +31,7 @@ impl Lifecycle for BuiltInSource {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_clone = Arc::clone(&stop);
         let ctx_clone = ctx.clone();
-        let key = self.key.clone();
+        let key = self.key();
         let handle = std::thread::spawn(move || (self.func)(ctx_clone, key, stop_clone));
         Ok(BuiltInState { handle, stop })
     }
@@ -41,7 +41,7 @@ impl Lifecycle for BuiltInSource {
             let stop = Arc::new(AtomicBool::new(false));
             let stop_clone = Arc::clone(&stop);
             let ctx_clone = ctx.clone();
-            let key = self.key.clone();
+            let key = self.key();
             let handle = std::thread::spawn(move || (self.func)(ctx_clone, key, stop_clone));
             state.handle = handle;
             state.stop = stop;
