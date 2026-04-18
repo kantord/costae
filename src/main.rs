@@ -204,132 +204,106 @@ fn handle_layout_reload(
     true
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn init_logging() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
+}
 
-    let log_path = {
-        let home = std::env::var("HOME").unwrap_or_default();
-        format!("{home}/.local/share/costae-crash.log")
-    };
-    {
-        let log_path = log_path.clone();
-        std::panic::set_hook(Box::new(move |info| {
-            let msg = format!("PANIC: {info}");
-            tracing::error!("{msg}");
-            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
-                use std::io::Write;
-                let _ = writeln!(f, "{msg}");
-            }
-        }));
-    }
+fn install_panic_hook(log_path: String) {
+    std::panic::set_hook(Box::new(move |info| {
+        let msg = format!("PANIC: {info}");
+        tracing::error!("{msg}");
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+            use std::io::Write;
+            let _ = writeln!(f, "{msg}");
+        }
+    }));
+}
 
-    let exe_path = std::env::current_exe().unwrap_or_default();
-
-    let layout_jsx_path = {
-        let home = std::env::var("HOME").unwrap_or_default();
-        std::path::PathBuf::from(home).join(".config/costae/layout.jsx")
-    };
-
-    let last_tick = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-    {
-        let last_tick = std::sync::Arc::clone(&last_tick);
-        let log_path = log_path.clone();
-        thread::spawn(move || {
-            loop {
-                thread::sleep(Duration::from_secs(10));
-                let last = last_tick.load(std::sync::atomic::Ordering::Relaxed);
-                if last == 0 { continue; }
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-                let stale = now.saturating_sub(last);
-                if stale > 10 {
-                    let msg = format!("FREEZE: main loop stalled for {stale}s");
-                    tracing::error!("{msg}");
-                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
-                        use std::io::Write;
-                        let _ = writeln!(f, "{msg}");
-                    }
+fn spawn_freeze_watchdog(last_tick: Arc<std::sync::atomic::AtomicU64>, log_path: String) {
+    thread::spawn(move || {
+        loop {
+            thread::sleep(Duration::from_secs(10));
+            let last = last_tick.load(Ordering::Relaxed);
+            if last == 0 { continue; }
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let stale = now.saturating_sub(last);
+            if stale > 10 {
+                let msg = format!("FREEZE: main loop stalled for {stale}s");
+                tracing::error!("{msg}");
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+                    use std::io::Write;
+                    let _ = writeln!(f, "{msg}");
                 }
             }
-        });
-    }
+        }
+    });
+}
 
-    // Shared wake channel: file watchers and bi-streams ping this to interrupt
-    // DataLoop's recv_timeout early.
-    let (dl_wake_tx, dl_wake_rx) = mpsc::sync_channel::<()>(1);
-
-    let (reload_tx, reload_rx) = mpsc::channel::<()>();
-    {
-        let path = layout_jsx_path.clone();
-        let dl_wake_tx = dl_wake_tx.clone();
-        thread::spawn(move || {
-            let mut last_modified = std::fs::metadata(&path)
-                .and_then(|m| m.modified())
-                .ok();
-            loop {
-                thread::sleep(Duration::from_millis(500));
-                let modified = std::fs::metadata(&path)
-                    .and_then(|m| m.modified())
-                    .ok();
-                if modified != last_modified {
-                    last_modified = modified;
-                    let _ = reload_tx.send(());
-                    let _ = dl_wake_tx.try_send(());
-                }
+fn spawn_layout_watcher(
+    path: std::path::PathBuf,
+    reload_tx: mpsc::Sender<()>,
+    dl_wake_tx: mpsc::SyncSender<()>,
+) {
+    thread::spawn(move || {
+        let mut last_modified = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+        loop {
+            thread::sleep(Duration::from_millis(500));
+            let modified = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+            if modified != last_modified {
+                last_modified = modified;
+                let _ = reload_tx.send(());
+                let _ = dl_wake_tx.try_send(());
             }
-        });
-    }
+        }
+    });
+}
 
-    let exe_baseline: Option<std::time::SystemTime> =
-        std::env::var("COSTAE_EXE_MTIME_NS")
-            .ok()
-            .and_then(|s| s.parse::<u128>().ok())
-            .and_then(|ns| {
-                std::time::UNIX_EPOCH.checked_add(std::time::Duration::from_nanos(ns as u64))
-            })
-            .or_else(|| std::fs::metadata(&exe_path).and_then(|m| m.modified()).ok());
-
-    let (bin_reload_tx, bin_reload_rx) = mpsc::channel::<()>();
-    if exe_path.exists() {
-        let path = exe_path.clone();
-        let dl_wake_tx = dl_wake_tx.clone();
-        thread::spawn(move || {
-            let mut last_modified = exe_baseline;
-            loop {
-                thread::sleep(Duration::from_millis(500));
-                let modified = std::fs::metadata(&path)
-                    .and_then(|m| m.modified())
-                    .ok();
-                if modified != last_modified {
-                    last_modified = modified;
-                    let _ = bin_reload_tx.send(());
-                    let _ = dl_wake_tx.try_send(());
-                }
+fn spawn_binary_watcher(
+    path: std::path::PathBuf,
+    baseline: Option<std::time::SystemTime>,
+    bin_reload_tx: mpsc::Sender<()>,
+    dl_wake_tx: mpsc::SyncSender<()>,
+) {
+    thread::spawn(move || {
+        let mut last_modified = baseline;
+        loop {
+            thread::sleep(Duration::from_millis(500));
+            let modified = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+            if modified != last_modified {
+                last_modified = modified;
+                let _ = bin_reload_tx.send(());
+                let _ = dl_wake_tx.try_send(());
             }
-        });
-    }
+        }
+    });
+}
 
-    // DataLoop manages all subprocesses (string streams and modules).
-    let (mut data_loop, handle) = DataLoop::new();
-    data_loop = data_loop.with_extra_rx(dl_wake_rx);
-    let module_event_txs = data_loop.event_txs_handle();
+struct X11Init {
+    conn: Arc<RustConnection>,
+    panel_ctx: PanelContext,
+    dpr: f32,
+    dpi: f32,
+    output_name: String,
+    screen_width_logical: u32,
+    screen_height_logical: u32,
+    jsx_ctx: serde_json::Value,
+}
 
-    let mut stream_values: HashMap<(String, Option<String>), String> = HashMap::new();
-    let mut jsx_evaluator: Option<costae::jsx::JsxEvaluator> = None;
-
+fn init_x11() -> Result<X11Init, Box<dyn std::error::Error>> {
     let (conn, screen_num) = RustConnection::connect(None)?;
     let conn = Arc::new(conn);
-    let screen = &conn.setup().roots[screen_num];
-    let depth = screen.root_depth;
+    let screen = conn.setup().roots[screen_num].clone();
 
-    let dpi = i3_dpi(&conn, screen.root, screen);
+    let dpi = i3_dpi(&conn, screen.root, &screen);
+    let dpr = dpi / 96.0;
 
     let primary_output = conn.randr_get_output_primary(screen.root)?.reply()?.output;
     let output_info = conn.randr_get_output_info(primary_output, 0)?.reply()?;
@@ -337,9 +311,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let crtc_info = conn.randr_get_crtc_info(output_info.crtc, 0)?.reply()?;
     let mon_x = crtc_info.x;
     let mon_y = crtc_info.y;
-    let mon_height = crtc_info.height as u32;
     let mon_width = crtc_info.width as u32;
-    let dpr = dpi / 96.0;
+    let mon_height = crtc_info.height as u32;
 
     let output_map = costae::x11::outputs::build_output_map(&conn, screen.root);
 
@@ -353,11 +326,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .intern_atom(false, b"_XROOTPMAP_ID").ok()
         .and_then(|c| c.reply().ok())
         .map(|r| r.atom);
-
     let strut_atom = conn.intern_atom(false, b"_NET_WM_STRUT_PARTIAL")?.reply()?.atom;
     let strut_legacy_atom = conn.intern_atom(false, b"_NET_WM_STRUT")?.reply()?.atom;
 
-    let mut panel_ctx = PanelContext {
+    let panel_ctx = PanelContext {
         conn: Arc::clone(&conn),
         root: screen.root,
         depth: screen.root_depth,
@@ -384,164 +356,279 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "screen_height": screen_height_logical,
     });
 
-    let mut panel_set: ManagedSet<PanelSpec> = ManagedSet::new();
+    Ok(X11Init { conn, panel_ctx, dpr, dpi, output_name, screen_width_logical, screen_height_logical, jsx_ctx })
+}
 
-    let make_mod_init = |specs: &[costae::PanelSpec]| -> serde_json::Value {
-        let spec = specs.iter()
-            .find(|p| p.anchor == Some(costae::PanelAnchor::Left))
-            .or_else(|| specs.first());
-        let (bar_w, og) = spec
-            .map(|p| (
-                (p.width as f32 * dpr).round() as u32,
-                (p.outer_gap as f32 * dpr).round() as u32,
-            ))
-            .unwrap_or((250, 0));
-        serde_json::json!({
-            "type": "init",
-            "config": {"width": bar_w, "outer_gap": og},
-            "output": output_name,
-            "dpi": dpi,
-            "screen_width": screen_width_logical,
-            "screen_height": screen_height_logical,
-        })
-    };
+fn make_mod_init_value(
+    specs: &[costae::PanelSpec],
+    dpr: f32,
+    output_name: &str,
+    dpi: f32,
+    screen_width_logical: u32,
+    screen_height_logical: u32,
+) -> serde_json::Value {
+    let spec = specs.iter()
+        .find(|p| p.anchor == Some(costae::PanelAnchor::Left))
+        .or_else(|| specs.first());
+    let (bar_w, og) = spec
+        .map(|p| ((p.width as f32 * dpr).round() as u32, (p.outer_gap as f32 * dpr).round() as u32))
+        .unwrap_or((250, 0));
+    serde_json::json!({
+        "type": "init",
+        "config": {"width": bar_w, "outer_gap": og},
+        "output": output_name,
+        "dpi": dpi,
+        "screen_width": screen_width_logical,
+        "screen_height": screen_height_logical,
+    })
+}
 
-    // Initial JSX load
-    if layout_jsx_path.exists() {
-        match std::fs::read_to_string(&layout_jsx_path) {
-            Ok(source) => {
-                let t = std::time::Instant::now();
-                match costae::jsx::JsxEvaluator::new(&source, jsx_ctx.clone()) {
-                    Ok(evaluator) => {
-                        match evaluator.eval(&stream_values) {
-                            Ok((value, stream_calls, module_calls)) => {
-                                tracing::debug!(elapsed_ms = t.elapsed().as_millis(), "jsx eval");
-                                apply_eval_result(
-                                    &value, &stream_calls, &module_calls,
-                                    &handle, &mut panel_set, &panel_ctx,
-                                    &make_mod_init,
-                                );
-                                jsx_evaluator = Some(evaluator);
-                            }
-                            Err(e) => tracing::error!(error = %e, "JSX eval error"),
-                        }
-                    }
-                    Err(e) => tracing::error!(error = %e, "JSX compile error"),
-                }
+type ModuleEventTxs = Arc<std::sync::Mutex<HashMap<String, mpsc::Sender<serde_json::Value>>>>;
+
+struct TickReceivers {
+    item_rx: mpsc::Receiver<((String, Option<String>), String)>,
+    bin_reload_rx: mpsc::Receiver<()>,
+    reload_rx: mpsc::Receiver<()>,
+}
+
+struct TickState {
+    stream_values: HashMap<(String, Option<String>), String>,
+    jsx_evaluator: Option<costae::jsx::JsxEvaluator>,
+    panel_set: ManagedSet<PanelSpec>,
+    panel_ctx: PanelContext,
+    handle: DataLoopHandle,
+    jsx_ctx: serde_json::Value,
+    item_rx: mpsc::Receiver<((String, Option<String>), String)>,
+    bin_reload_rx: mpsc::Receiver<()>,
+    reload_rx: mpsc::Receiver<()>,
+    layout_jsx_path: std::path::PathBuf,
+    conn: Arc<RustConnection>,
+    module_event_txs: ModuleEventTxs,
+    dpr: f32,
+    dpi: f32,
+    output_name: String,
+    screen_width_logical: u32,
+    screen_height_logical: u32,
+    stop: Arc<AtomicBool>,
+    last_tick: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl TickState {
+    fn new(
+        x11: X11Init,
+        handle: DataLoopHandle,
+        rx: TickReceivers,
+        layout_jsx_path: std::path::PathBuf,
+        module_event_txs: ModuleEventTxs,
+        stop: Arc<AtomicBool>,
+        last_tick: Arc<std::sync::atomic::AtomicU64>,
+    ) -> Self {
+        let X11Init { conn, panel_ctx, dpr, dpi, output_name, screen_width_logical, screen_height_logical, jsx_ctx } = x11;
+        let mut state = Self {
+            stream_values: HashMap::new(),
+            jsx_evaluator: None,
+            panel_set: ManagedSet::new(),
+            panel_ctx,
+            handle,
+            jsx_ctx,
+            item_rx: rx.item_rx,
+            bin_reload_rx: rx.bin_reload_rx,
+            reload_rx: rx.reload_rx,
+            layout_jsx_path,
+            conn,
+            module_event_txs,
+            dpr,
+            dpi,
+            output_name,
+            screen_width_logical,
+            screen_height_logical,
+            stop,
+            last_tick,
+        };
+        state.initial_load();
+        state
+    }
+
+    fn initial_load(&mut self) {
+        if !self.layout_jsx_path.exists() { return; }
+        let source = match std::fs::read_to_string(&self.layout_jsx_path) {
+            Ok(s) => s,
+            Err(e) => { tracing::error!(error = %e, "JSX file error"); return; }
+        };
+        let t = std::time::Instant::now();
+        let evaluator = match costae::jsx::JsxEvaluator::new(&source, self.jsx_ctx.clone()) {
+            Ok(e) => e,
+            Err(e) => { tracing::error!(error = %e, "JSX compile error"); return; }
+        };
+        match evaluator.eval(&self.stream_values) {
+            Ok((value, stream_calls, module_calls)) => {
+                tracing::debug!(elapsed_ms = t.elapsed().as_millis(), "jsx eval");
+                let (dpr, dpi, sw, sh) = (self.dpr, self.dpi, self.screen_width_logical, self.screen_height_logical);
+                let output_name = self.output_name.clone();
+                let make_mod_init = |specs: &[costae::PanelSpec]| make_mod_init_value(specs, dpr, &output_name, dpi, sw, sh);
+                apply_eval_result(&value, &stream_calls, &module_calls, &self.handle, &mut self.panel_set, &self.panel_ctx, &make_mod_init);
+                self.jsx_evaluator = Some(evaluator);
             }
-            Err(e) => tracing::error!(error = %e, "JSX file error"),
+            Err(e) => tracing::error!(error = %e, "JSX eval error"),
         }
     }
 
+    fn tick(&mut self) {
+        self.last_tick.store(
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
+            Ordering::Relaxed,
+        );
+
+        let mut needs_render = false;
+
+        let mut changed = false;
+        while let Ok((key, value)) = self.item_rx.try_recv() {
+            if self.stream_values.get(&key).map(|s| s.as_str()) != Some(value.as_str()) {
+                self.stream_values.insert(key, value);
+                changed = true;
+            }
+        }
+
+        let (dpr, dpi, sw, sh) = (self.dpr, self.dpi, self.screen_width_logical, self.screen_height_logical);
+        let output_name = self.output_name.clone();
+        let make_mod_init = |specs: &[costae::PanelSpec]| make_mod_init_value(specs, dpr, &output_name, dpi, sw, sh);
+
+        if changed {
+            if let Some(new_map) = rebuild_output_map_from_stream(&self.stream_values) {
+                self.panel_ctx.output_map = Arc::new(new_map);
+            }
+            if let Some(ref evaluator) = self.jsx_evaluator {
+                let t = std::time::Instant::now();
+                match evaluator.eval(&self.stream_values) {
+                    Ok((new_value, new_calls, new_module_calls)) => {
+                        tracing::debug!(elapsed_us = t.elapsed().as_micros(), "jsx re-eval");
+                        if apply_eval_result(&new_value, &new_calls, &new_module_calls, &self.handle, &mut self.panel_set, &self.panel_ctx, &make_mod_init) {
+                            needs_render = true;
+                        }
+                    }
+                    Err(e) => tracing::error!(error = %e, "JSX re-eval error"),
+                }
+            }
+        }
+
+        if self.bin_reload_rx.try_recv().is_ok() {
+            tracing::info!("binary changed, restarting...");
+            self.stop.store(true, Ordering::Relaxed);
+            return;
+        }
+
+        if handle_layout_reload(
+            &self.reload_rx, &self.handle, &mut self.stream_values,
+            &mut self.jsx_evaluator, &self.layout_jsx_path, &self.jsx_ctx,
+            &mut self.panel_set, &self.panel_ctx,
+            &make_mod_init,
+        ) {
+            needs_render = true;
+        }
+
+        match handle_x11_events(
+            &self.conn, &mut self.panel_set, &self.module_event_txs,
+            self.dpr, self.panel_ctx.depth, self.panel_ctx.root, self.panel_ctx.xrootpmap_atom,
+        ) {
+            Ok(wallpaper_changed) => { if wallpaper_changed { needs_render = true; } }
+            Err(e) => tracing::error!(error = %e, "X11 event error"),
+        }
+
+        if needs_render {
+            let key = serde_json::to_value(&self.stream_values).unwrap_or_default();
+            for (_, panel) in self.panel_set.iter_mut() {
+                inject_root_bg(panel.root_bg_rgba.clone(), panel.phys_width, panel.phys_height);
+                panel.bgrx = panel.render_cache.get_or_render(&key, || {
+                    let t = std::time::Instant::now();
+                    let layout = resolve_layout(&panel.raw_layout);
+                    tracing::debug!(elapsed_us = t.elapsed().as_micros(), "resolve_layout");
+                    render_frame(layout, panel.phys_width, panel.phys_height, self.dpr)
+                });
+                tracing::debug!(panel = %panel.id, win_id = panel.win_id, "put_image");
+                if let Err(e) = self.conn.put_image(ImageFormat::Z_PIXMAP, panel.win_id, panel.gc, panel.phys_width as u16, panel.phys_height as u16, 0, 0, 0, self.panel_ctx.depth, &panel.bgrx[..]) {
+                    tracing::error!(error = %e, "put_image failed");
+                }
+            }
+            if let Err(e) = self.conn.flush() {
+                tracing::error!(error = %e, "flush failed");
+            }
+            tracing::debug!("flush ok");
+        }
+    }
+}
+
+impl Drop for TickState {
+    fn drop(&mut self) {
+        self.panel_set.update(vec![], &self.panel_ctx);
+        let _ = self.conn.flush();
+    }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    init_logging();
+
+    let log_path = {
+        let home = std::env::var("HOME").unwrap_or_default();
+        format!("{home}/.local/share/costae-crash.log")
+    };
+    install_panic_hook(log_path.clone());
+
+    let exe_path = std::env::current_exe().unwrap_or_default();
+
+    let layout_jsx_path = {
+        let home = std::env::var("HOME").unwrap_or_default();
+        std::path::PathBuf::from(home).join(".config/costae/layout.jsx")
+    };
+
+    let last_tick = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    spawn_freeze_watchdog(Arc::clone(&last_tick), log_path);
+
+    // Shared wake channel: file watchers and bi-streams ping this to interrupt
+    // DataLoop's recv_timeout early.
+    let (dl_wake_tx, dl_wake_rx) = mpsc::sync_channel::<()>(1);
+
+    let (reload_tx, reload_rx) = mpsc::channel::<()>();
+    spawn_layout_watcher(layout_jsx_path.clone(), reload_tx, dl_wake_tx.clone());
+
+    let exe_baseline: Option<std::time::SystemTime> =
+        std::env::var("COSTAE_EXE_MTIME_NS")
+            .ok()
+            .and_then(|s| s.parse::<u128>().ok())
+            .and_then(|ns| {
+                std::time::UNIX_EPOCH.checked_add(std::time::Duration::from_nanos(ns as u64))
+            })
+            .or_else(|| std::fs::metadata(&exe_path).and_then(|m| m.modified()).ok());
+
+    let (bin_reload_tx, bin_reload_rx) = mpsc::channel::<()>();
+    if exe_path.exists() {
+        spawn_binary_watcher(exe_path.clone(), exe_baseline, bin_reload_tx, dl_wake_tx.clone());
+    }
+
+    // DataLoop manages all subprocesses (string streams and modules).
+    let (mut data_loop, handle) = DataLoop::new();
+    data_loop = data_loop.with_extra_rx(dl_wake_rx);
+    let module_event_txs = data_loop.event_txs_handle();
+
+    let x11 = init_x11()?;
+
     // Cross-closure channel: on_item sends key/value here, on_tick processes them.
     let (item_tx, item_rx) = mpsc::channel::<((String, Option<String>), String)>();
-
     let stop = Arc::new(AtomicBool::new(false));
+
+    let mut tick_state = TickState::new(
+        x11, handle,
+        TickReceivers { item_rx, bin_reload_rx, reload_rx },
+        layout_jsx_path, module_event_txs,
+        Arc::clone(&stop), Arc::clone(&last_tick),
+    );
 
     data_loop.run(
         Arc::clone(&stop),
-        // on_item: relay line to on_tick via channel (avoids dual mutable capture)
-        move |item: StreamItem| {
-            let _ = item_tx.send((item.key, item.line));
-        },
-        // on_tick: all stateful work — stream processing, reloads, X11, render
-        || {
-            last_tick.store(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs(),
-                Ordering::Relaxed,
-            );
-
-            let mut needs_render = false;
-
-            // Drain stream updates from DataLoop (string streams and modules share the same channel)
-            let mut changed = false;
-            while let Ok((key, value)) = item_rx.try_recv() {
-                if stream_values.get(&key).map(|s| s.as_str()) != Some(value.as_str()) {
-                    stream_values.insert(key, value);
-                    changed = true;
-                }
-            }
-
-            if changed {
-                if let Some(new_map) = rebuild_output_map_from_stream(&stream_values) {
-                    panel_ctx.output_map = Arc::new(new_map);
-                }
-                if let Some(ref evaluator) = jsx_evaluator {
-                    let t = std::time::Instant::now();
-                    match evaluator.eval(&stream_values) {
-                        Ok((new_value, new_calls, new_module_calls)) => {
-                            tracing::debug!(elapsed_us = t.elapsed().as_micros(), "jsx re-eval");
-                            if apply_eval_result(
-                                &new_value, &new_calls, &new_module_calls,
-                                &handle, &mut panel_set, &panel_ctx,
-                                &make_mod_init,
-                            ) {
-                                needs_render = true;
-                            }
-                        }
-                        Err(e) => tracing::error!(error = %e, "JSX re-eval error"),
-                    }
-                }
-            }
-
-            // Binary reload: set stop flag; cleanup + re-exec happens after run() returns
-            if bin_reload_rx.try_recv().is_ok() {
-                tracing::info!("binary changed, restarting...");
-                stop.store(true, Ordering::Relaxed);
-                return;
-            }
-
-            // Layout reload
-            if handle_layout_reload(
-                &reload_rx, &handle, &mut stream_values,
-                &mut jsx_evaluator, &layout_jsx_path, &jsx_ctx,
-                &mut panel_set, &panel_ctx,
-                &make_mod_init,
-            ) {
-                needs_render = true;
-            }
-
-            // X11 events
-            match handle_x11_events(
-                &conn, &mut panel_set, &module_event_txs,
-                dpr, depth, screen.root, xrootpmap_atom,
-            ) {
-                Ok(wallpaper_changed) => {
-                    if wallpaper_changed { needs_render = true; }
-                }
-                Err(e) => tracing::error!(error = %e, "X11 event error"),
-            }
-
-            // Render
-            if needs_render {
-                let key = serde_json::to_value(&stream_values).unwrap_or_default();
-                for (_, panel) in panel_set.iter_mut() {
-                    inject_root_bg(panel.root_bg_rgba.clone(), panel.phys_width, panel.phys_height);
-                    panel.bgrx = panel.render_cache.get_or_render(&key, || {
-                        let t = std::time::Instant::now();
-                        let layout = resolve_layout(&panel.raw_layout);
-                        tracing::debug!(elapsed_us = t.elapsed().as_micros(), "resolve_layout");
-                        render_frame(layout, panel.phys_width, panel.phys_height, dpr)
-                    });
-                    tracing::debug!(panel = %panel.id, win_id = panel.win_id, "put_image");
-                    if let Err(e) = conn.put_image(ImageFormat::Z_PIXMAP, panel.win_id, panel.gc, panel.phys_width as u16, panel.phys_height as u16, 0, 0, 0, depth, &panel.bgrx[..]) {
-                        tracing::error!(error = %e, "put_image failed");
-                    }
-                }
-                if let Err(e) = conn.flush() {
-                    tracing::error!(error = %e, "flush failed");
-                }
-                tracing::debug!("flush ok");
-            }
-        },
+        move |item: StreamItem| { let _ = item_tx.send((item.key, item.line)); },
+        move || tick_state.tick(),
     );
 
-    // run() returned because stop was set (binary reload). Clean up and re-exec.
-    panel_set.update(vec![], &panel_ctx);
-    let _ = conn.flush();
+    // run() returned because stop was set (binary reload). TickState::drop handles cleanup.
     use std::os::unix::process::CommandExt;
     let mut cmd = std::process::Command::new(&exe_path);
     if let Ok(mtime) = std::fs::metadata(&exe_path).and_then(|m| m.modified()) {
