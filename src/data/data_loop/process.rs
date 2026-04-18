@@ -155,7 +155,7 @@ impl Lifecycle for ProcessSource {
                 }
                 *state = new_state;
             }
-        } else if let Some(p) = self.props.clone() {
+        } else if let Some(p) = self.props {
             if state.last_sent_props.as_ref() != Some(&p) {
                 let _ = state.event_tx.send(p.clone());
                 state.last_sent_props = Some(p);

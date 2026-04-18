@@ -24,7 +24,7 @@ where
     F: FnOnce(&GlobalContext) -> R,
 {
     let g = GLOBAL_CTX.get().expect("GlobalContext not initialized").lock().unwrap();
-    f(&*g)
+    f(&g)
 }
 
 /// LRU cache of rendered frames keyed on the canonical JSON of `module_values`.
@@ -111,10 +111,7 @@ fn load_fonts_impl(global: &mut GlobalContext) {
 pub fn find_font_files(dirs: &[&std::path::Path]) -> Vec<std::path::PathBuf> {
     let mut results = Vec::new();
     for &dir in dirs {
-        let read_dir = match std::fs::read_dir(dir) {
-            Ok(rd) => rd,
-            Err(_) => continue,
-        };
+        let Ok(read_dir) = std::fs::read_dir(dir) else { continue; };
         for entry in read_dir.flatten() {
             let path = entry.path();
             if !path.is_file() {

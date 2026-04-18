@@ -98,11 +98,8 @@ impl DataLoop {
     }
 
     pub fn send_event(&mut self, identity: &ProcessIdentity, event: serde_json::Value) {
-        loop {
-            match self.desired_rx.try_recv() {
-                Ok(sources) => self.set_desired(sources),
-                Err(_) => break,
-            }
+        while let Ok(sources) = self.desired_rx.try_recv() {
+            self.set_desired(sources);
         }
         self.process_pool.update(self.desired_processes.clone(), &self.stream_tx);
         if let Some(state) = self.process_pool.get(identity) {
@@ -150,12 +147,8 @@ impl DataLoop {
             }
 
             // Drain desired_rx: apply any new desired sets sent via DataLoopHandle.
-            loop {
-                match self.desired_rx.try_recv() {
-                    Ok(sources) => self.set_desired(sources),
-                    Err(mpsc::TryRecvError::Empty) => break,
-                    Err(mpsc::TryRecvError::Disconnected) => break,
-                }
+            while let Ok(sources) = self.desired_rx.try_recv() {
+                self.set_desired(sources);
             }
 
             // Check extra_rx: if a message arrives, stay awake (no blocking recv) for the

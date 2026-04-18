@@ -143,7 +143,7 @@ impl JsxEvaluator {
         &self,
         new_stream_values: &HashMap<(String, Option<String>), String>,
     ) -> EvalResult {
-        *self.stream_values.write().unwrap() = new_stream_values.clone();
+        self.stream_values.write().unwrap().clone_from(new_stream_values);
         self.calls.lock().unwrap().clear();
         self.module_calls.lock().unwrap().clear();
 

@@ -59,10 +59,7 @@ pub use data::{
 ///   root → output → content_container → workspace → windows
 /// We follow the `focus` array at each level until we reach a workspace node.
 pub fn has_fullscreen_on_output(tree: &serde_json::Value, output_name: &str) -> bool {
-    let outputs = match tree["nodes"].as_array() {
-        Some(a) => a,
-        None => return false,
-    };
+    let Some(outputs) = tree["nodes"].as_array() else { return false; };
     for output in outputs {
         if output["name"].as_str() != Some(output_name) {
             continue;

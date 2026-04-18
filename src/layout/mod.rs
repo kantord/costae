@@ -1,7 +1,5 @@
 use takumi::layout::node::Node;
 
-/// A stream key identifying a subprocess by its binary and optional script.
-
 /// Which screen edge a panel is anchored to. Drives both window placement and EWMH strut
 /// reservation. Panels without an anchor are free-floating (no strut).
 #[derive(Debug, PartialEq, Eq, Clone)]

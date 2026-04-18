@@ -127,10 +127,9 @@ fn create_panel(
         .unwrap_or((ctx.mon_x, ctx.mon_y, ctx.mon_width, ctx.mon_height));
 
     let (win_x, win_y) = match &spec.anchor {
-        Some(PanelAnchor::Left)  => (mon_x, mon_y),
+        Some(PanelAnchor::Left) | Some(PanelAnchor::Top) => (mon_x, mon_y),
         Some(PanelAnchor::Right) => (mon_x + mon_width as i16 - phys_width as i16, mon_y),
-        Some(PanelAnchor::Top)   => (mon_x, mon_y),
-        Some(PanelAnchor::Bottom)=> (mon_x, mon_y + mon_height as i16 - phys_height as i16),
+        Some(PanelAnchor::Bottom) => (mon_x, mon_y + mon_height as i16 - phys_height as i16),
         None => (
             mon_x + (spec.x as f32 * ctx.dpr).round() as i16,
             mon_y + (spec.y as f32 * ctx.dpr).round() as i16,

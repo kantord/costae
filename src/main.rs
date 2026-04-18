@@ -135,7 +135,7 @@ fn handle_x11_events(
                 if let Some(panel) = panel_set.iter().find(|(_, p)| p.win_id == e.event).map(|(_, p)| p) {
                     let txs = module_event_txs.lock().unwrap();
                     do_hit_test(
-                        &panel.raw_layout, &*txs,
+                        &panel.raw_layout, &txs,
                         panel.phys_width, panel.phys_height, dpr,
                         e.event_x as f32, e.event_y as f32,
                     );
@@ -506,7 +506,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // X11 events
             match handle_x11_events(
-                &conn, &mut panel_set, &*module_event_txs,
+                &conn, &mut panel_set, &module_event_txs,
                 dpr, depth, screen.root, xrootpmap_atom,
             ) {
                 Ok(wallpaper_changed) => {

@@ -51,39 +51,24 @@ pub fn do_hit_test(
     click_x: f32,
     click_y: f32,
 ) {
-    let layout_json = match raw_layout {
-        Some(l) => l,
-        None => return,
-    };
-    let node = match raw_layout.as_ref().and_then(|layout| {
-        parse_layout(layout)
-            .map_err(|e| tracing::error!(error = %e, "layout parse error"))
-            .ok()
-    }) {
-        Some(n) => n,
-        None => return,
-    };
+    let Some(layout_json) = raw_layout.as_ref() else { return; };
+    let Some(node) = parse_layout(layout_json)
+        .map_err(|e| tracing::error!(error = %e, "layout parse error"))
+        .ok() else { return; };
 
-    let measured = with_global_ctx(|global| {
+    let Some(measured) = with_global_ctx(|global| {
         let options = RenderOptions::builder()
             .global(global)
             .viewport(Viewport::new((Some(phys_width), Some(phys_height))).with_device_pixel_ratio(dpr))
             .node(node)
             .build();
         measure_layout(options).ok()
-    });
-    let measured = match measured {
-        Some(m) => m,
-        None => return,
-    };
+    }) else { return; };
 
     tracing::debug!(click_x, click_y, phys_width, phys_height, "hit test");
-    let (hit_path, on_click) = match hit_test(&measured, layout_json, click_x, click_y) {
-        Some(r) => r,
-        None => {
-            tracing::debug!(click_x, click_y, "hit test: no clickable node found");
-            return;
-        }
+    let Some((hit_path, on_click)) = hit_test(&measured, layout_json, click_x, click_y) else {
+        tracing::debug!(click_x, click_y, "hit test: no clickable node found");
+        return;
     };
 
     dispatch_click(module_event_txs, &hit_path, &on_click);
