@@ -59,6 +59,14 @@ impl<T: Lifecycle> ManagedSet<T> {
     pub fn iter(&self) -> impl Iterator<Item = (&T::Key, &T::State)> {
         self.store.iter()
     }
+
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = (&T::Key, &mut T::State)> {
+        self.store.iter_mut()
+    }
+
+    pub fn get_mut(&mut self, key: &T::Key) -> Option<&mut T::State> {
+        self.store.get_mut(key)
+    }
 }
 
 #[cfg(test)]
@@ -168,5 +176,31 @@ mod tests {
         ms.update(vec![TestSpec { id: "c".to_string(), value: 10 }], &ctx);
         ms.update(vec![TestSpec { id: "c".to_string(), value: 20 }], &ctx);
         assert_eq!(ms.get(&"c".to_string()), Some(&20));
+    }
+
+    // Test 7 (Claim A): iter_mut yields (&Key, &mut State) pairs; mutations are
+    // visible through subsequent get calls.
+    #[test]
+    fn iter_mut_yields_mutable_state_visible_via_get() {
+        let ctx = make_ctx();
+        let mut ms: ManagedSet<TestSpec> = ManagedSet::new();
+        ms.update(vec![TestSpec { id: "d".to_string(), value: 5 }], &ctx);
+        for (_k, v) in ms.iter_mut() {
+            *v = 99;
+        }
+        assert_eq!(ms.get(&"d".to_string()), Some(&99));
+    }
+
+    // Test 8 (Claim B): get_mut returns a mutable reference; a mutation through it
+    // is visible via the subsequent get call.
+    #[test]
+    fn get_mut_returns_mutable_reference_visible_via_get() {
+        let ctx = make_ctx();
+        let mut ms: ManagedSet<TestSpec> = ManagedSet::new();
+        ms.update(vec![TestSpec { id: "e".to_string(), value: 3 }], &ctx);
+        if let Some(v) = ms.get_mut(&"e".to_string()) {
+            *v = 77;
+        }
+        assert_eq!(ms.get(&"e".to_string()), Some(&77));
     }
 }

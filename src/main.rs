@@ -4,9 +4,11 @@ use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::Duration;
 
-use costae::{RenderCache, inject_root_bg, init_global_ctx, parse_layout, preload_layout_images, reconcile_panels, render_frame};
+use costae::{RenderCache, inject_root_bg, init_global_ctx, parse_layout, render_frame};
 use costae::data::data_loop::{CommandSpec, DataLoop, DataLoopHandle, ProcessIdentity, StreamItem};
-use costae::x11::panel::{Panel, X11Context, create_panel, destroy_panel, sample_root_bg, i3_dpi, do_hit_test};
+use costae::x11::panel::{sample_root_bg, i3_dpi, do_hit_test, PanelContext};
+use costae::managed_set::ManagedSet;
+use costae::layout::PanelSpec;
 use x11rb::{
     connection::Connection,
     protocol::{randr::ConnectionExt as RandrExt, xproto::*},
@@ -35,25 +37,14 @@ fn stream_calls_to_specs(calls: &[(String, Option<String>)]) -> Vec<costae::data
     }).collect()
 }
 
-fn module_calls_to_specs(calls: &[(String, serde_json::Value)]) -> Vec<CommandSpec> {
-    calls.iter().map(|(bin, props)| CommandSpec {
-        identity: ProcessIdentity { bin: bin.clone(), key: bin.clone() },
-        script: None,
-        args: vec![],
-        env: std::collections::BTreeMap::new(),
-        current_dir: None,
-        props: Some(props.clone()),
-    }).collect()
-}
-
 fn apply_eval_result(
     value: &serde_json::Value,
     stream_calls: &[(String, Option<String>)],
     module_calls: &[(String, serde_json::Value)],
     handle: &DataLoopHandle,
-    panels: &mut Vec<Panel>,
+    panel_set: &mut ManagedSet<PanelSpec>,
+    panel_ctx: &PanelContext,
     mod_init_fn: &dyn Fn(&[costae::PanelSpec]) -> serde_json::Value,
-    apply_panel_specs_fn: &mut dyn FnMut(&mut Vec<Panel>, Vec<costae::PanelSpec>),
 ) -> bool {
     let specs = match costae::parse_root_node(value) {
         Ok(s) => s,
@@ -81,7 +72,7 @@ fn apply_eval_result(
     let combined = stream_specs.into_iter().chain(module_specs).collect::<Vec<_>>();
     handle.set_desired(combined);
 
-    apply_panel_specs_fn(panels, specs);
+    panel_set.update(specs, panel_ctx);
     true
 }
 
@@ -104,7 +95,7 @@ fn drain_stream_updates(
 #[allow(clippy::too_many_arguments)]
 fn handle_x11_events(
     conn: &RustConnection,
-    panels: &mut [Panel],
+    panel_set: &mut ManagedSet<PanelSpec>,
     module_event_txs: &std::sync::Mutex<HashMap<String, mpsc::Sender<serde_json::Value>>>,
     dpr: f32,
     depth: u8,
@@ -115,16 +106,16 @@ fn handle_x11_events(
     while let Some(event) = conn.poll_for_event()? {
         match event {
             x11rb::protocol::Event::Expose(e) => {
-                if let Some(panel) = panels.iter().find(|p| p.win_id == e.window) {
+                if let Some(panel) = panel_set.iter().find(|(_, p)| p.win_id == e.window).map(|(_, p)| p) {
                     tracing::debug!(panel = %panel.id, win_id = panel.win_id, "expose repaint");
                     conn.put_image(ImageFormat::Z_PIXMAP, panel.win_id, panel.gc, panel.phys_width as u16, panel.phys_height as u16, 0, 0, 0, depth, &panel.bgrx[..])?;
                     conn.flush()?;
                 }
             }
             x11rb::protocol::Event::ButtonPress(e) => {
-                let panel_ids: Vec<u32> = panels.iter().map(|p| p.win_id).collect();
+                let panel_ids: Vec<u32> = panel_set.iter().map(|(_, p)| p.win_id).collect();
                 tracing::debug!(event_win = e.event, x = e.event_x, y = e.event_y, known_wins = ?panel_ids, "ButtonPress");
-                if let Some(panel) = panels.iter().find(|p| p.win_id == e.event) {
+                if let Some(panel) = panel_set.iter().find(|(_, p)| p.win_id == e.event).map(|(_, p)| p) {
                     let txs = module_event_txs.lock().unwrap();
                     do_hit_test(
                         &panel.raw_layout, &*txs,
@@ -135,7 +126,7 @@ fn handle_x11_events(
             }
             x11rb::protocol::Event::PropertyNotify(e) => {
                 if xrootpmap_atom == Some(e.atom) {
-                    for panel in panels.iter_mut() {
+                    for (_, panel) in panel_set.iter_mut() {
                         if let Some(rgba) = sample_root_bg(conn, root, panel.win_x, panel.win_y, panel.phys_width, panel.phys_height, xrootpmap_atom) {
                             panel.root_bg_rgba = rgba;
                             tracing::debug!(panel = %panel.id, "root bg updated");
@@ -162,9 +153,9 @@ fn handle_layout_reload(
     jsx_evaluator: &mut Option<costae::jsx::JsxEvaluator>,
     layout_jsx_path: &std::path::Path,
     jsx_ctx: &serde_json::Value,
-    panels: &mut Vec<Panel>,
+    panel_set: &mut ManagedSet<PanelSpec>,
+    panel_ctx: &PanelContext,
     mod_init_fn: &dyn Fn(&[costae::PanelSpec]) -> serde_json::Value,
-    apply_panel_specs_fn: &mut dyn FnMut(&mut Vec<Panel>, Vec<costae::PanelSpec>),
 ) -> bool {
     if reload_rx.try_recv().is_err() {
         return false;
@@ -180,8 +171,8 @@ fn handle_layout_reload(
                     Ok((value, stream_calls, module_calls)) => {
                         apply_eval_result(
                             &value, &stream_calls, &module_calls,
-                            handle, panels,
-                            mod_init_fn, apply_panel_specs_fn,
+                            handle, panel_set, panel_ctx,
+                            mod_init_fn,
                         );
                         *jsx_evaluator = Some(evaluator);
                     }
@@ -317,6 +308,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut jsx_evaluator: Option<costae::jsx::JsxEvaluator> = None;
 
     let (conn, screen_num) = RustConnection::connect(None)?;
+    let conn = Arc::new(conn);
     let screen = &conn.setup().roots[screen_num];
     let depth = screen.root_depth;
 
@@ -365,10 +357,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let strut_atom = conn.intern_atom(false, b"_NET_WM_STRUT_PARTIAL")?.reply()?.atom;
     let strut_legacy_atom = conn.intern_atom(false, b"_NET_WM_STRUT")?.reply()?.atom;
 
-    let x11 = X11Context {
-        conn: &conn,
-        screen,
-        depth,
+    let panel_ctx = PanelContext {
+        conn: Arc::clone(&conn),
+        root: screen.root,
+        depth: screen.root_depth,
+        root_visual: screen.root_visual,
+        black_pixel: screen.black_pixel,
         dpr,
         mon_x,
         mon_y,
@@ -377,13 +371,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         xrootpmap_atom,
         strut_atom,
         strut_legacy_atom,
-        output_map: &output_map,
+        output_map: Arc::new(output_map),
     };
 
     let screen_width_logical = (mon_width as f32 / dpr).round() as u32;
     let screen_height_logical = (mon_height as f32 / dpr).round() as u32;
 
-    let outputs_json: Vec<serde_json::Value> = output_map.iter().map(|(name, &(_, _, pw, ph))| {
+    let outputs_json: Vec<serde_json::Value> = panel_ctx.output_map.iter().map(|(name, &(_, _, pw, ph))| {
         serde_json::json!({
             "name": name,
             "screen_width":  (pw as f32 / dpr).round() as u32,
@@ -399,7 +393,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "outputs": outputs_json,
     });
 
-    let mut panels: Vec<Panel> = Vec::new();
+    let mut panel_set: ManagedSet<PanelSpec> = ManagedSet::new();
 
     let make_mod_init = |specs: &[costae::PanelSpec]| -> serde_json::Value {
         let spec = specs.iter()
@@ -421,44 +415,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
     };
 
-    let mut apply_panel_specs = |panels: &mut Vec<Panel>, specs: Vec<costae::PanelSpec>| {
-        let existing_ids: Vec<&str> = panels.iter().map(|p| p.id.as_str()).collect();
-        let (to_create, to_update, to_destroy) = reconcile_panels(&existing_ids, &specs);
-
-        for id in &to_destroy {
-            if let Some(pos) = panels.iter().position(|p| &p.id == id) {
-                let panel = panels.remove(pos);
-                let _ = conn.free_gc(panel.gc);
-                let _ = conn.destroy_window(panel.win_id);
-            }
-        }
-
-        for spec in &to_create {
-            match create_panel(spec, &x11) {
-                Ok(mut panel) => {
-                    let content = specs.iter().find(|s| s.id == spec.id).map(|s| s.content.clone()).unwrap_or_default();
-                    if !content.is_null() {
-                        preload_layout_images(&content);
-                        panel.raw_layout = Some(content);
-                    }
-                    panels.push(panel);
-                }
-                Err(e) => tracing::error!(panel = %spec.id, error = %e, "failed to create panel"),
-            }
-        }
-
-        for spec in &to_update {
-            if let Some(panel) = panels.iter_mut().find(|p| p.id == spec.id) {
-                let content = specs.iter().find(|s| s.id == spec.id).map(|s| s.content.clone()).unwrap_or_default();
-                if !content.is_null() {
-                    preload_layout_images(&content);
-                    panel.raw_layout = Some(content);
-                    panel.render_cache = RenderCache::new(30);
-                }
-            }
-        }
-    };
-
     // Initial JSX load
     if layout_jsx_path.exists() {
         match std::fs::read_to_string(&layout_jsx_path) {
@@ -471,8 +427,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 tracing::debug!(elapsed_ms = t.elapsed().as_millis(), "jsx eval");
                                 apply_eval_result(
                                     &value, &stream_calls, &module_calls,
-                                    &handle, &mut panels,
-                                    &make_mod_init, &mut apply_panel_specs,
+                                    &handle, &mut panel_set, &panel_ctx,
+                                    &make_mod_init,
                                 );
                                 jsx_evaluator = Some(evaluator);
                             }
@@ -527,8 +483,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             tracing::debug!(elapsed_us = t.elapsed().as_micros(), "jsx re-eval");
                             if apply_eval_result(
                                 &new_value, &new_calls, &new_module_calls,
-                                &handle, &mut panels,
-                                &make_mod_init, &mut apply_panel_specs,
+                                &handle, &mut panel_set, &panel_ctx,
+                                &make_mod_init,
                             ) {
                                 needs_render = true;
                             }
@@ -548,15 +504,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Layout reload
             if handle_layout_reload(
                 &reload_rx, &handle, &mut stream_values,
-                &mut jsx_evaluator, &layout_jsx_path, &jsx_ctx, &mut panels,
-                &make_mod_init, &mut apply_panel_specs,
+                &mut jsx_evaluator, &layout_jsx_path, &jsx_ctx,
+                &mut panel_set, &panel_ctx,
+                &make_mod_init,
             ) {
                 needs_render = true;
             }
 
             // X11 events
             match handle_x11_events(
-                &conn, &mut panels, &*module_event_txs,
+                &conn, &mut panel_set, &*module_event_txs,
                 dpr, depth, screen.root, xrootpmap_atom,
             ) {
                 Ok(wallpaper_changed) => { if wallpaper_changed { needs_render = true; } }
@@ -566,7 +523,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Render
             if needs_render {
                 let key = serde_json::to_value(&stream_values).unwrap_or_default();
-                for panel in panels.iter_mut() {
+                for (_, panel) in panel_set.iter_mut() {
                     inject_root_bg(panel.root_bg_rgba.clone(), panel.phys_width, panel.phys_height);
                     panel.bgrx = panel.render_cache.get_or_render(&key, || {
                         let t = std::time::Instant::now();
@@ -588,9 +545,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // run() returned because stop was set (binary reload). Clean up and re-exec.
-    for panel in std::mem::take(&mut panels) {
-        destroy_panel(panel, &conn);
-    }
+    panel_set.update(vec![], &panel_ctx);
     let _ = conn.flush();
     use std::os::unix::process::CommandExt;
     let mut cmd = std::process::Command::new(&exe_path);
@@ -606,7 +561,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{drain_stream_updates, module_calls_to_specs, stream_calls_to_specs};
+    use super::{drain_stream_updates, stream_calls_to_specs};
     use costae::data::data_loop::{CommandSpec, ProcessIdentity, StreamItem, StreamKind};
     use std::collections::{BTreeMap, HashMap};
     use std::sync::mpsc;
@@ -698,34 +653,5 @@ mod tests {
         assert_eq!(specs[0].args, Vec::<String>::new());
         assert_eq!(specs[1].identity.bin, "python");
         assert_eq!(specs[1].script, Some("print('hi')".to_string()));
-    }
-
-    /// module_calls_to_specs converts (bin, props) pairs into CommandSpecs routed
-    /// through DataLoop — not BiStreamRegistry.  Each spec must have:
-    ///   - identity.bin == the supplied bin string
-    ///   - props == Some(the supplied serde_json::Value)
-    ///   - script == None  (modules are long-running processes, not scripts)
-    #[test]
-    fn module_calls_to_specs_sets_props_on_each_spec() {
-        let calls = vec![
-            (
-                "/usr/bin/clock-module".to_string(),
-                serde_json::json!({"interval": 1000}),
-            ),
-            (
-                "/usr/bin/workspace-module".to_string(),
-                serde_json::json!({"output": "DP-1"}),
-            ),
-        ];
-        let specs = module_calls_to_specs(&calls);
-        assert_eq!(specs.len(), 2);
-
-        assert_eq!(specs[0].identity.bin, "/usr/bin/clock-module");
-        assert_eq!(specs[0].props, Some(serde_json::json!({"interval": 1000})));
-        assert_eq!(specs[0].script, None);
-
-        assert_eq!(specs[1].identity.bin, "/usr/bin/workspace-module");
-        assert_eq!(specs[1].props, Some(serde_json::json!({"output": "DP-1"})));
-        assert_eq!(specs[1].script, None);
     }
 }

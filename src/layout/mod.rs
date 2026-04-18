@@ -104,20 +104,3 @@ pub fn parse_root_node(root: &serde_json::Value) -> Result<Vec<PanelSpec>, Strin
     }).collect()
 }
 
-/// Partition new panel specs against currently-live panel ids.
-///
-/// Returns `(to_create, to_update, to_destroy)` where:
-/// - `to_create`: specs whose id is not in `existing_ids` — a new X11 window must be created
-/// - `to_update`: specs whose id IS in `existing_ids` — re-render in the existing window
-/// - `to_destroy`: existing ids not present in `new_specs` — the X11 window must be destroyed
-pub fn reconcile_panels<'a>(
-    existing_ids: &[&str],
-    new_specs: &'a [PanelSpec],
-) -> (Vec<&'a PanelSpec>, Vec<&'a PanelSpec>, Vec<String>) {
-    let new_ids: std::collections::HashSet<&str> = new_specs.iter().map(|p| p.id.as_str()).collect();
-    let existing_set: std::collections::HashSet<&str> = existing_ids.iter().copied().collect();
-    let to_create = new_specs.iter().filter(|p| !existing_set.contains(p.id.as_str())).collect();
-    let to_update = new_specs.iter().filter(|p| existing_set.contains(p.id.as_str())).collect();
-    let to_destroy = existing_ids.iter().filter(|id| !new_ids.contains(*id)).map(|s| s.to_string()).collect();
-    (to_create, to_update, to_destroy)
-}

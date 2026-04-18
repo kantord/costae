@@ -15,8 +15,13 @@ pub use layout::{
     PanelSpec,
     parse_layout,
     parse_root_node,
-    reconcile_panels,
 };
+
+// managed_set
+pub use managed_set::ManagedSet;
+
+// x11 panel context
+pub use x11::panel::PanelContext;
 
 // render
 pub use render::{
@@ -37,8 +42,6 @@ pub use x11::{
     solid_color_rgba,
     strut_partial_values_for_anchor,
 };
-pub use x11::panel::PanelPool;
-
 // data spawn functions
 pub use data::{
     spawn_module,
@@ -173,20 +176,5 @@ mod tests {
         assert_eq!(v[8], 0);   // top_start_x
         assert_eq!(v[9], 1919); // top_end_x
     }
-
-    #[test]
-    fn reconcile_panels_partitions_specs_into_create_update_destroy() {
-        fn spec(id: &str) -> PanelSpec {
-            PanelSpec { id: id.to_string(), anchor: None, width: 100, height: 100, x: 0, y: 0, outer_gap: 0, output: None, above: false, content: serde_json::Value::Null }
-        }
-        let new_specs = vec![spec("sidebar"), spec("topbar")];
-        let (to_create, to_update, to_destroy) = reconcile_panels(&["sidebar", "bottombar"], &new_specs);
-        assert_eq!(to_create.len(), 1);
-        assert_eq!(to_create[0].id, "topbar");
-        assert_eq!(to_update.len(), 1);
-        assert_eq!(to_update[0].id, "sidebar");
-        assert_eq!(to_destroy, vec!["bottombar".to_string()]);
-    }
-
 
 }
