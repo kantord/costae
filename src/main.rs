@@ -64,7 +64,12 @@ fn apply_eval_result(
     };
     let mod_init = mod_init_fn(&specs);
 
-    let mut combined = stream_calls_to_specs(stream_calls);
+    let module_bins: std::collections::HashSet<String> =
+        module_calls.iter().map(|(b, _)| b.clone()).collect();
+    let stream_specs = stream_calls_to_specs(stream_calls)
+        .into_iter()
+        .filter(|s| !module_bins.contains(&s.identity.bin))
+        .collect::<Vec<_>>();
     let module_specs: Vec<CommandSpec> = module_calls.iter().map(|(bin, _)| CommandSpec {
         identity: ProcessIdentity { bin: bin.clone(), key: bin.clone() },
         script: None,
@@ -73,7 +78,7 @@ fn apply_eval_result(
         current_dir: None,
         props: Some(mod_init.clone()),
     }).collect();
-    combined.extend(module_specs);
+    let combined = stream_specs.into_iter().chain(module_specs).collect::<Vec<_>>();
     handle.set_desired(combined);
 
     apply_panel_specs_fn(panels, specs);
@@ -117,6 +122,8 @@ fn handle_x11_events(
                 }
             }
             x11rb::protocol::Event::ButtonPress(e) => {
+                let panel_ids: Vec<u32> = panels.iter().map(|p| p.win_id).collect();
+                tracing::debug!(event_win = e.event, x = e.event_x, y = e.event_y, known_wins = ?panel_ids, "ButtonPress");
                 if let Some(panel) = panels.iter().find(|p| p.win_id == e.event) {
                     let txs = module_event_txs.lock().unwrap();
                     do_hit_test(
@@ -191,8 +198,10 @@ fn handle_layout_reload(
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env()
-            .add_directive(tracing::Level::INFO.into()))
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
         .init();
 
     let log_path = {

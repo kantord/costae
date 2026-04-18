@@ -126,13 +126,20 @@ fn spawn_process(spec: CommandSpec, tx: &mpsc::Sender<StreamItem>) -> Option<Pro
     // Wire up a stdin writer thread backed by an mpsc channel.
     let (event_tx, event_rx) = mpsc::channel::<serde_json::Value>();
     if let Some(mut stdin) = child.stdin.take() {
+        let bin_for_log = spec.identity.bin.clone();
         thread::spawn(move || {
             while let Ok(event) = event_rx.recv() {
+                let event_type = event.get("type").or_else(|| event.get("event")).and_then(|v| v.as_str()).unwrap_or("?");
+                if event_type != "init" {
+                    tracing::debug!(bin = %bin_for_log, event_type, "stdin writer: writing event to pipe");
+                }
                 let line = serde_json::to_string(&event).unwrap_or_default() + "\n";
                 if stdin.write_all(line.as_bytes()).is_err() {
+                    tracing::debug!(bin = %bin_for_log, "stdin writer: write_all failed, exiting");
                     break;
                 }
             }
+            tracing::debug!(bin = %bin_for_log, "stdin writer: channel closed, exiting");
         });
     }
 

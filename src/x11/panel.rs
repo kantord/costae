@@ -141,10 +141,13 @@ fn dispatch_click(
     on_click: &serde_json::Value,
 ) {
     if let Some(channel) = on_click.get("__channel__").and_then(|v| v.as_str()) {
-if let Some(tx) = module_event_txs.get(channel) {
+        if let Some(tx) = module_event_txs.get(channel) {
             let mut payload = on_click.clone();
             if let Some(obj) = payload.as_object_mut() { obj.remove("__channel__"); }
-            let _ = tx.send(serde_json::json!({"event": "click", "data": payload}));
+            let result = tx.send(serde_json::json!({"event": "click", "data": payload}));
+            tracing::debug!(channel, ok = result.is_ok(), "click dispatched via __channel__");
+        } else {
+            tracing::debug!(channel, known_channels = ?module_event_txs.keys().collect::<Vec<_>>(), "click __channel__ not found");
         }
         return;
     }
@@ -152,11 +155,15 @@ if let Some(tx) = module_event_txs.get(channel) {
     loop {
         if let Some(tx) = module_event_txs.get(&path) {
             let _ = tx.send(serde_json::json!({"event": "click", "data": on_click}));
+            tracing::debug!(path, "click dispatched via path");
             return;
         }
         match path.rfind('/') {
             Some(pos) => path.truncate(pos),
-            None => return,
+            None => {
+                tracing::debug!(hit_path, "click: no channel matched");
+                return;
+            }
         }
     }
 }
@@ -198,9 +205,13 @@ pub fn do_hit_test(
         None => return,
     };
 
+    tracing::debug!(click_x, click_y, phys_width, phys_height, "hit test");
     let (hit_path, on_click) = match hit_test(&measured, layout_json, click_x, click_y) {
         Some(r) => r,
-        None => return,
+        None => {
+            tracing::debug!(click_x, click_y, "hit test: no clickable node found");
+            return;
+        }
     };
 
     dispatch_click(module_event_txs, &hit_path, &on_click);
