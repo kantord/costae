@@ -1,7 +1,7 @@
-mod internal;
+mod builtin;
 mod process;
 
-pub use internal::InternalSource;
+pub use builtin::{BuiltInSource, BuiltInState};
 pub use process::{ProcessIdentity, ProcessSource, ProcessState};
 
 use std::collections::HashMap;
@@ -26,7 +26,7 @@ pub struct StreamItem {
 
 pub enum StreamSource {
     Process(ProcessSource),
-    Internal(InternalSource),
+    BuiltIn(BuiltInSource),
 }
 
 pub struct DataLoopHandle {
@@ -41,10 +41,10 @@ impl DataLoopHandle {
 
 pub struct DataLoop {
     process_pool: ManagedSet<ProcessSource>,
-    internal_pool: ManagedSet<InternalSource>,
+    builtin_pool: ManagedSet<BuiltInSource>,
     stream_tx: mpsc::Sender<StreamItem>,
     desired_processes: Vec<ProcessSource>,
-    desired_internals: Vec<InternalSource>,
+    desired_builtins: Vec<BuiltInSource>,
     timeout: Option<Duration>,
     rx: mpsc::Receiver<StreamItem>,
     extra_rx: Option<mpsc::Receiver<()>>,
@@ -61,10 +61,10 @@ impl DataLoop {
         let event_txs_snapshot = Arc::new(Mutex::new(HashMap::new()));
         let data_loop = Self {
             process_pool: ManagedSet::new(),
-            internal_pool: ManagedSet::new(),
+            builtin_pool: ManagedSet::new(),
             stream_tx,
             desired_processes: Vec::new(),
-            desired_internals: Vec::new(),
+            desired_builtins: Vec::new(),
             timeout: None,
             rx,
             extra_rx: None,
@@ -112,11 +112,11 @@ impl DataLoop {
 
     fn set_desired(&mut self, sources: Vec<StreamSource>) {
         let mut processes = vec![];
-        let mut internals = vec![];
+        let mut builtins = vec![];
         for s in sources {
             match s {
                 StreamSource::Process(p) => processes.push(p),
-                StreamSource::Internal(i) => internals.push(i),
+                StreamSource::BuiltIn(b) => builtins.push(b),
             }
         }
         let mut seen = std::collections::HashSet::new();
@@ -124,9 +124,9 @@ impl DataLoop {
             .into_iter()
             .filter(|s| seen.insert(s.identity.clone()))
             .collect();
-        self.desired_internals = internals;
+        self.desired_builtins = builtins;
         self.process_pool.update(self.desired_processes.clone(), &self.stream_tx);
-        self.internal_pool.update(self.desired_internals.clone(), &self.stream_tx);
+        self.builtin_pool.update(self.desired_builtins.clone(), &self.stream_tx);
         self.update_event_txs_snapshot();
     }
 
@@ -173,7 +173,7 @@ impl DataLoop {
 
             // Reconcile: enter new, exit removed, update existing (restarts crashed processes).
             self.process_pool.update(self.desired_processes.clone(), &self.stream_tx);
-            self.internal_pool.update(self.desired_internals.clone(), &self.stream_tx);
+            self.builtin_pool.update(self.desired_builtins.clone(), &self.stream_tx);
             self.update_event_txs_snapshot();
 
             on_tick();
