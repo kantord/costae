@@ -16,6 +16,7 @@ type ModuleEventTxs = Arc<std::sync::Mutex<HashMap<String, mpsc::Sender<serde_js
 
 const FREEZE_WATCHDOG_POLL_SECS: u64 = 10;
 const FREEZE_STALE_THRESHOLD_SECS: u64 = 10;
+const FILE_WATCHER_POLL_MS: u64 = 500;
 
 fn log_lifecycle_errors<K: Debug, E: Debug>(errors: Vec<(K, E)>) {
     for (key, err) in errors {
@@ -260,23 +261,33 @@ fn spawn_freeze_watchdog(last_tick: Arc<std::sync::atomic::AtomicU64>, log_path:
     });
 }
 
+fn spawn_file_watcher(
+    path: std::path::PathBuf,
+    baseline: Option<std::time::SystemTime>,
+    on_change_tx: mpsc::Sender<()>,
+    dl_wake_tx: mpsc::SyncSender<()>,
+) {
+    thread::spawn(move || {
+        let mut last_modified = baseline;
+        loop {
+            thread::sleep(Duration::from_millis(FILE_WATCHER_POLL_MS));
+            let modified = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+            if modified != last_modified {
+                last_modified = modified;
+                let _ = on_change_tx.send(());
+                let _ = dl_wake_tx.try_send(());
+            }
+        }
+    });
+}
+
 fn spawn_layout_watcher(
     path: std::path::PathBuf,
     reload_tx: mpsc::Sender<()>,
     dl_wake_tx: mpsc::SyncSender<()>,
 ) {
-    thread::spawn(move || {
-        let mut last_modified = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
-        loop {
-            thread::sleep(Duration::from_millis(500));
-            let modified = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
-            if modified != last_modified {
-                last_modified = modified;
-                let _ = reload_tx.send(());
-                let _ = dl_wake_tx.try_send(());
-            }
-        }
-    });
+    let baseline = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+    spawn_file_watcher(path, baseline, reload_tx, dl_wake_tx);
 }
 
 fn spawn_binary_watcher(
@@ -285,18 +296,7 @@ fn spawn_binary_watcher(
     bin_reload_tx: mpsc::Sender<()>,
     dl_wake_tx: mpsc::SyncSender<()>,
 ) {
-    thread::spawn(move || {
-        let mut last_modified = baseline;
-        loop {
-            thread::sleep(Duration::from_millis(500));
-            let modified = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
-            if modified != last_modified {
-                last_modified = modified;
-                let _ = bin_reload_tx.send(());
-                let _ = dl_wake_tx.try_send(());
-            }
-        }
-    });
+    spawn_file_watcher(path, baseline, bin_reload_tx, dl_wake_tx);
 }
 
 struct X11Init {
