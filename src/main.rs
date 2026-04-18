@@ -4,7 +4,7 @@ use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::Duration;
 
-use costae::{GlobalContext, RenderCache, inject_root_bg, load_fonts, parse_layout, preload_layout_images, reconcile_panels, render_frame};
+use costae::{RenderCache, inject_root_bg, init_global_ctx, parse_layout, preload_layout_images, reconcile_panels, render_frame};
 use costae::data::data_loop::{CommandSpec, DataLoop, DataLoopHandle, ProcessIdentity, StreamItem};
 use costae::x11::panel::{Panel, X11Context, create_panel, destroy_panel, sample_root_bg, i3_dpi, do_hit_test};
 use x11rb::{
@@ -101,7 +101,6 @@ fn handle_x11_events(
     conn: &RustConnection,
     panels: &mut [Panel],
     module_event_txs: &std::sync::Mutex<HashMap<String, mpsc::Sender<serde_json::Value>>>,
-    global: &GlobalContext,
     dpr: f32,
     depth: u8,
     root: u32,
@@ -122,7 +121,7 @@ fn handle_x11_events(
                     let txs = module_event_txs.lock().unwrap();
                     do_hit_test(
                         &panel.raw_layout, &*txs,
-                        global, panel.phys_width, panel.phys_height, dpr,
+                        panel.phys_width, panel.phys_height, dpr,
                         e.event_x as f32, e.event_y as f32,
                     );
                 }
@@ -343,8 +342,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let mut global = GlobalContext::default();
-    load_fonts(&mut global);
+    init_global_ctx();
 
     conn.change_window_attributes(
         screen.root,
@@ -362,7 +360,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         conn: &conn,
         screen,
         depth,
-        global: &global,
         dpr,
         mon_x,
         mon_y,
@@ -432,7 +429,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Ok(mut panel) => {
                     let content = specs.iter().find(|s| s.id == spec.id).map(|s| s.content.clone()).unwrap_or_default();
                     if !content.is_null() {
-                        preload_layout_images(&content, &global);
+                        preload_layout_images(&content);
                         panel.raw_layout = Some(content);
                     }
                     panels.push(panel);
@@ -445,7 +442,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(panel) = panels.iter_mut().find(|p| p.id == spec.id) {
                 let content = specs.iter().find(|s| s.id == spec.id).map(|s| s.content.clone()).unwrap_or_default();
                 if !content.is_null() {
-                    preload_layout_images(&content, &global);
+                    preload_layout_images(&content);
                     panel.raw_layout = Some(content);
                     panel.render_cache = RenderCache::new(30);
                 }
@@ -551,7 +548,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // X11 events
             match handle_x11_events(
                 &conn, &mut panels, &*module_event_txs,
-                &global, dpr, depth, screen.root, xrootpmap_atom,
+                dpr, depth, screen.root, xrootpmap_atom,
             ) {
                 Ok(wallpaper_changed) => { if wallpaper_changed { needs_render = true; } }
                 Err(e) => tracing::error!(error = %e, "X11 event error"),
@@ -561,12 +558,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if needs_render {
                 let key = serde_json::to_value(&stream_values).unwrap_or_default();
                 for panel in panels.iter_mut() {
-                    inject_root_bg(&global, panel.root_bg_rgba.clone(), panel.phys_width, panel.phys_height);
+                    inject_root_bg(panel.root_bg_rgba.clone(), panel.phys_width, panel.phys_height);
                     panel.bgrx = panel.render_cache.get_or_render(&key, || {
                         let t = std::time::Instant::now();
                         let layout = resolve_layout(&panel.raw_layout);
                         tracing::debug!(elapsed_us = t.elapsed().as_micros(), "resolve_layout");
-                        render_frame(layout, &global, panel.phys_width, panel.phys_height, dpr)
+                        render_frame(layout, panel.phys_width, panel.phys_height, dpr)
                     });
                     tracing::debug!(panel = %panel.id, win_id = panel.win_id, "put_image");
                     if let Err(e) = conn.put_image(ImageFormat::Z_PIXMAP, panel.win_id, panel.gc, panel.phys_width as u16, panel.phys_height as u16, 0, 0, 0, depth, &panel.bgrx[..]) {

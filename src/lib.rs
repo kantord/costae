@@ -22,8 +22,9 @@ pub use layout::{
 pub use render::{
     RenderCache,
     render_frame,
-    load_fonts,
+    init_global_ctx,
     preload_layout_images,
+    with_global_ctx,
 };
 
 // modules

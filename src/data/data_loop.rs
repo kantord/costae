@@ -8,10 +8,10 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use crate::managed_set::{HasKey, Lifecycle, ManagedSet};
+use crate::managed_set::{Lifecycle, ManagedSet};
 
 /// Stable identity for a process: uniquely identifies which process to manage.
-/// Used as the key in `HasKey` so that `ManagedSet` can track processes by identity.
+/// Used as the key in `Lifecycle` so that `ManagedSet` can track processes by identity.
 #[derive(Hash, Eq, PartialEq, Clone, Debug)]
 pub struct ProcessIdentity {
     pub bin: String,
@@ -139,16 +139,14 @@ fn spawn_process(spec: CommandSpec, tx: &mpsc::Sender<StreamItem>) -> Option<Pro
     Some(ProcessState { child, event_tx })
 }
 
-impl HasKey for CommandSpec {
+impl Lifecycle for CommandSpec {
     type Key = ProcessIdentity;
+    type State = ProcessState;
+    type Context = mpsc::Sender<StreamItem>;
+
     fn key(&self) -> ProcessIdentity {
         self.identity.clone()
     }
-}
-
-impl Lifecycle for CommandSpec {
-    type State = ProcessState;
-    type Context = mpsc::Sender<StreamItem>;
 
     fn enter(self, ctx: &Self::Context) -> Option<Self::State> {
         let props = self.props.clone();
@@ -255,7 +253,7 @@ impl DataLoop {
 
     fn set_desired(&mut self, desired: &[CommandSpec]) {
         // Deduplicate desired specs while preserving first occurrence order.
-        // Use ProcessIdentity (the HasKey type) as the deduplication key.
+        // Use ProcessIdentity (the Lifecycle key type) as the deduplication key.
         let mut seen = std::collections::HashSet::new();
         let desired_unique: Vec<CommandSpec> = desired
             .iter()
@@ -692,11 +690,9 @@ mod tests {
         assert!(spec.script.is_some());
     }
 
-    /// Compile-time + runtime: `HasKey for CommandSpec` must use `type Key = ProcessIdentity`
-    /// and `key()` must return `self.identity.clone()`.
     #[test]
     fn has_key_for_command_spec_returns_process_identity() {
-        use crate::managed_set::HasKey;
+        use crate::managed_set::Lifecycle;
         let id = ProcessIdentity {
             bin: "/usr/bin/cat".to_string(),
             key: "cat-key".to_string(),

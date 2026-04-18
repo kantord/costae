@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, mpsc};
 
-use takumi::GlobalContext;
 use takumi::layout::Viewport;
 use takumi::rendering::{RenderOptions, measure_layout};
 use x11rb::{
@@ -38,7 +37,6 @@ pub struct X11Context<'a> {
     pub conn: &'a RustConnection,
     pub screen: &'a Screen,
     pub depth: u8,
-    pub global: &'a GlobalContext,
     pub dpr: f32,
     /// Primary monitor coordinates (fallback when panel has no output= prop).
     pub mon_x: i16,
@@ -167,13 +165,13 @@ if let Some(tx) = module_event_txs.get(channel) {
 pub fn do_hit_test(
     raw_layout: &Option<serde_json::Value>,
     module_event_txs: &HashMap<String, mpsc::Sender<serde_json::Value>>,
-    global: &GlobalContext,
     phys_width: u32,
     phys_height: u32,
     dpr: f32,
     click_x: f32,
     click_y: f32,
 ) {
+    use crate::render::with_global_ctx;
     let layout_json = match raw_layout {
         Some(l) => l,
         None => return,
@@ -187,14 +185,17 @@ pub fn do_hit_test(
         None => return,
     };
 
-    let options = RenderOptions::builder()
-        .global(global)
-        .viewport(Viewport::new((Some(phys_width), Some(phys_height))).with_device_pixel_ratio(dpr))
-        .node(node)
-        .build();
-    let measured = match measure_layout(options) {
-        Ok(m) => m,
-        Err(_) => return,
+    let measured = with_global_ctx(|global| {
+        let options = RenderOptions::builder()
+            .global(global)
+            .viewport(Viewport::new((Some(phys_width), Some(phys_height))).with_device_pixel_ratio(dpr))
+            .node(node)
+            .build();
+        measure_layout(options).ok()
+    });
+    let measured = match measured {
+        Some(m) => m,
+        None => return,
     };
 
     let (hit_path, on_click) = match hit_test(&measured, layout_json, click_x, click_y) {
@@ -251,7 +252,7 @@ pub fn create_panel(
 
     let root_bg_rgba = sample_root_bg(x11.conn, x11.screen.root, win_x, win_y, phys_width, phys_height, x11.xrootpmap_atom)
         .unwrap_or_default();
-    inject_root_bg(x11.global, root_bg_rgba.clone(), phys_width, phys_height);
+    inject_root_bg(root_bg_rgba.clone(), phys_width, phys_height);
 
     x11.conn.map_window(win_id)?;
     let stack_mode = if spec.above { StackMode::ABOVE } else { StackMode::BELOW };
@@ -270,7 +271,7 @@ pub fn create_panel(
 
     x11.conn.flush()?;
 
-    let bgrx = Arc::new(render_frame(None, x11.global, phys_width, phys_height, x11.dpr));
+    let bgrx = Arc::new(render_frame(None, phys_width, phys_height, x11.dpr));
     x11.conn.put_image(ImageFormat::Z_PIXMAP, win_id, gc, phys_width as u16, phys_height as u16, 0, 0, 0, x11.depth, &bgrx[..])?;
     x11.conn.flush()?;
 
@@ -320,7 +321,7 @@ impl PanelPool {
             match create_panel(spec, ctx) {
                 Ok(mut panel) => {
                     if !spec.content.is_null() {
-                        preload_layout_images(&spec.content, ctx.global);
+                        preload_layout_images(&spec.content);
                         panel.raw_layout = Some(spec.content.clone());
                     }
                     self.panels.insert(spec.id.clone(), panel);
@@ -332,7 +333,7 @@ impl PanelPool {
         for spec in &to_update {
             if let Some(panel) = self.panels.get_mut(&spec.id) {
                 if !spec.content.is_null() {
-                    preload_layout_images(&spec.content, ctx.global);
+                    preload_layout_images(&spec.content);
                     panel.raw_layout = Some(spec.content.clone());
                     panel.render_cache = RenderCache::new(30);
                 }

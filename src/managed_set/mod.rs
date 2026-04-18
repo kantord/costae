@@ -1,14 +1,11 @@
 use std::collections::HashMap;
 use std::hash::Hash;
 
-pub trait HasKey {
+pub trait Lifecycle {
     type Key: Hash + Eq + Clone;
-    fn key(&self) -> Self::Key;
-}
-
-pub trait Lifecycle: HasKey {
     type State;
     type Context;
+    fn key(&self) -> Self::Key;
     /// Returns `None` if initialization fails; the item is not added to the store.
     fn enter(self, ctx: &Self::Context) -> Option<Self::State>;
     fn update(self, state: &mut Self::State, ctx: &Self::Context);
@@ -75,16 +72,14 @@ mod tests {
         value: i32,
     }
 
-    impl HasKey for TestSpec {
+    impl Lifecycle for TestSpec {
         type Key = String;
+        type State = i32;
+        type Context = Arc<Mutex<Vec<String>>>;
+
         fn key(&self) -> String {
             self.id.clone()
         }
-    }
-
-    impl Lifecycle for TestSpec {
-        type State = i32;
-        type Context = Arc<Mutex<Vec<String>>>;
 
         fn enter(self, ctx: &Self::Context) -> Option<Self::State> {
             ctx.lock().unwrap().push(format!("enter:{}", self.id));

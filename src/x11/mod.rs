@@ -1,6 +1,6 @@
-use takumi::GlobalContext;
 use tiny_skia::{IntSize, Pixmap};
 use takumi::resources::image::ImageSource;
+use crate::render::with_global_ctx;
 
 pub use crate::layout::{PanelAnchor, PanelSpec};
 
@@ -22,10 +22,12 @@ pub fn x11_bgrx_to_rgba(bgrx: &[u8]) -> Vec<u8> {
 /// Layout nodes can reference it via `backgroundImage: "url(root-bg)"`.
 /// Because takumi treats this as real pixel content, `backdrop-filter: blur()`
 /// will correctly blur the wallpaper — the same effect a compositor would produce.
-pub fn inject_root_bg(global: &GlobalContext, rgba: Vec<u8>, width: u32, height: u32) {
+pub fn inject_root_bg(rgba: Vec<u8>, width: u32, height: u32) {
     if let Some(size) = IntSize::from_wh(width, height) {
         if let Some(pixmap) = Pixmap::from_vec(rgba, size) {
-            global.persistent_image_store.insert("root-bg".to_string(), ImageSource::from(pixmap));
+            with_global_ctx(|global| {
+                global.persistent_image_store.insert("root-bg".to_string(), ImageSource::from(pixmap.clone()));
+            });
         }
     }
 }
