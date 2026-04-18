@@ -75,7 +75,7 @@ const JSX_GLOBALS_JS: &str = r#"
     globalThis.Module = ({ bin, children, ...rest }) => {
         const child = Array.isArray(children) ? children[0] : children;
         if (typeof child === 'function') {
-            registerModule(bin, JSON.stringify(rest));
+            registerModule(bin, rest);
             const data = useJSONStream(bin);
             const events = new Proxy({}, {
                 get: (_, type) => ({ __channel__: bin, type: String(type) })
@@ -117,8 +117,8 @@ impl JsxEvaluator {
                     sv.read().unwrap().get(&(bin, script)).cloned().unwrap_or_default()
                 })?;
                 qjs_ctx.globals().set("useStringStream", func)?;
-                let func2 = rquickjs::Function::new(qjs_ctx.clone(), move |bin: String, props_json: String| {
-                    let props: serde_json::Value = serde_json::from_str(&props_json)
+                let func2 = rquickjs::Function::new(qjs_ctx.clone(), move |bin: String, props: rquickjs::Value| {
+                    let props: serde_json::Value = rquickjs_serde::from_value(props)
                         .unwrap_or(serde_json::Value::Null);
                     let mut mc = module_calls_inner.lock().unwrap();
                     if !mc.iter().any(|(b, _)| b == &bin) {
@@ -127,8 +127,9 @@ impl JsxEvaluator {
                 })?;
                 qjs_ctx.globals().set("registerModule", func2)?;
                 if !ctx.is_null() {
-                    let json_string = serde_json::to_string(&ctx).map_err(|_| rquickjs::Error::Unknown)?;
-                    qjs_ctx.eval::<(), _>(format!("globalThis.ctx = {json_string};").as_str())?;
+                    let js_ctx = rquickjs_serde::to_value(qjs_ctx.clone(), &ctx)
+                        .map_err(|_| rquickjs::Error::Unknown)?;
+                    qjs_ctx.globals().set("ctx", js_ctx)?;
                 }
                 qjs_ctx.eval::<(), _>(render_js.as_str())?;
                 Ok::<(), rquickjs::Error>(())
