@@ -124,7 +124,7 @@ fn apply_eval_result(
     true
 }
 
-fn handle_x11_events(
+fn poll_x11_events(
     conn: &RustConnection,
     panel_set: &mut ManagedSet<PanelSpec>,
     module_event_txs: &std::sync::Mutex<HashMap<String, mpsc::Sender<serde_json::Value>>>,
@@ -537,7 +537,7 @@ impl TickState {
             needs_render = true;
         }
 
-        match handle_x11_events(
+        match poll_x11_events(
             &self.conn, &mut self.panel_set, &self.module_event_txs,
             self.dpr, self.panel_ctx.depth, self.panel_ctx.root, self.panel_ctx.xrootpmap_atom,
         ) {

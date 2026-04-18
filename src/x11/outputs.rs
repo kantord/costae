@@ -33,6 +33,8 @@ pub fn build_output_map(conn: &RustConnection, root: u32) -> HashMap<String, (i1
     map
 }
 
+// Emits the current monitor layout as a JSON array of {name, x, y, width, height,
+// screen_width, screen_height} objects, where screen_* are logical-pixel dimensions.
 fn emit_outputs(conn: &RustConnection, root: u32, dpr: f32, key: &str, tx: &mpsc::Sender<StreamItem>) {
     let map = build_output_map(conn, root);
     let outputs: Vec<serde_json::Value> = map.iter().map(|(name, &(x, y, w, h))| {
