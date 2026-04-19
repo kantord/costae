@@ -504,6 +504,7 @@ dependencies = [
 name = "costae"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "image",
  "json-canon",
  "libc",

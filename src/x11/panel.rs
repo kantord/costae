@@ -122,7 +122,7 @@ pub fn i3_dpi(conn: &RustConnection, root: Window, screen: &Screen) -> f32 {
 fn create_panel(
     spec: &PanelSpec,
     ctx: &PanelContext,
-) -> Result<Panel, Box<dyn std::error::Error>> {
+) -> anyhow::Result<Panel> {
     let phys_width = (spec.width as f32 * ctx.dpr).round() as u32;
     let phys_height = (spec.height as f32 * ctx.dpr).round() as u32;
 
@@ -219,8 +219,7 @@ impl Lifecycle for PanelSpec {
     type Key = String;
     type State = Panel;
     type Context = PanelContext;
-    /// Explicitly temporary — a concrete PanelError enum is a separate future task.
-    type Error = Box<dyn std::error::Error>;
+    type Error = anyhow::Error;
 
     fn key(&self) -> String {
         self.id.clone()
