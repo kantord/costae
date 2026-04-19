@@ -12,7 +12,7 @@ use super::{StreamItem, StreamKind};
 
 /// Stable identity for a process: uniquely identifies which process to manage.
 /// Used as the key in `Lifecycle` so that `ManagedSet` can track processes by identity.
-#[derive(Hash, Eq, PartialEq, Clone, Debug)]
+#[derive(Hash, Eq, PartialEq, Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ProcessIdentity {
     pub bin: String,
     pub key: String,
@@ -155,7 +155,7 @@ impl Lifecycle for ProcessSource {
         Ok(state)
     }
 
-    fn update(self, state: &mut Self::State, ctx: &Self::Context) -> Result<(), Self::Error> {
+    fn reconcile_self(self, state: &mut Self::State, ctx: &Self::Context) -> Result<(), Self::Error> {
         if matches!(state.child.try_wait(), Ok(Some(_))) {
             tracing::warn!(bin = %self.identity.bin, "process exited");
             let props = self.props.clone();
@@ -174,8 +174,9 @@ impl Lifecycle for ProcessSource {
         Ok(())
     }
 
-    fn exit(mut state: Self::State, _ctx: &Self::Context) {
+    fn exit(mut state: Self::State, _ctx: &Self::Context) -> Result<(), Self::Error> {
         let _ = state.child.kill();
+        Ok(())
     }
 }
 
@@ -343,8 +344,8 @@ mod tests {
             props: None,
         };
 
-        let result = spec_update.update(&mut state, &tx);
-        assert!(result.is_err(), "update must propagate Err when restart spawn fails");
+        let result = spec_update.reconcile_self(&mut state, &tx);
+        assert!(result.is_err(), "reconcile_self must propagate Err when restart spawn fails");
         match result {
             Err(super::SpawnError::ProcessSpawnFailed { .. }) => {}
             Err(other) => panic!("expected ProcessSpawnFailed, got: {:?}", other),

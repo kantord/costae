@@ -36,7 +36,7 @@ impl Lifecycle for BuiltInSource {
         Ok(BuiltInState { handle, stop })
     }
 
-    fn update(self, state: &mut Self::State, ctx: &Self::Context) -> Result<(), Self::Error> {
+    fn reconcile_self(self, state: &mut Self::State, ctx: &Self::Context) -> Result<(), Self::Error> {
         if state.handle.is_finished() {
             let stop = Arc::new(AtomicBool::new(false));
             let stop_clone = Arc::clone(&stop);
@@ -49,8 +49,9 @@ impl Lifecycle for BuiltInSource {
         Ok(())
     }
 
-    fn exit(state: Self::State, _ctx: &Self::Context) {
+    fn exit(state: Self::State, _ctx: &Self::Context) -> Result<(), Self::Error> {
         state.stop.store(true, Ordering::Relaxed);
+        Ok(())
     }
 }
 
@@ -116,7 +117,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(100));
 
         // update: should detect finished thread and restart it
-        source.update(&mut state, &tx).expect("update must return Ok");
+        source.reconcile_self(&mut state, &tx).expect("reconcile_self must return Ok");
 
         let item = rx.recv_timeout(Duration::from_millis(500))
             .expect("update must restart the thread and deliver a new StreamItem");
@@ -153,7 +154,7 @@ mod tests {
             "stop flag must be false before exit"
         );
 
-        BuiltInSource::exit(state, &tx);
+        let _ = BuiltInSource::exit(state, &tx);
 
         assert!(
             stop_clone.load(Ordering::Relaxed),

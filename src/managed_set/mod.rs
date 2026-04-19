@@ -6,16 +6,28 @@ pub mod reconcile;
 pub use reconcile::{Reconcile, ReconcileErrors};
 
 pub trait Lifecycle {
-    type Key: Hash + Eq + Clone;
+    /// Stable identity for this item. Forms a segment in the `KeyPath` used to address
+    /// this item's logs and status in a supervisor tree.
+    type Key: Hash + Eq + Clone + serde::Serialize + serde::de::DeserializeOwned;
     type State;
     type Context;
     type Error;
 
+    /// Stable identity for this item within its parent's namespace.
     fn key(&self) -> Self::Key;
-    /// Returns `Err` if initialization fails; the item is not added to the store.
+
+    /// Called once when this item first appears in the desired set. Returns the live
+    /// state or an error; on `Err` the item is not added to the store.
     fn enter(self, ctx: &Self::Context) -> Result<Self::State, Self::Error>;
-    fn update(self, state: &mut Self::State, ctx: &Self::Context) -> Result<(), Self::Error>;
-    fn exit(state: Self::State, ctx: &Self::Context);
+
+    /// Called on every reconciliation cycle while the item remains present. Responsible
+    /// for both synchronising this item's own state and triggering reconciliation of any
+    /// child items it owns.
+    fn reconcile_self(self, state: &mut Self::State, ctx: &Self::Context) -> Result<(), Self::Error>;
+
+    /// Called when this item leaves the desired set or after a failed `reconcile_self`.
+    /// An `Err` return signals a zombie — cleanup did not complete cleanly.
+    fn exit(state: Self::State, ctx: &Self::Context) -> Result<(), Self::Error>;
 }
 
 pub struct ManagedSet<T: Lifecycle> {
@@ -44,14 +56,16 @@ where
         map
     }
 
-    fn exit_removed(&mut self, new_map: &HashMap<T::Key, T>, ctx: &T::Context) {
+    fn exit_removed(&mut self, new_map: &HashMap<T::Key, T>, ctx: &T::Context, errors: &mut ReconcileErrors<T::Key, T::Error>) {
         let exit_keys: Vec<T::Key> = self.store.keys()
             .filter(|k| !new_map.contains_key(*k))
             .cloned()
             .collect();
         for key in exit_keys {
             let state = self.store.remove(&key).unwrap();
-            T::exit(state, ctx);
+            if let Err(e) = T::exit(state, ctx) {
+                errors.push((key, e));
+            }
         }
     }
 
@@ -63,9 +77,11 @@ where
         for key in update_keys {
             let item = new_map.remove(&key).unwrap();
             let state = self.store.get_mut(&key).unwrap();
-            if let Err(e) = item.update(state, ctx) {
+            if let Err(e) = item.reconcile_self(state, ctx) {
                 let old_state = self.store.remove(&key).unwrap();
-                T::exit(old_state, ctx);
+                if let Err(exit_e) = T::exit(old_state, ctx) {
+                    errors.push((key.clone(), exit_e));
+                }
                 errors.push((key, e));
             }
         }
@@ -111,7 +127,7 @@ where
     {
         let mut errors = ReconcileErrors::new();
         let mut new_map = Self::dedup_by_key(desired);
-        self.exit_removed(&new_map, ctx);
+        self.exit_removed(&new_map, ctx, &mut errors);
         self.update_existing(&mut new_map, ctx, &mut errors);
         self.enter_new(new_map, ctx, &mut errors);
         errors
@@ -144,14 +160,15 @@ mod tests {
             Ok(self.value)
         }
 
-        fn update(self, state: &mut Self::State, ctx: &Self::Context) -> Result<(), Self::Error> {
-            ctx.lock().unwrap().push(format!("update:{}", self.id));
+        fn reconcile_self(self, state: &mut Self::State, ctx: &Self::Context) -> Result<(), Self::Error> {
+            ctx.lock().unwrap().push(format!("reconcile_self:{}", self.id));
             *state = self.value;
             Ok(())
         }
 
-        fn exit(state: Self::State, ctx: &Self::Context) {
+        fn exit(state: Self::State, ctx: &Self::Context) -> Result<(), Self::Error> {
             ctx.lock().unwrap().push(format!("exit:{}", state));
+            Ok(())
         }
     }
 
@@ -193,8 +210,8 @@ mod tests {
         let log = calls(&ctx);
         // Only one enter call total
         assert_eq!(log.iter().filter(|c| *c == "enter:a").count(), 1);
-        // At least one update call
-        assert!(log.contains(&"update:a".to_string()));
+        // At least one reconcile_self call
+        assert!(log.contains(&"reconcile_self:a".to_string()));
     }
 
     // Test 4: update deduplicates: two items with the same key → only one enter call
@@ -286,12 +303,14 @@ mod tests {
             }
         }
 
-        fn update(self, state: &mut String, _ctx: &()) -> Result<(), FallibleError> {
+        fn reconcile_self(self, state: &mut String, _ctx: &()) -> Result<(), FallibleError> {
             *state = format!("updated:{}", self.id);
             Ok(())
         }
 
-        fn exit(_state: String, _ctx: &()) {}
+        fn exit(_state: String, _ctx: &()) -> Result<(), FallibleError> {
+            Ok(())
+        }
     }
 
     // Claim: when enter returns Err, the item is not added to the store and the
@@ -344,7 +363,7 @@ mod tests {
             Ok(format!("state:{}", self.id))
         }
 
-        fn update(self, _state: &mut String, _ctx: &()) -> Result<(), UpdateError> {
+        fn reconcile_self(self, _state: &mut String, _ctx: &()) -> Result<(), UpdateError> {
             if self.fail_update {
                 Err(UpdateError(format!("update failed for {}", self.id)))
             } else {
@@ -352,8 +371,9 @@ mod tests {
             }
         }
 
-        fn exit(_state: String, _ctx: &()) {
+        fn exit(_state: String, _ctx: &()) -> Result<(), UpdateError> {
             EXIT_CALLED.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
         }
     }
 

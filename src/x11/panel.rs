@@ -239,7 +239,7 @@ impl Lifecycle for PanelSpec {
         Ok(panel)
     }
 
-    fn update(self, state: &mut Self::State, _ctx: &Self::Context) -> Result<(), Self::Error> {
+    fn reconcile_self(self, state: &mut Self::State, _ctx: &Self::Context) -> Result<(), Self::Error> {
         if !self.content.is_null() {
             preload_layout_images(&self.content);
             state.raw_layout = Some(self.content);
@@ -248,10 +248,11 @@ impl Lifecycle for PanelSpec {
         Ok(())
     }
 
-    fn exit(state: Self::State, ctx: &Self::Context) {
+    fn exit(state: Self::State, ctx: &Self::Context) -> Result<(), Self::Error> {
         tracing::info!(panel = %state.id, "panel destroyed");
         let _ = ctx.conn.free_gc(state.gc);
         let _ = ctx.conn.destroy_window(state.win_id);
+        Ok(())
     }
 }
 
@@ -372,7 +373,7 @@ mod tests {
         assert!(panel.phys_height > 0, "phys_height must be > 0");
 
         // Cleanup
-        <crate::layout::PanelSpec as Lifecycle>::exit(panel, &ctx);
+        let _ = <crate::layout::PanelSpec as Lifecycle>::exit(panel, &ctx);
     }
 
     // ---------------------------------------------------------------------------
@@ -405,7 +406,7 @@ mod tests {
             .and_then(|c| c.reply().ok());
         assert!(before.is_some(), "window should exist before exit");
 
-        <crate::layout::PanelSpec as Lifecycle>::exit(panel, &ctx);
+        let _ = <crate::layout::PanelSpec as Lifecycle>::exit(panel, &ctx);
         ctx.conn.flush().ok();
 
         // After exit the window must no longer exist.
@@ -448,8 +449,8 @@ mod tests {
             content: new_content.clone(),
         };
 
-        <crate::layout::PanelSpec as Lifecycle>::update(new_spec, &mut panel, &ctx)
-            .expect("update must succeed");
+        <crate::layout::PanelSpec as Lifecycle>::reconcile_self(new_spec, &mut panel, &ctx)
+            .expect("reconcile_self must succeed");
 
         assert_eq!(
             panel.raw_layout,
@@ -458,7 +459,7 @@ mod tests {
         );
 
         // Cleanup
-        <crate::layout::PanelSpec as Lifecycle>::exit(panel, &ctx);
+        let _ = <crate::layout::PanelSpec as Lifecycle>::exit(panel, &ctx);
     }
 
     // ---------------------------------------------------------------------------

@@ -29,26 +29,27 @@ mod tests {
         pub type Ctx = Arc<Mutex<Vec<String>>>;
 
         impl Lifecycle for Item {
-            type Key = &'static str;
+            type Key = String;
             type State = i32;
             type Context = Ctx;
             type Error = Infallible;
 
-            fn key(&self) -> &'static str { self.id }
+            fn key(&self) -> String { self.id.to_string() }
 
             fn enter(self, ctx: &Ctx) -> Result<i32, Infallible> {
                 ctx.lock().unwrap().push(format!("enter:{}", self.id));
                 Ok(self.value)
             }
 
-            fn update(self, state: &mut i32, ctx: &Ctx) -> Result<(), Infallible> {
-                ctx.lock().unwrap().push(format!("update:{}", self.id));
+            fn reconcile_self(self, state: &mut i32, ctx: &Ctx) -> Result<(), Infallible> {
+                ctx.lock().unwrap().push(format!("reconcile_self:{}", self.id));
                 *state = self.value;
                 Ok(())
             }
 
-            fn exit(_state: i32, ctx: &Ctx) {
+            fn exit(_state: i32, ctx: &Ctx) -> Result<(), Infallible> {
                 ctx.lock().unwrap().push("exit".to_string());
+                Ok(())
             }
         }
 
@@ -61,7 +62,7 @@ mod tests {
         }
 
         pub struct RecordingReconciler {
-            pub calls: Vec<Vec<&'static str>>,
+            pub calls: Vec<Vec<String>>,
         }
 
         impl RecordingReconciler {
@@ -70,9 +71,9 @@ mod tests {
 
         impl Reconcile<Item> for RecordingReconciler {
             fn reconcile(&mut self, desired: impl IntoIterator<Item = Item>, _ctx: &Ctx)
-                -> ReconcileErrors<&'static str, Infallible>
+                -> ReconcileErrors<String, Infallible>
             {
-                self.calls.push(desired.into_iter().map(|i| i.id).collect());
+                self.calls.push(desired.into_iter().map(|i| i.id.to_string()).collect());
                 vec![]
             }
         }
@@ -81,7 +82,7 @@ mod tests {
             reconciler: &mut R,
             items: Vec<Item>,
             ctx: &Ctx,
-        ) -> ReconcileErrors<&'static str, Infallible> {
+        ) -> ReconcileErrors<String, Infallible> {
             reconciler.reconcile(items, ctx)
         }
     }
@@ -130,12 +131,12 @@ mod tests {
         }
 
         #[test]
-        fn calls_update_for_existing_item() {
+        fn calls_reconcile_self_for_existing_item() {
             check(
                 &mut ManagedSet::new(),
                 vec![Item { id: "b", value: 1 }],
                 vec![Item { id: "b", value: 2 }],
-                "update:b",
+                "reconcile_self:b",
             );
         }
 
@@ -160,8 +161,8 @@ mod tests {
 
             assert_eq!(mock.calls.len(), 2);
             assert_eq!(mock.calls[0], vec!["x"]);
-            assert!(mock.calls[1].contains(&"y"));
-            assert!(mock.calls[1].contains(&"z"));
+            assert!(mock.calls[1].iter().any(|s| s == "y"));
+            assert!(mock.calls[1].iter().any(|s| s == "z"));
             assert!(log(&ctx).is_empty(), "mock must not invoke lifecycle callbacks");
         }
     }
