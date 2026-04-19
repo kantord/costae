@@ -78,19 +78,44 @@ fn required_u64(obj: &serde_json::Value, key: &str, label: &str) -> Result<u64, 
         .ok_or_else(|| format!("{label} missing {key}"))
 }
 
+fn optional_str<'a>(obj: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+    obj.get(key).and_then(|v| v.as_str())
+}
+
+fn optional_i64(obj: &serde_json::Value, key: &str, default: i64) -> i64 {
+    obj.get(key).and_then(|v| v.as_i64()).unwrap_or(default)
+}
+
+fn optional_u64(obj: &serde_json::Value, key: &str, default: u64) -> u64 {
+    obj.get(key).and_then(|v| v.as_u64()).unwrap_or(default)
+}
+
+fn optional_bool(obj: &serde_json::Value, key: &str, default: bool) -> bool {
+    obj.get(key).and_then(|v| v.as_bool()).unwrap_or(default)
+}
+
+fn first_child(node: &serde_json::Value) -> serde_json::Value {
+    node.get("children")
+        .and_then(|c| c.as_array())
+        .and_then(|c| c.first())
+        .cloned()
+        .unwrap_or(serde_json::Value::Null)
+}
+
 fn parse_panel_spec(i: usize, panel: &serde_json::Value) -> Result<PanelSpec, String> {
     let id = required_str(panel, "id", &format!("panel[{i}]"))?.to_string();
     let label = format!("panel '{id}'");
-    let width  = required_u64(panel, "width",  &label)? as u32;
-    let height = required_u64(panel, "height", &label)? as u32;
-    let anchor = panel.get("anchor").and_then(|v| v.as_str()).and_then(PanelAnchor::parse);
-    let x          = panel.get("x").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-    let y          = panel.get("y").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-    let outer_gap  = panel.get("outer_gap").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-    let output     = panel.get("output").and_then(|v| v.as_str()).map(str::to_string);
-    let above      = panel.get("above").and_then(|v| v.as_bool()).unwrap_or(false);
-    let content    = panel.get("children").and_then(|c| c.as_array()).and_then(|c| c.first())
-        .cloned().unwrap_or(serde_json::Value::Null);
-    Ok(PanelSpec { id, anchor, width, height, x, y, outer_gap, output, above, content })
+    Ok(PanelSpec {
+        id,
+        width:     required_u64(panel, "width",  &label)? as u32,
+        height:    required_u64(panel, "height", &label)? as u32,
+        anchor:    optional_str(panel, "anchor").and_then(PanelAnchor::parse),
+        x:         optional_i64(panel, "x",         0) as i32,
+        y:         optional_i64(panel, "y",         0) as i32,
+        outer_gap: optional_u64(panel, "outer_gap", 0) as u32,
+        output:    optional_str(panel, "output").map(str::to_string),
+        above:     optional_bool(panel, "above", false),
+        content:   first_child(panel),
+    })
 }
 
