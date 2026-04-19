@@ -20,36 +20,37 @@ pub struct BuiltInSource {
 impl Lifecycle for BuiltInSource {
     type Key = String;
     type State = BuiltInState;
-    type Context = mpsc::Sender<StreamItem>;
+    type Context = ();
+    type Output = mpsc::Sender<StreamItem>;
     type Error = std::convert::Infallible;
 
     fn key(&self) -> String {
         self.key.clone()
     }
 
-    fn enter(self, ctx: &Self::Context) -> Result<Self::State, Self::Error> {
+    fn enter(self, _ctx: &(), output: &Self::Output) -> Result<Self::State, Self::Error> {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_clone = Arc::clone(&stop);
-        let ctx_clone = ctx.clone();
+        let output_clone = output.clone();
         let key = self.key();
-        let handle = std::thread::spawn(move || (self.func)(ctx_clone, key, stop_clone));
+        let handle = std::thread::spawn(move || (self.func)(output_clone, key, stop_clone));
         Ok(BuiltInState { handle, stop })
     }
 
-    fn reconcile_self(self, state: &mut Self::State, ctx: &Self::Context) -> Result<(), Self::Error> {
+    fn reconcile_self(self, state: &mut Self::State, _ctx: &(), output: &Self::Output) -> Result<(), Self::Error> {
         if state.handle.is_finished() {
             let stop = Arc::new(AtomicBool::new(false));
             let stop_clone = Arc::clone(&stop);
-            let ctx_clone = ctx.clone();
+            let output_clone = output.clone();
             let key = self.key();
-            let handle = std::thread::spawn(move || (self.func)(ctx_clone, key, stop_clone));
+            let handle = std::thread::spawn(move || (self.func)(output_clone, key, stop_clone));
             state.handle = handle;
             state.stop = stop;
         }
         Ok(())
     }
 
-    fn exit(state: Self::State, _ctx: &Self::Context) -> Result<(), Self::Error> {
+    fn exit(state: Self::State, _ctx: &()) -> Result<(), Self::Error> {
         state.stop.store(true, Ordering::Relaxed);
         Ok(())
     }
@@ -82,7 +83,7 @@ mod tests {
             func: send_one_item,
         };
 
-        let _state = source.enter(&tx).expect("enter must return Ok(state)");
+        let _state = source.enter(&(), &tx).expect("enter must return Ok(state)");
 
         let item = rx.recv_timeout(Duration::from_millis(500))
             .expect("enter must spawn a thread that delivers a StreamItem");
@@ -107,7 +108,7 @@ mod tests {
         };
 
         // enter: thread runs, sends item, then finishes
-        let mut state = source.clone().enter(&tx).expect("enter must succeed");
+        let mut state = source.clone().enter(&(), &tx).expect("enter must succeed");
 
         // drain the first item
         let _ = rx.recv_timeout(Duration::from_millis(500))
@@ -117,7 +118,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(100));
 
         // update: should detect finished thread and restart it
-        source.reconcile_self(&mut state, &tx).expect("reconcile_self must return Ok");
+        source.reconcile_self(&mut state, &(), &tx).expect("reconcile_self must return Ok");
 
         let item = rx.recv_timeout(Duration::from_millis(500))
             .expect("update must restart the thread and deliver a new StreamItem");
@@ -141,7 +142,7 @@ mod tests {
             func: send_one_item,
         };
 
-        let state = source.enter(&tx).expect("enter must succeed");
+        let state = source.enter(&(), &tx).expect("enter must succeed");
 
         // drain item so the channel doesn't block anything
         let _ = rx.recv_timeout(Duration::from_millis(500));
@@ -154,7 +155,7 @@ mod tests {
             "stop flag must be false before exit"
         );
 
-        let _ = BuiltInSource::exit(state, &tx);
+        let _ = BuiltInSource::exit(state, &());
 
         assert!(
             stop_clone.load(Ordering::Relaxed),

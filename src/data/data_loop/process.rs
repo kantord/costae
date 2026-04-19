@@ -138,16 +138,17 @@ pub(super) fn spawn_process(spec: ProcessSource, tx: &mpsc::Sender<StreamItem>) 
 impl Lifecycle for ProcessSource {
     type Key = ProcessIdentity;
     type State = ProcessState;
-    type Context = mpsc::Sender<StreamItem>;
+    type Context = ();
+    type Output = mpsc::Sender<StreamItem>;
     type Error = SpawnError;
 
     fn key(&self) -> ProcessIdentity {
         self.identity.clone()
     }
 
-    fn enter(self, ctx: &Self::Context) -> Result<Self::State, Self::Error> {
+    fn enter(self, _ctx: &(), output: &Self::Output) -> Result<Self::State, Self::Error> {
         let props = self.props.clone();
-        let mut state = spawn_process(self, ctx)?;
+        let mut state = spawn_process(self, output)?;
         if let Some(p) = props {
             let _ = state.event_tx.send(p.clone());
             state.last_sent_props = Some(p);
@@ -155,11 +156,11 @@ impl Lifecycle for ProcessSource {
         Ok(state)
     }
 
-    fn reconcile_self(self, state: &mut Self::State, ctx: &Self::Context) -> Result<(), Self::Error> {
+    fn reconcile_self(self, state: &mut Self::State, _ctx: &(), output: &Self::Output) -> Result<(), Self::Error> {
         if matches!(state.child.try_wait(), Ok(Some(_))) {
             tracing::warn!(bin = %self.identity.bin, "process exited");
             let props = self.props.clone();
-            let mut new_state = spawn_process(self, ctx)?;
+            let mut new_state = spawn_process(self, output)?;
             if let Some(p) = props {
                 let _ = new_state.event_tx.send(p.clone());
                 new_state.last_sent_props = Some(p);
@@ -174,7 +175,7 @@ impl Lifecycle for ProcessSource {
         Ok(())
     }
 
-    fn exit(mut state: Self::State, _ctx: &Self::Context) -> Result<(), Self::Error> {
+    fn exit(mut state: Self::State, _ctx: &()) -> Result<(), Self::Error> {
         let _ = state.child.kill();
         Ok(())
     }
@@ -324,7 +325,7 @@ mod tests {
             current_dir: None,
             props: None,
         };
-        let mut state = spec_enter.enter(&tx).expect("enter must succeed with /bin/sh");
+        let mut state = spec_enter.enter(&(), &tx).expect("enter must succeed with /bin/sh");
 
         // Wait for the process to exit
         std::thread::sleep(std::time::Duration::from_millis(200));
@@ -344,7 +345,7 @@ mod tests {
             props: None,
         };
 
-        let result = spec_update.reconcile_self(&mut state, &tx);
+        let result = spec_update.reconcile_self(&mut state, &(), &tx);
         assert!(result.is_err(), "reconcile_self must propagate Err when restart spawn fails");
         match result {
             Err(super::SpawnError::ProcessSpawnFailed { .. }) => {}

@@ -219,13 +219,14 @@ impl Lifecycle for PanelSpec {
     type Key = String;
     type State = Panel;
     type Context = PanelContext;
+    type Output = ();
     type Error = anyhow::Error;
 
     fn key(&self) -> String {
         self.id.clone()
     }
 
-    fn enter(self, ctx: &Self::Context) -> Result<Self::State, Self::Error> {
+    fn enter(self, ctx: &Self::Context, _output: &()) -> Result<Self::State, Self::Error> {
         init_global_ctx();
         let mut panel = create_panel(&self, ctx).map_err(|e| {
             tracing::error!(panel = %self.id, error = %e, "panel create failed");
@@ -239,7 +240,7 @@ impl Lifecycle for PanelSpec {
         Ok(panel)
     }
 
-    fn reconcile_self(self, state: &mut Self::State, _ctx: &Self::Context) -> Result<(), Self::Error> {
+    fn reconcile_self(self, state: &mut Self::State, _ctx: &Self::Context, _output: &()) -> Result<(), Self::Error> {
         if !self.content.is_null() {
             preload_layout_images(&self.content);
             state.raw_layout = Some(self.content);
@@ -366,7 +367,7 @@ mod tests {
         };
 
         let spec = make_spec("test-enter", 200, 30);
-        let panel = <crate::layout::PanelSpec as Lifecycle>::enter(spec, &ctx)
+        let panel = <crate::layout::PanelSpec as Lifecycle>::enter(spec, &ctx, &())
             .expect("enter should succeed when X11 is available");
 
         assert!(panel.phys_width > 0, "phys_width must be > 0");
@@ -394,7 +395,7 @@ mod tests {
         };
 
         let spec = make_spec("test-exit", 200, 30);
-        let panel = <crate::layout::PanelSpec as Lifecycle>::enter(spec, &ctx)
+        let panel = <crate::layout::PanelSpec as Lifecycle>::enter(spec, &ctx, &())
             .expect("enter must succeed for exit test");
 
         let win_id = panel.win_id;
@@ -432,7 +433,7 @@ mod tests {
         };
 
         let spec = make_spec("test-update", 200, 30);
-        let mut panel = <crate::layout::PanelSpec as Lifecycle>::enter(spec, &ctx)
+        let mut panel = <crate::layout::PanelSpec as Lifecycle>::enter(spec, &ctx, &())
             .expect("enter must succeed for update test");
 
         let new_content = serde_json::json!({"type": "text", "text": "hello"});
@@ -449,7 +450,7 @@ mod tests {
             content: new_content.clone(),
         };
 
-        <crate::layout::PanelSpec as Lifecycle>::reconcile_self(new_spec, &mut panel, &ctx)
+        <crate::layout::PanelSpec as Lifecycle>::reconcile_self(new_spec, &mut panel, &ctx, &())
             .expect("reconcile_self must succeed");
 
         assert_eq!(

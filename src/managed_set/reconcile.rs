@@ -8,7 +8,7 @@ pub type ReconcileErrors<K, E> = Vec<(K, E)>;
 /// This trait makes the reconciliation algorithm swappable: callers can
 /// program against `impl Reconcile<T>` rather than `ManagedSet<T>` directly.
 pub trait Reconcile<T: Lifecycle> {
-    fn reconcile(&mut self, desired: impl IntoIterator<Item = T>, ctx: &T::Context)
+    fn reconcile(&mut self, desired: impl IntoIterator<Item = T>, ctx: &T::Context, output: &T::Output)
         -> ReconcileErrors<T::Key, T::Error>;
 }
 
@@ -32,16 +32,17 @@ mod tests {
             type Key = String;
             type State = i32;
             type Context = Ctx;
+            type Output = ();
             type Error = Infallible;
 
             fn key(&self) -> String { self.id.to_string() }
 
-            fn enter(self, ctx: &Ctx) -> Result<i32, Infallible> {
+            fn enter(self, ctx: &Ctx, _output: &()) -> Result<i32, Infallible> {
                 ctx.lock().unwrap().push(format!("enter:{}", self.id));
                 Ok(self.value)
             }
 
-            fn reconcile_self(self, state: &mut i32, ctx: &Ctx) -> Result<(), Infallible> {
+            fn reconcile_self(self, state: &mut i32, ctx: &Ctx, _output: &()) -> Result<(), Infallible> {
                 ctx.lock().unwrap().push(format!("reconcile_self:{}", self.id));
                 *state = self.value;
                 Ok(())
@@ -70,7 +71,7 @@ mod tests {
         }
 
         impl Reconcile<Item> for RecordingReconciler {
-            fn reconcile(&mut self, desired: impl IntoIterator<Item = Item>, _ctx: &Ctx)
+            fn reconcile(&mut self, desired: impl IntoIterator<Item = Item>, _ctx: &Ctx, _output: &())
                 -> ReconcileErrors<String, Infallible>
             {
                 self.calls.push(desired.into_iter().map(|i| i.id.to_string()).collect());
@@ -83,7 +84,7 @@ mod tests {
             items: Vec<Item>,
             ctx: &Ctx,
         ) -> ReconcileErrors<String, Infallible> {
-            reconciler.reconcile(items, ctx)
+            reconciler.reconcile(items, ctx, &())
         }
     }
 
@@ -117,8 +118,8 @@ mod tests {
 
         fn check<R: Reconcile<Item>>(reconciler: &mut R, setup: Vec<Item>, action: Vec<Item>, expected_log_entry: &str) {
             let ctx = make_ctx();
-            reconciler.reconcile(setup, &ctx);
-            reconciler.reconcile(action, &ctx);
+            reconciler.reconcile(setup, &ctx, &());
+            reconciler.reconcile(action, &ctx, &());
             assert!(
                 log(&ctx).iter().any(|e| e == expected_log_entry),
                 "expected {:?} in log, got {:?}", expected_log_entry, log(&ctx)

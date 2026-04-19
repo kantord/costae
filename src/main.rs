@@ -119,7 +119,7 @@ fn apply_eval_result(
     let combined: Vec<StreamSource> = stream_specs.into_iter().chain(module_specs).collect();
     handle.set_desired(combined);
 
-    let panel_errors = panel_set.reconcile(specs, panel_ctx);
+    let panel_errors = panel_set.reconcile(specs, panel_ctx, &());
     log_lifecycle_errors(panel_errors);
     true
 }
@@ -570,7 +570,7 @@ impl TickState {
 
 impl Drop for TickState {
     fn drop(&mut self) {
-        let panel_errors = self.panel_set.reconcile(vec![], &self.panel_ctx);
+        let panel_errors = self.panel_set.reconcile(vec![], &self.panel_ctx, &());
         log_lifecycle_errors(panel_errors);
         let _ = self.conn.flush();
     }
