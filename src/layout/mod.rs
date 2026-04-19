@@ -1,4 +1,5 @@
 use takumi::layout::node::Node;
+use crate::windowing::DisplayContext;
 
 /// Which screen edge a panel is anchored to. Drives both window placement and EWMH strut
 /// reservation. Panels without an anchor are free-floating (no strut).
@@ -24,7 +25,8 @@ impl PanelAnchor {
 
 /// Logical-pixel description of a `<panel>` node extracted from the JSX root.
 /// All dimensions are in logical pixels; the display backend scales to physical pixels.
-pub struct PanelSpec {
+#[derive(Debug)]
+pub struct PanelSpecData {
     pub id: String,
     pub anchor: Option<PanelAnchor>,
     /// Logical width in CSS px (same unit as i3 config / Tailwind values).
@@ -44,6 +46,24 @@ pub struct PanelSpec {
     pub content: serde_json::Value,
 }
 
+/// Platform-tagged panel specification. Wraps `PanelSpecData` with the display backend
+/// that should own the panel window.
+#[derive(Debug)]
+pub enum PanelSpec {
+    X11(PanelSpecData),
+    Wayland(PanelSpecData),
+}
+
+impl PanelSpec {
+    /// Create a `PanelSpec` variant matching the given `DisplayContext`.
+    pub fn for_context(data: PanelSpecData, ctx: &DisplayContext) -> Self {
+        match ctx {
+            DisplayContext::X11 => PanelSpec::X11(data),
+            DisplayContext::Wayland => PanelSpec::Wayland(data),
+        }
+    }
+}
+
 pub fn parse_layout(value: &serde_json::Value) -> Result<Node, serde_json::Error> {
     use serde::Deserialize;
     Node::deserialize(value)
@@ -54,7 +74,7 @@ pub fn parse_layout(value: &serde_json::Value) -> Result<Node, serde_json::Error
 /// Expects the root value to be `{ type: "root", children: [...panels] }`. Each panel
 /// child must have at minimum `id`, `width`, and `height`. Returns an error string if
 /// the root type is wrong or a required field is missing.
-pub fn parse_root_node(root: &serde_json::Value) -> Result<Vec<PanelSpec>, String> {
+pub fn parse_root_node(root: &serde_json::Value) -> Result<Vec<PanelSpecData>, String> {
     if root.get("type").and_then(|t| t.as_str()) != Some("root") {
         return Err(format!("expected root node, got {:?}", root.get("type")));
     }
@@ -102,10 +122,10 @@ fn first_child(node: &serde_json::Value) -> serde_json::Value {
         .unwrap_or(serde_json::Value::Null)
 }
 
-fn parse_panel_spec(i: usize, panel: &serde_json::Value) -> Result<PanelSpec, String> {
+fn parse_panel_spec(i: usize, panel: &serde_json::Value) -> Result<PanelSpecData, String> {
     let id = required_str(panel, "id", &format!("panel[{i}]"))?.to_string();
     let label = format!("panel '{id}'");
-    Ok(PanelSpec {
+    Ok(PanelSpecData {
         id,
         width:     required_u64(panel, "width",  &label)? as u32,
         height:    required_u64(panel, "height", &label)? as u32,
