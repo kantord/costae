@@ -147,7 +147,7 @@ impl Drop for JsxEvaluator {
         // Must restore (and drop) the Persistent<Function> inside context.with() before
         // the runtime is freed — otherwise QuickJS aborts with a GC assertion.
         if let Some(persistent_fn) = self.render_fn.take() {
-            let _ = self.context.with(|ctx| {
+            self.context.with(|ctx| {
                 let _ = persistent_fn.restore(&ctx);
             });
         }

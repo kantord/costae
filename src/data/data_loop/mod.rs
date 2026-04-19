@@ -352,7 +352,7 @@ mod tests {
 
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         loop {
-            if collected.lock().unwrap().len() >= 1 {
+            if !collected.lock().unwrap().is_empty() {
                 break;
             }
             assert!(
@@ -405,7 +405,7 @@ mod tests {
 
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         loop {
-            if collected.lock().unwrap().len() >= 1 {
+            if !collected.lock().unwrap().is_empty() {
                 break;
             }
             assert!(

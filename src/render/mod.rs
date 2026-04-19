@@ -129,6 +129,48 @@ pub fn find_font_files<P: AsRef<std::path::Path>>(dirs: &[P]) -> Vec<std::path::
     results
 }
 
+pub fn preload_layout_images(layout: &serde_json::Value) {
+    with_global_ctx(|global| preload_layout_images_impl(layout, global));
+}
+
+fn preload_layout_images_impl(layout: &serde_json::Value, global: &GlobalContext) {
+    fn walk(value: &serde_json::Value, srcs: &mut Vec<String>) {
+        match value {
+            serde_json::Value::Object(map) => {
+                if map.get("type").and_then(|t| t.as_str()) == Some("image") {
+                    if let Some(src) = map.get("src").and_then(|s| s.as_str()) {
+                        srcs.push(src.to_string());
+                    }
+                    return; // image nodes are terminal
+                }
+                for v in map.values() {
+                    walk(v, srcs);
+                }
+            }
+            serde_json::Value::Array(arr) => {
+                for v in arr {
+                    walk(v, srcs);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut srcs = Vec::new();
+    walk(layout, &mut srcs);
+
+    for src in srcs {
+        if src.starts_with("http://") || src.starts_with("https://") || src.starts_with("data:") {
+            continue;
+        }
+        if let Ok(bytes) = std::fs::read(&src) {
+            if let Ok(image) = ImageSource::from_bytes(&bytes) {
+                global.persistent_image_store.insert(src, image);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::find_font_files;
@@ -242,47 +284,5 @@ mod tests {
 
         fs::remove_dir_all(&dir).ok();
         assert_eq!(result, expected);
-    }
-}
-
-pub fn preload_layout_images(layout: &serde_json::Value) {
-    with_global_ctx(|global| preload_layout_images_impl(layout, global));
-}
-
-fn preload_layout_images_impl(layout: &serde_json::Value, global: &GlobalContext) {
-    fn walk(value: &serde_json::Value, srcs: &mut Vec<String>) {
-        match value {
-            serde_json::Value::Object(map) => {
-                if map.get("type").and_then(|t| t.as_str()) == Some("image") {
-                    if let Some(src) = map.get("src").and_then(|s| s.as_str()) {
-                        srcs.push(src.to_string());
-                    }
-                    return; // image nodes are terminal
-                }
-                for v in map.values() {
-                    walk(v, srcs);
-                }
-            }
-            serde_json::Value::Array(arr) => {
-                for v in arr {
-                    walk(v, srcs);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    let mut srcs = Vec::new();
-    walk(layout, &mut srcs);
-
-    for src in srcs {
-        if src.starts_with("http://") || src.starts_with("https://") || src.starts_with("data:") {
-            continue;
-        }
-        if let Ok(bytes) = std::fs::read(&src) {
-            if let Ok(image) = ImageSource::from_bytes(&bytes) {
-                global.persistent_image_store.insert(src, image);
-            }
-        }
     }
 }

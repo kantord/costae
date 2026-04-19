@@ -9,7 +9,7 @@ fn spawn_string_stream_delivers_line_as_triple() {
     let (tx, rx) = mpsc::channel();
     let (wake_tx, wake_rx) = mpsc::sync_channel(1);
 
-    let _child = spawn_string_stream("sh", Some("echo hello"), tx, wake_tx);
+    let mut child = spawn_string_stream("sh", Some("echo hello"), tx, wake_tx);
 
     let item = rx.recv_timeout(Duration::from_secs(2)).unwrap();
     assert_eq!(item.key.0, "sh");
@@ -18,6 +18,7 @@ fn spawn_string_stream_delivers_line_as_triple() {
 
     // wake_tx must have been signalled after the line was sent
     wake_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    child.wait().ok();
 }
 
 #[test]
@@ -25,7 +26,7 @@ fn spawn_string_stream_signals_wake_tx_after_each_line() {
     let (tx, rx) = mpsc::channel();
     let (wake_tx, wake_rx) = mpsc::sync_channel(4);
 
-    let _child =
+    let mut child =
         spawn_string_stream("sh", Some("echo first\necho second"), tx, wake_tx);
 
     // First line + wake signal
@@ -37,6 +38,7 @@ fn spawn_string_stream_signals_wake_tx_after_each_line() {
     let item2 = rx.recv_timeout(Duration::from_secs(2)).unwrap();
     assert_eq!(item2.line, "second");
     wake_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    child.wait().ok();
 }
 
 #[test]

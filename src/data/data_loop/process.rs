@@ -270,141 +270,129 @@ mod tests {
         assert_eq!(returned, id);
     }
 
-    // ---------------------------------------------------------------------------
-    // Cycle 3: spawn_process memfd_create failure → SpawnError::MemfdCreateFailed
-    // ---------------------------------------------------------------------------
+    mod memfd_create_err {
+        use super::super::SpawnError;
 
-    // We can't easily make memfd_create fail in a unit test without mocking,
-    // but we can test the error type's Display and structure.
-    #[test]
-    fn spawn_error_memfd_create_failed_display() {
-        let err = super::SpawnError::MemfdCreateFailed { bin: "mybin".to_string() };
-        let msg = err.to_string();
-        assert!(msg.contains("memfd_create failed"), "display must mention memfd_create failed, got: {msg}");
-        assert!(msg.contains("mybin"), "display must include the bin name, got: {msg}");
-    }
-
-    // ---------------------------------------------------------------------------
-    // Cycle 4: spawn_process cmd.spawn() failure → SpawnError::ProcessSpawnFailed
-    // ---------------------------------------------------------------------------
-    #[test]
-    fn spawn_process_nonexistent_binary_returns_process_spawn_failed() {
-        use std::sync::mpsc;
-        use super::spawn_process;
-
-        let (tx, _rx) = mpsc::channel();
-        let spec = ProcessSource {
-            identity: ProcessIdentity {
-                bin: "/nonexistent/binary/that/cannot/exist".to_string(),
-                key: "test".to_string(),
-            },
-            script: None,
-            args: vec![],
-            env: BTreeMap::new(),
-            current_dir: None,
-            props: None,
-        };
-
-        let result = spawn_process(spec, &tx);
-        assert!(result.is_err(), "spawn_process must return Err for nonexistent binary");
-        match result {
-            Err(super::SpawnError::ProcessSpawnFailed { bin, .. }) => {
-                assert_eq!(bin, "/nonexistent/binary/that/cannot/exist");
-            }
-            Err(other) => panic!("expected ProcessSpawnFailed, got: {:?}", other),
-            Ok(_) => panic!("expected Err, got Ok"),
+        #[test]
+        fn spawn_error_memfd_create_failed_display() {
+            let err = SpawnError::MemfdCreateFailed { bin: "mybin".to_string() };
+            let msg = err.to_string();
+            assert!(msg.contains("memfd_create failed"), "display must mention memfd_create failed, got: {msg}");
+            assert!(msg.contains("mybin"), "display must include the bin name, got: {msg}");
         }
     }
 
-    // ---------------------------------------------------------------------------
-    // Cycle 6: spawn_process expands ~/  in bin to $HOME before spawning
-    // ---------------------------------------------------------------------------
-    #[test]
-    fn spawn_process_tilde_bin_is_expanded_to_home_dir() {
+    mod spawn_failure {
+        use std::collections::BTreeMap;
         use std::sync::mpsc;
-        use super::spawn_process;
+        use super::super::{ProcessIdentity, ProcessSource, spawn_process, SpawnError};
 
-        let home = std::env::var("HOME").expect("HOME must be set");
+        #[test]
+        fn spawn_process_nonexistent_binary_returns_process_spawn_failed() {
+            let (tx, _rx) = mpsc::channel();
+            let spec = ProcessSource {
+                identity: ProcessIdentity {
+                    bin: "/nonexistent/binary/that/cannot/exist".to_string(),
+                    key: "test".to_string(),
+                },
+                script: None,
+                args: vec![],
+                env: BTreeMap::new(),
+                current_dir: None,
+                props: None,
+            };
 
-        let (tx, _rx) = mpsc::channel();
-        let spec = ProcessSource {
-            identity: ProcessIdentity {
-                bin: "~/nonexistent-tilde-test-binary".to_string(),
-                key: "tilde-test".to_string(),
-            },
-            script: None,
-            args: vec![],
-            env: BTreeMap::new(),
-            current_dir: None,
-            props: None,
-        };
-
-        let result = spawn_process(spec, &tx);
-        assert!(result.is_err(), "spawn of nonexistent tilde binary must fail");
-        match result {
-            Err(super::SpawnError::ProcessSpawnFailed { bin, .. }) => {
-                assert!(
-                    !bin.starts_with('~'),
-                    "bin in error must not contain literal ~; got: {bin}"
-                );
-                assert!(
-                    bin.starts_with(&home),
-                    "bin in error must start with HOME ({home}); got: {bin}"
-                );
+            let result = spawn_process(spec, &tx);
+            assert!(result.is_err(), "spawn_process must return Err for nonexistent binary");
+            match result {
+                Err(SpawnError::ProcessSpawnFailed { bin, .. }) => {
+                    assert_eq!(bin, "/nonexistent/binary/that/cannot/exist");
+                }
+                Err(other) => panic!("expected ProcessSpawnFailed, got: {:?}", other),
+                Ok(_) => panic!("expected Err, got Ok"),
             }
-            Err(other) => panic!("expected ProcessSpawnFailed, got: {:?}", other),
-            Ok(_) => panic!("expected Err, got Ok"),
         }
     }
 
-    // ---------------------------------------------------------------------------
-    // Cycle 5: ProcessSource::update crash+restart failure → propagates Err
-    // ---------------------------------------------------------------------------
-    #[test]
-    fn process_source_update_spawn_failure_returns_err() {
+    mod tilde_expansion {
+        use std::collections::BTreeMap;
+        use std::sync::mpsc;
+        use super::super::{ProcessIdentity, ProcessSource, spawn_process, SpawnError};
+
+        #[test]
+        fn spawn_process_tilde_bin_is_expanded_to_home_dir() {
+            let home = std::env::var("HOME").expect("HOME must be set");
+            let (tx, _rx) = mpsc::channel();
+            let spec = ProcessSource {
+                identity: ProcessIdentity {
+                    bin: "~/nonexistent-tilde-test-binary".to_string(),
+                    key: "tilde-test".to_string(),
+                },
+                script: None,
+                args: vec![],
+                env: BTreeMap::new(),
+                current_dir: None,
+                props: None,
+            };
+
+            let result = spawn_process(spec, &tx);
+            assert!(result.is_err(), "spawn of nonexistent tilde binary must fail");
+            match result {
+                Err(SpawnError::ProcessSpawnFailed { bin, .. }) => {
+                    assert!(!bin.starts_with('~'), "bin in error must not contain literal ~; got: {bin}");
+                    assert!(bin.starts_with(&home), "bin in error must start with HOME ({home}); got: {bin}");
+                }
+                Err(other) => panic!("expected ProcessSpawnFailed, got: {:?}", other),
+                Ok(_) => panic!("expected Err, got Ok"),
+            }
+        }
+    }
+
+    mod reconcile_restart_failure {
+        use std::collections::BTreeMap;
         use std::sync::mpsc;
         use crate::managed_set::Lifecycle;
+        use super::super::{ProcessIdentity, ProcessSource, SpawnError};
 
-        let (tx, _rx) = mpsc::channel();
+        #[test]
+        fn reconcile_self_spawn_failure_propagates_err() {
+            let (tx, _rx) = mpsc::channel();
 
-        // Enter with a valid binary that exits immediately
-        let spec_enter = ProcessSource {
-            identity: ProcessIdentity {
-                bin: "/bin/sh".to_string(),
-                key: "cycle5".to_string(),
-            },
-            script: None,
-            args: vec!["-c".to_string(), "exit 0".to_string()],
-            env: BTreeMap::new(),
-            current_dir: None,
-            props: None,
-        };
-        let mut state = spec_enter.enter(&(), &tx).expect("enter must succeed with /bin/sh");
+            let spec_enter = ProcessSource {
+                identity: ProcessIdentity {
+                    bin: "/bin/sh".to_string(),
+                    key: "restart-test".to_string(),
+                },
+                script: None,
+                args: vec!["-c".to_string(), "exit 0".to_string()],
+                env: BTreeMap::new(),
+                current_dir: None,
+                props: None,
+            };
+            let mut state = spec_enter.enter(&(), &tx).expect("enter must succeed with /bin/sh");
 
-        // Wait for the process to exit
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        // Confirm it exited
-        assert!(matches!(state.child.try_wait(), Ok(Some(_))), "child should have exited");
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            assert!(matches!(state.child.try_wait(), Ok(Some(_))), "child should have exited");
 
-        // Now update with a spec pointing to a nonexistent binary — spawn must fail
-        let spec_update = ProcessSource {
-            identity: ProcessIdentity {
-                bin: "/nonexistent/binary/that/cannot/exist".to_string(),
-                key: "cycle5".to_string(),
-            },
-            script: None,
-            args: vec![],
-            env: BTreeMap::new(),
-            current_dir: None,
-            props: None,
-        };
+            let spec_update = ProcessSource {
+                identity: ProcessIdentity {
+                    bin: "/nonexistent/binary/that/cannot/exist".to_string(),
+                    key: "restart-test".to_string(),
+                },
+                script: None,
+                args: vec![],
+                env: BTreeMap::new(),
+                current_dir: None,
+                props: None,
+            };
 
-        let result = spec_update.reconcile_self(&mut state, &(), &tx);
-        assert!(result.is_err(), "reconcile_self must propagate Err when restart spawn fails");
-        match result {
-            Err(super::SpawnError::ProcessSpawnFailed { .. }) => {}
-            Err(other) => panic!("expected ProcessSpawnFailed, got: {:?}", other),
-            Ok(_) => panic!("expected Err, got Ok"),
+            let result = spec_update.reconcile_self(&mut state, &(), &tx);
+            assert!(result.is_err(), "reconcile_self must propagate Err when restart spawn fails");
+            match result {
+                Err(SpawnError::ProcessSpawnFailed { .. }) => {}
+                Err(other) => panic!("expected ProcessSpawnFailed, got: {:?}", other),
+                Ok(_) => panic!("expected Err, got Ok"),
+            }
         }
     }
 }

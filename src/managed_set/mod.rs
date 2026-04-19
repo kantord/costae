@@ -182,7 +182,6 @@ mod tests {
         ctx.lock().unwrap().clone()
     }
 
-    // Test 1: update with a new item calls enter and stores the returned state
     #[test]
     fn new_item_calls_enter_and_stores_state() {
         let ctx = make_ctx();
@@ -192,7 +191,6 @@ mod tests {
         assert_eq!(ms.get(&"a".to_string()), Some(&42));
     }
 
-    // Test 2: update removing an existing item calls exit with the old state
     #[test]
     fn removed_item_calls_exit_with_old_state() {
         let ctx = make_ctx();
@@ -202,21 +200,17 @@ mod tests {
         assert!(calls(&ctx).contains(&"exit:99".to_string()));
     }
 
-    // Test 3: update with an already-present key calls update (not enter)
     #[test]
-    fn existing_item_calls_update_not_enter() {
+    fn existing_item_calls_reconcile_self_not_enter() {
         let ctx = make_ctx();
         let mut ms: ManagedSet<TestSpec> = ManagedSet::new();
         ms.reconcile(vec![TestSpec { id: "a".to_string(), value: 1 }], &ctx, &());
         ms.reconcile(vec![TestSpec { id: "a".to_string(), value: 2 }], &ctx, &());
         let log = calls(&ctx);
-        // Only one enter call total
         assert_eq!(log.iter().filter(|c| *c == "enter:a").count(), 1);
-        // At least one reconcile_self call
         assert!(log.contains(&"reconcile_self:a".to_string()));
     }
 
-    // Test 4: update deduplicates: two items with the same key → only one enter call
     #[test]
     fn duplicate_keys_in_batch_only_one_enter() {
         let ctx = make_ctx();
@@ -229,7 +223,6 @@ mod tests {
         assert_eq!(log.iter().filter(|c| *c == "enter:a").count(), 1);
     }
 
-    // Test 5: get returns the current state after enter
     #[test]
     fn get_returns_state_after_enter() {
         let ctx = make_ctx();
@@ -238,9 +231,8 @@ mod tests {
         assert_eq!(ms.get(&"b".to_string()), Some(&7));
     }
 
-    // Test 6: get returns updated state after update
     #[test]
-    fn get_returns_updated_state_after_update() {
+    fn get_returns_updated_state_after_reconcile() {
         let ctx = make_ctx();
         let mut ms: ManagedSet<TestSpec> = ManagedSet::new();
         ms.reconcile(vec![TestSpec { id: "c".to_string(), value: 10 }], &ctx, &());
@@ -248,8 +240,6 @@ mod tests {
         assert_eq!(ms.get(&"c".to_string()), Some(&20));
     }
 
-    // Test 7 (Claim A): iter_mut yields (&Key, &mut State) pairs; mutations are
-    // visible through subsequent get calls.
     #[test]
     fn iter_mut_yields_mutable_state_visible_via_get() {
         let ctx = make_ctx();
@@ -261,8 +251,6 @@ mod tests {
         assert_eq!(ms.get(&"d".to_string()), Some(&99));
     }
 
-    // Test 8 (Claim B): get_mut returns a mutable reference; a mutation through it
-    // is visible via the subsequent get call.
     #[test]
     fn get_mut_returns_mutable_reference_visible_via_get() {
         let ctx = make_ctx();
@@ -274,224 +262,186 @@ mod tests {
         assert_eq!(ms.get(&"e".to_string()), Some(&77));
     }
 
-    // ---------------------------------------------------------------------------
-    // Cycle 1: enter returning Err → item not added to store, error returned
-    // ---------------------------------------------------------------------------
+    mod enter_err {
+        use super::super::*;
 
-    #[derive(Clone)]
-    struct FallibleSpec {
-        id: String,
-        fail: bool,
-    }
-
-    #[derive(Debug, PartialEq)]
-    struct FallibleError(String);
-
-    impl Lifecycle for FallibleSpec {
-        type Key = String;
-        type State = String;
-        type Context = ();
-        type Output = ();
-        type Error = FallibleError;
-
-        fn key(&self) -> String {
-            self.id.clone()
+        #[derive(Clone)]
+        struct FallibleSpec {
+            id: String,
+            fail: bool,
         }
 
-        fn enter(self, _ctx: &(), _output: &()) -> Result<String, FallibleError> {
-            if self.fail {
-                Err(FallibleError(format!("enter failed for {}", self.id)))
-            } else {
-                Ok(format!("state:{}", self.id))
+        #[derive(Debug, PartialEq)]
+        struct FallibleError(String);
+
+        impl Lifecycle for FallibleSpec {
+            type Key = String;
+            type State = String;
+            type Context = ();
+            type Output = ();
+            type Error = FallibleError;
+
+            fn key(&self) -> String {
+                self.id.clone()
             }
-        }
 
-        fn reconcile_self(self, state: &mut String, _ctx: &(), _output: &()) -> Result<(), FallibleError> {
-            *state = format!("updated:{}", self.id);
-            Ok(())
-        }
+            fn enter(self, _ctx: &(), _output: &()) -> Result<String, FallibleError> {
+                if self.fail {
+                    Err(FallibleError(format!("enter failed for {}", self.id)))
+                } else {
+                    Ok(format!("state:{}", self.id))
+                }
+            }
 
-        fn exit(_state: String, _ctx: &()) -> Result<(), FallibleError> {
-            Ok(())
-        }
-    }
+            fn reconcile_self(self, state: &mut String, _ctx: &(), _output: &()) -> Result<(), FallibleError> {
+                *state = format!("updated:{}", self.id);
+                Ok(())
+            }
 
-    // Claim: when enter returns Err, the item is not added to the store and the
-    // error is included in the Vec returned by ManagedSet::update.
-    #[test]
-    fn enter_err_not_added_to_store_error_returned() {
-        let mut ms: ManagedSet<FallibleSpec> = ManagedSet::new();
-        let errors = ms.reconcile(vec![FallibleSpec { id: "x".to_string(), fail: true }], &(), &());
-        assert!(ms.get(&"x".to_string()).is_none(), "item must not be in store after enter Err");
-        assert_eq!(errors.len(), 1, "one error must be returned");
-        assert_eq!(errors[0].0, "x");
-        assert_eq!(errors[0].1, FallibleError("enter failed for x".to_string()));
-    }
-
-    // Claim: when enter returns Ok, the item IS added to the store and no errors returned.
-    #[test]
-    fn enter_ok_adds_item_to_store_no_errors() {
-        let mut ms: ManagedSet<FallibleSpec> = ManagedSet::new();
-        let errors = ms.reconcile(vec![FallibleSpec { id: "y".to_string(), fail: false }], &(), &());
-        assert_eq!(ms.get(&"y".to_string()), Some(&"state:y".to_string()));
-        assert!(errors.is_empty(), "no errors when enter returns Ok");
-    }
-
-    // ---------------------------------------------------------------------------
-    // Cycle 2: update returning Err → exit called, entry removed, error returned
-    // ---------------------------------------------------------------------------
-
-    #[derive(Clone)]
-    struct UpdateFallibleSpec {
-        id: String,
-        fail_update: bool,
-    }
-
-    #[derive(Debug, PartialEq)]
-    struct UpdateError(String);
-
-    static EXIT_CALLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-    impl Lifecycle for UpdateFallibleSpec {
-        type Key = String;
-        type State = String;
-        type Context = ();
-        type Output = ();
-        type Error = UpdateError;
-
-        fn key(&self) -> String {
-            self.id.clone()
-        }
-
-        fn enter(self, _ctx: &(), _output: &()) -> Result<String, UpdateError> {
-            Ok(format!("state:{}", self.id))
-        }
-
-        fn reconcile_self(self, _state: &mut String, _ctx: &(), _output: &()) -> Result<(), UpdateError> {
-            if self.fail_update {
-                Err(UpdateError(format!("update failed for {}", self.id)))
-            } else {
+            fn exit(_state: String, _ctx: &()) -> Result<(), FallibleError> {
                 Ok(())
             }
         }
 
-        fn exit(_state: String, _ctx: &()) -> Result<(), UpdateError> {
-            EXIT_CALLED.store(true, std::sync::atomic::Ordering::SeqCst);
-            Ok(())
+        #[test]
+        fn enter_err_not_added_to_store_error_returned() {
+            let mut ms: ManagedSet<FallibleSpec> = ManagedSet::new();
+            let errors = ms.reconcile(vec![FallibleSpec { id: "x".to_string(), fail: true }], &(), &());
+            assert!(ms.get(&"x".to_string()).is_none(), "item must not be in store after enter Err");
+            assert_eq!(errors.len(), 1, "one error must be returned");
+            assert_eq!(errors[0].0, "x");
+            assert_eq!(errors[0].1, FallibleError("enter failed for x".to_string()));
+        }
+
+        #[test]
+        fn enter_ok_adds_item_to_store_no_errors() {
+            let mut ms: ManagedSet<FallibleSpec> = ManagedSet::new();
+            let errors = ms.reconcile(vec![FallibleSpec { id: "y".to_string(), fail: false }], &(), &());
+            assert_eq!(ms.get(&"y".to_string()), Some(&"state:y".to_string()));
+            assert!(errors.is_empty(), "no errors when enter returns Ok");
         }
     }
 
-    // Claim: when update returns Err, exit is called on the old state, the entry is
-    // removed from the store, and the error is returned. Next call will use enter.
-    #[test]
-    fn update_err_exit_called_entry_removed_error_returned() {
-        EXIT_CALLED.store(false, std::sync::atomic::Ordering::SeqCst);
-        let mut ms: ManagedSet<UpdateFallibleSpec> = ManagedSet::new();
+    mod reconcile_err {
+        use super::super::*;
 
-        // First: enter succeeds
-        let e1 = ms.reconcile(vec![UpdateFallibleSpec { id: "z".to_string(), fail_update: false }], &(), &());
-        assert!(e1.is_empty());
-        assert!(ms.get(&"z".to_string()).is_some(), "item should be in store after successful enter");
-
-        // Second: update fails
-        let errors = ms.reconcile(vec![UpdateFallibleSpec { id: "z".to_string(), fail_update: true }], &(), &());
-        assert_eq!(errors.len(), 1, "one error must be returned on update failure");
-        assert_eq!(errors[0].0, "z");
-        assert_eq!(errors[0].1, UpdateError("update failed for z".to_string()));
-        assert!(ms.get(&"z".to_string()).is_none(), "item must be removed from store after update Err");
-        assert!(EXIT_CALLED.load(std::sync::atomic::Ordering::SeqCst), "exit must be called after update Err");
-
-        // Third: next call uses enter (not update)
-        EXIT_CALLED.store(false, std::sync::atomic::Ordering::SeqCst);
-        let e3 = ms.reconcile(vec![UpdateFallibleSpec { id: "z".to_string(), fail_update: false }], &(), &());
-        assert!(e3.is_empty(), "third call should succeed via enter");
-        assert!(ms.get(&"z".to_string()).is_some(), "item should be re-entered on third call");
-    }
-
-    // ---------------------------------------------------------------------------
-    // Output separation tests (RED — these require the new Lifecycle::Output type)
-    // ---------------------------------------------------------------------------
-
-    // A channel-based output type so we can observe what enter writes.
-    use std::sync::mpsc;
-
-    #[derive(Clone)]
-    struct OutputSpec {
-        id: String,
-        value: i32,
-    }
-
-    impl Lifecycle for OutputSpec {
-        type Key = String;
-        type State = ();
-        // Context is empty — all "live" communication goes through Output.
-        type Context = ();
-        // Output is the sender half of a channel.
-        type Output = mpsc::Sender<String>;
-        type Error = std::convert::Infallible;
-
-        fn key(&self) -> String {
-            self.id.clone()
+        #[derive(Clone)]
+        struct UpdateFallibleSpec {
+            id: String,
+            fail_update: bool,
         }
 
-        // enter receives output and writes to it — this is the behavioral claim.
-        fn enter(self, _ctx: &(), output: &mpsc::Sender<String>) -> Result<(), Self::Error> {
-            output.send(format!("entered:{}", self.id)).unwrap();
-            Ok(())
+        #[derive(Debug, PartialEq)]
+        struct UpdateError(String);
+
+        static EXIT_CALLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+        impl Lifecycle for UpdateFallibleSpec {
+            type Key = String;
+            type State = String;
+            type Context = ();
+            type Output = ();
+            type Error = UpdateError;
+
+            fn key(&self) -> String {
+                self.id.clone()
+            }
+
+            fn enter(self, _ctx: &(), _output: &()) -> Result<String, UpdateError> {
+                Ok(format!("state:{}", self.id))
+            }
+
+            fn reconcile_self(self, _state: &mut String, _ctx: &(), _output: &()) -> Result<(), UpdateError> {
+                if self.fail_update {
+                    Err(UpdateError(format!("update failed for {}", self.id)))
+                } else {
+                    Ok(())
+                }
+            }
+
+            fn exit(_state: String, _ctx: &()) -> Result<(), UpdateError> {
+                EXIT_CALLED.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
         }
 
-        // reconcile_self also receives output.
-        fn reconcile_self(self, _state: &mut (), _ctx: &(), output: &mpsc::Sender<String>) -> Result<(), Self::Error> {
-            output.send(format!("reconciled:{}", self.id)).unwrap();
-            Ok(())
-        }
+        #[test]
+        fn reconcile_err_exit_called_entry_removed_error_returned() {
+            EXIT_CALLED.store(false, std::sync::atomic::Ordering::SeqCst);
+            let mut ms: ManagedSet<UpdateFallibleSpec> = ManagedSet::new();
 
-        // exit does NOT receive output — cleanup doesn't write to it.
-        fn exit(_state: (), _ctx: &()) -> Result<(), Self::Error> {
-            Ok(())
+            let e1 = ms.reconcile(vec![UpdateFallibleSpec { id: "z".to_string(), fail_update: false }], &(), &());
+            assert!(e1.is_empty());
+            assert!(ms.get(&"z".to_string()).is_some(), "item should be in store after successful enter");
+
+            let errors = ms.reconcile(vec![UpdateFallibleSpec { id: "z".to_string(), fail_update: true }], &(), &());
+            assert_eq!(errors.len(), 1, "one error must be returned on reconcile failure");
+            assert_eq!(errors[0].0, "z");
+            assert_eq!(errors[0].1, UpdateError("update failed for z".to_string()));
+            assert!(ms.get(&"z".to_string()).is_none(), "item must be removed from store after reconcile Err");
+            assert!(EXIT_CALLED.load(std::sync::atomic::Ordering::SeqCst), "exit must be called after reconcile Err");
+
+            EXIT_CALLED.store(false, std::sync::atomic::Ordering::SeqCst);
+            let e3 = ms.reconcile(vec![UpdateFallibleSpec { id: "z".to_string(), fail_update: false }], &(), &());
+            assert!(e3.is_empty(), "third call should succeed via enter");
+            assert!(ms.get(&"z".to_string()).is_some(), "item should be re-entered on third call");
         }
     }
 
-    // Claim A: enter receives `output` and can write to it; Context is separate (here `()`).
-    #[test]
-    fn enter_receives_output_and_can_write_to_it() {
-        let (tx, rx) = mpsc::channel::<String>();
-        let mut ms: ManagedSet<OutputSpec> = ManagedSet::new();
-        ms.reconcile(
-            vec![OutputSpec { id: "o1".to_string(), value: 1 }],
-            &(),
-            &tx,
-        );
-        drop(tx); // close sender so recv() terminates
-        let msgs: Vec<String> = rx.try_iter().collect();
-        assert!(
-            msgs.contains(&"entered:o1".to_string()),
-            "enter must write to output; got: {:?}",
-            msgs
-        );
-    }
+    mod channel_output {
+        use super::super::*;
+        use std::sync::mpsc;
 
-    // Claim B: exit does NOT receive output — it only takes ctx (&()).
-    // This is a compile-time claim. We verify it by confirming OutputSpec compiles
-    // with an exit signature that has NO output parameter, proving the trait
-    // requires exactly `fn exit(state, ctx)` and not `fn exit(state, ctx, output)`.
-    //
-    // The test body just exercises the exit path to confirm it runs without output.
-    #[test]
-    fn exit_does_not_receive_output() {
-        let (tx, rx) = mpsc::channel::<String>();
-        let mut ms: ManagedSet<OutputSpec> = ManagedSet::new();
-        // Enter the item.
-        ms.reconcile(vec![OutputSpec { id: "o2".to_string(), value: 2 }], &(), &tx);
-        // Remove it — triggers exit, which has no output parameter.
-        ms.reconcile(vec![], &(), &tx);
-        drop(tx);
-        // We only expect "entered:o2" — exit must NOT have sent anything to output.
-        let msgs: Vec<String> = rx.try_iter().collect();
-        assert!(
-            !msgs.iter().any(|m| m.starts_with("exited:")),
-            "exit must not write to output; got: {:?}",
-            msgs
-        );
+        #[derive(Clone)]
+        struct ChannelOutputLifecycle {
+            id: String,
+        }
+
+        impl Lifecycle for ChannelOutputLifecycle {
+            type Key = String;
+            type State = ();
+            type Context = ();
+            type Output = mpsc::Sender<String>;
+            type Error = std::convert::Infallible;
+
+            fn key(&self) -> String {
+                self.id.clone()
+            }
+
+            fn enter(self, _ctx: &(), output: &mpsc::Sender<String>) -> Result<(), Self::Error> {
+                output.send(format!("entered:{}", self.id)).unwrap();
+                Ok(())
+            }
+
+            fn reconcile_self(self, _state: &mut (), _ctx: &(), output: &mpsc::Sender<String>) -> Result<(), Self::Error> {
+                output.send(format!("reconciled:{}", self.id)).unwrap();
+                Ok(())
+            }
+
+            fn exit(_state: (), _ctx: &()) -> Result<(), Self::Error> {
+                Ok(())
+            }
+        }
+
+        #[test]
+        fn enter_receives_output_and_can_write_to_it() {
+            let (tx, rx) = mpsc::channel::<String>();
+            let mut ms: ManagedSet<ChannelOutputLifecycle> = ManagedSet::new();
+            ms.reconcile(vec![ChannelOutputLifecycle { id: "o1".to_string() }], &(), &tx);
+            drop(tx);
+            let msgs: Vec<String> = rx.try_iter().collect();
+            assert!(msgs.contains(&"entered:o1".to_string()), "enter must write to output; got: {:?}", msgs);
+        }
+
+        #[test]
+        fn exit_does_not_receive_output() {
+            let (tx, rx) = mpsc::channel::<String>();
+            let mut ms: ManagedSet<ChannelOutputLifecycle> = ManagedSet::new();
+            ms.reconcile(vec![ChannelOutputLifecycle { id: "o2".to_string() }], &(), &tx);
+            ms.reconcile(vec![], &(), &tx);
+            drop(tx);
+            let msgs: Vec<String> = rx.try_iter().collect();
+            assert!(!msgs.iter().any(|m| m.starts_with("exited:")), "exit must not write to output; got: {:?}", msgs);
+        }
     }
 }
