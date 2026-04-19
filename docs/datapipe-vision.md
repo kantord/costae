@@ -1,44 +1,82 @@
 # DataPipe Architecture Vision
 
+> This document covers the near-term DataPipe design. For the broader pipeline/reconciler
+> vision — structural recursion, fan-out, streaming model, context composition — see
+> `pipeline-vision.md`. For the Supervisor trait and health monitoring design — see
+> `health-vision.md`.
+
+---
+
 ## Core idea
 
-Replace the current ad-hoc wiring (DataLoop + DataLoopHandle + event_txs_snapshot + set_desired method calls) with a composable pipeline where a single `DataPipe` struct owns the event loop and dispatches typed messages to each stage.
+Replace the current ad-hoc wiring (DataLoop + DataLoopHandle + event_txs_snapshot +
+set_desired method calls) with a composable pipeline where a single `DataPipe` struct owns
+the event loop and dispatches typed messages to each stage.
 
 ## Shape
 
 ```
-┌─────────────────────────────────────────────────────┐
-│  DataPipe  (owns the loop, owns the channel)        │
-│                                                     │
-│  on message:                                        │
-│    ProcessPoolMsg::SetDesired(specs)  → ProcessPool │
-│    ProcessPoolMsg::SendEvent(key, v)  → ProcessPool │
-│    StreamValuesMsg::SetDesired(specs) → StreamValues│
-│    …                                                │
-│                                                     │
-│  back-edge (only allowed feedback arc):             │
-│    ProcessPool stdout → DataPipe → consumers        │
-└─────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│  JSX evaluator  (desired-state source node)                 │
+│  Reacts to data streams; emits a new tree on any change.    │
+│  This emission is the message that triggers reconciliation.  │
+└────────────────────────────┬────────────────────────────────┘
+                             │ new desired tree
+                             ▼
+┌─────────────────────────────────────────────────────────────┐
+│  DataPipe / pipeline orchestrator  (owns the loop)          │
+│                                                             │
+│  on message:                                                │
+│    ProcessPoolMsg::SetDesired(specs)  → ProcessPool         │
+│    ProcessPoolMsg::SendEvent(key, v)  → ProcessPool         │
+│    StreamValuesMsg::SetDesired(specs) → StreamValues        │
+│    …                                                        │
+│                                                             │
+│  back-edge (only allowed feedback arc):                     │
+│    ProcessPool stdout → DataPipe → consumers                │
+└─────────────────────────────────────────────────────────────┘
 ```
 
 ## Key properties
 
-- **DataPipe owns the loop.** No external thread drives it; callers send messages through a channel.
-- **All configuration is a message.** `set_desired` becomes `ProcessPoolMsg::SetDesired(specs)` — no separate handle type needed.
-- **Stages are equal.** Each stage (ProcessPool, StreamValues, …) receives typed messages and emits outputs. None calls methods on another directly.
-- **Single back-edge rule.** Process stdout lines flow back up to DataPipe for routing. All other data flow is top-down. This prevents feedback cycles and mirrors the Elm architecture constraint.
-- **`DataLoopHandle` disappears.** Main thread holds a `DataPipeSender` (thin wrapper around the channel); DataPipe fans messages out internally.
+- **DataPipe owns the loop.** No external thread drives it; callers send messages through a
+  channel.
+- **All configuration is a message.** `set_desired` becomes
+  `ProcessPoolMsg::SetDesired(specs)` — no separate handle type needed.
+- **Stages are equal.** Each stage (ProcessPool, StreamValues, …) receives typed messages
+  and emits outputs. None calls methods on another directly.
+- **Single back-edge rule.** Process stdout lines flow back up to DataPipe for routing. All
+  other data flow is top-down. This prevents feedback cycles and mirrors the Elm
+  architecture constraint. The same rule applies to Tier 3 global context writes
+  (see `pipeline-vision.md` — context composition).
+- **`DataLoopHandle` disappears.** Main thread holds a `DataPipeSender` (thin wrapper around
+  the channel); DataPipe fans messages out internally.
+- **The orchestrator is the timing controller.** Reconciliation cadence at each level is
+  driven by messages from the orchestrator — including explicit "reconcile now" ticks — not
+  by internal timers inside stages. Each stage can receive ticks at a different rate.
+
+## Relationship to the Supervisor trait
+
+Each stage in the pipeline is a **Supervisor** (see `health-vision.md`): it owns a
+`ManagedSet`, drives reconciliation, and reports per-item health. DataPipe is the
+orchestrator that routes messages to supervisors and aggregates their health/log output
+streams. DataPipe does not know about item internals — it only speaks in typed messages to
+each supervisor.
 
 ## Migration path
 
 1. Define `DataPipeMsg` enum with variants for each stage.
 2. Give DataPipe a `Sender<DataPipeMsg>` and run the loop internally.
-3. Replace `set_desired` call-sites with `pipe_tx.send(DataPipeMsg::ProcessPool(SetDesired(specs)))`.
-4. Replace `event_txs_snapshot` Arc with `DataPipeMsg::ProcessPool(SendEvent(key, value))`.
+3. Replace `set_desired` call-sites with
+   `pipe_tx.send(DataPipeMsg::ProcessPool(SetDesired(specs)))`.
+4. Replace `event_txs_snapshot` Arc with
+   `DataPipeMsg::ProcessPool(SendEvent(key, value))`.
 5. Delete `DataLoopHandle`.
 
 ## What this does NOT cover yet
 
-- StreamValues as a managed stage (they're currently just process stdout parsed as JSON — may not need separate treatment).
+- StreamValues as a managed stage (currently just process stdout parsed as JSON).
 - Backpressure between stages.
-- Per-stage restart/error policy.
+- Per-stage restart/error policy (see `health-vision.md`).
+- Fan-out: per-panel process supervisors instead of one global process pool
+  (see `pipeline-vision.md` — fan-out).
