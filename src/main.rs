@@ -80,15 +80,13 @@ fn stream_calls_to_specs(calls: &[(String, Option<String>)]) -> Vec<StreamSource
 }
 
 fn apply_eval_result(
-    value: &serde_json::Value,
-    stream_calls: &[(String, Option<String>)],
-    module_calls: &[(String, serde_json::Value)],
+    out: &costae::jsx::EvalOutput,
     handle: &DataLoopHandle,
     panel_set: &mut ManagedSet<PanelSpec>,
     panel_ctx: &PanelContext,
     mod_init_fn: &dyn Fn(&[costae::PanelSpec]) -> serde_json::Value,
 ) -> bool {
-    let specs = match costae::parse_root_node(value) {
+    let specs = match costae::parse_root_node(&out.layout) {
         Ok(s) => s,
         Err(e) => {
             tracing::error!(error = %e, "root node parse error");
@@ -98,15 +96,15 @@ fn apply_eval_result(
     let mod_init = mod_init_fn(&specs);
 
     let module_bins: std::collections::HashSet<String> =
-        module_calls.iter().map(|(b, _)| b.clone()).collect();
-    let stream_specs = stream_calls_to_specs(stream_calls)
+        out.module_calls.iter().map(|(b, _)| b.clone()).collect();
+    let stream_specs = stream_calls_to_specs(&out.stream_calls)
         .into_iter()
         .filter(|s| match s {
             StreamSource::Process(p) => !module_bins.contains(&p.identity.bin),
             StreamSource::BuiltIn(_) => true,
         })
         .collect::<Vec<_>>();
-    let module_specs: Vec<StreamSource> = module_calls.iter().map(|(bin, _)| {
+    let module_specs: Vec<StreamSource> = out.module_calls.iter().map(|(bin, _)| {
         StreamSource::Process(ProcessSource {
             identity: ProcessIdentity { bin: bin.clone(), key: bin.clone() },
             script: None,
@@ -197,19 +195,18 @@ fn handle_layout_reload(
 
     if layout_jsx_path.exists() {
         match std::fs::read_to_string(layout_jsx_path) {
-            Ok(source) => match costae::jsx::JsxEvaluator::new(&source, jsx_ctx.clone()) {
-                Ok(evaluator) => match evaluator.eval(stream_values) {
-                    Ok((value, stream_calls, module_calls)) => {
-                        apply_eval_result(
-                            &value, &stream_calls, &module_calls,
-                            handle, panel_set, panel_ctx,
-                            mod_init_fn,
-                        );
-                        *jsx_evaluator = Some(evaluator);
-                    }
-                    Err(e) => tracing::error!(error = %e, "JSX eval error"),
-                },
-                Err(e) => tracing::error!(error = %e, "JSX compile error"),
+            Ok(source) => {
+                let base_dir = layout_jsx_path.parent().unwrap_or(layout_jsx_path);
+                match costae::jsx::JsxEvaluator::new(&source, jsx_ctx.clone(), Some(base_dir)) {
+                    Ok(evaluator) => match evaluator.eval(stream_values) {
+                        Ok(out) => {
+                            apply_eval_result(&out, handle, panel_set, panel_ctx, mod_init_fn);
+                            *jsx_evaluator = Some(evaluator);
+                        }
+                        Err(e) => tracing::error!(error = %e, "JSX eval error"),
+                    },
+                    Err(e) => tracing::error!(error = %e, "JSX compile error"),
+                }
             },
             Err(e) => tracing::error!(error = %e, "JSX file error"),
         }
@@ -460,6 +457,15 @@ impl TickState {
         state
     }
 
+    fn make_mod_init_fn(&self) -> impl Fn(&[costae::PanelSpec]) -> serde_json::Value {
+        let dpr = self.dpr;
+        let dpi = self.dpi;
+        let sw = self.screen_width_logical;
+        let sh = self.screen_height_logical;
+        let output_name = self.output_name.clone();
+        move |specs| make_mod_init_value(specs, dpr, &output_name, dpi, sw, sh)
+    }
+
     fn initial_load(&mut self) {
         if !self.layout_jsx_path.exists() { return; }
         let source = match std::fs::read_to_string(&self.layout_jsx_path) {
@@ -467,17 +473,16 @@ impl TickState {
             Err(e) => { tracing::error!(error = %e, "JSX file error"); return; }
         };
         let t = std::time::Instant::now();
-        let evaluator = match costae::jsx::JsxEvaluator::new(&source, self.jsx_ctx.clone()) {
+        let base_dir = self.layout_jsx_path.parent().unwrap_or(&self.layout_jsx_path);
+        let evaluator = match costae::jsx::JsxEvaluator::new(&source, self.jsx_ctx.clone(), Some(base_dir)) {
             Ok(e) => e,
             Err(e) => { tracing::error!(error = %e, "JSX compile error"); return; }
         };
         match evaluator.eval(&self.stream_values) {
-            Ok((value, stream_calls, module_calls)) => {
+            Ok(out) => {
                 tracing::debug!(elapsed_ms = t.elapsed().as_millis(), "jsx eval");
-                let (dpr, dpi, sw, sh) = (self.dpr, self.dpi, self.screen_width_logical, self.screen_height_logical);
-                let output_name = self.output_name.clone();
-                let make_mod_init = |specs: &[costae::PanelSpec]| make_mod_init_value(specs, dpr, &output_name, dpi, sw, sh);
-                apply_eval_result(&value, &stream_calls, &module_calls, &self.handle, &mut self.panel_set, &self.panel_ctx, &make_mod_init);
+                let make_mod_init = self.make_mod_init_fn();
+                apply_eval_result(&out, &self.handle, &mut self.panel_set, &self.panel_ctx, &make_mod_init);
                 self.jsx_evaluator = Some(evaluator);
             }
             Err(e) => tracing::error!(error = %e, "JSX eval error"),
@@ -500,9 +505,7 @@ impl TickState {
             }
         }
 
-        let (dpr, dpi, sw, sh) = (self.dpr, self.dpi, self.screen_width_logical, self.screen_height_logical);
-        let output_name = self.output_name.clone();
-        let make_mod_init = |specs: &[costae::PanelSpec]| make_mod_init_value(specs, dpr, &output_name, dpi, sw, sh);
+        let make_mod_init = self.make_mod_init_fn();
 
         if changed {
             if let Some(new_map) = rebuild_output_map_from_stream(&self.stream_values) {
@@ -511,9 +514,9 @@ impl TickState {
             if let Some(ref evaluator) = self.jsx_evaluator {
                 let t = std::time::Instant::now();
                 match evaluator.eval(&self.stream_values) {
-                    Ok((new_value, new_calls, new_module_calls)) => {
+                    Ok(out) => {
                         tracing::debug!(elapsed_us = t.elapsed().as_micros(), "jsx re-eval");
-                        if apply_eval_result(&new_value, &new_calls, &new_module_calls, &self.handle, &mut self.panel_set, &self.panel_ctx, &make_mod_init) {
+                        if apply_eval_result(&out, &self.handle, &mut self.panel_set, &self.panel_ctx, &make_mod_init) {
                             needs_render = true;
                         }
                     }
