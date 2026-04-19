@@ -21,13 +21,17 @@ pub fn i3_recv(s: &mut UnixStream) -> std::io::Result<(u32, Vec<u8>)> {
 }
 
 pub fn i3_socket_path() -> String {
-    std::env::var("I3SOCK").unwrap_or_else(|_| {
-        std::process::Command::new("i3")
-            .arg("--get-socketpath")
-            .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-            .unwrap_or_default()
-    })
+    if let Ok(path) = std::env::var("I3SOCK") {
+        return path;
+    }
+    if let Ok(path) = std::env::var("SWAYSOCK") {
+        return path;
+    }
+    std::process::Command::new("i3")
+        .arg("--get-socketpath")
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default()
 }
 
 const I3_DPI_SCALE_THRESHOLD: f32 = 1.25;

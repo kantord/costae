@@ -10,7 +10,10 @@ use costae::data::data_loop::{DataLoop, DataLoopHandle, BuiltInSource, ProcessId
 use costae::x11::click::do_hit_test;
 use costae::x11::panel::{sample_root_bg, i3_dpi, PanelContext};
 use costae::managed_set::{ManagedSet, Reconcile};
-use costae::layout::PanelSpec;
+use costae::layout::PanelSpecData;
+use costae::windowing::wayland::{WaylandDisplayServer, WaylandPanel};
+use costae::windowing::{DisplayServer, WindowEvent};
+use wayland_client::backend::ObjectId;
 
 type ModuleEventTxs = Arc<std::sync::Mutex<HashMap<String, mpsc::Sender<serde_json::Value>>>>;
 
@@ -23,6 +26,194 @@ fn log_lifecycle_errors<K: Debug, E: Debug>(errors: costae::managed_set::Reconci
         tracing::error!(key = ?key, error = ?err, "lifecycle error");
     }
 }
+
+fn is_wayland_session() -> bool {
+    std::env::var("WAYLAND_DISPLAY").is_ok()
+}
+
+fn apply_wayland_eval_result(
+    out: &costae::jsx::EvalOutput,
+    handle: &DataLoopHandle,
+    panels: &mut HashMap<String, WaylandPanel>,
+    server: &mut WaylandDisplayServer,
+) -> bool {
+    let specs = match costae::parse_root_node(&out.layout) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(error = %e, "root node parse error");
+            return false;
+        }
+    };
+    let stream_specs = stream_calls_to_specs(&out.stream_calls);
+    handle.set_desired(stream_specs);
+
+    let desired_ids: std::collections::HashSet<String> = specs.iter().map(|s| s.id.clone()).collect();
+    panels.retain(|id, _| desired_ids.contains(id));
+    for data in specs {
+        if let Some(panel) = panels.get_mut(&data.id) {
+            panel.raw_layout = Some(data.content.clone());
+        } else {
+            match server.create_panel(&data) {
+                Ok(panel) => { panels.insert(data.id.clone(), panel); }
+                Err(e) => tracing::error!(id = %data.id, error = %e, "create_panel failed"),
+            }
+        }
+    }
+    true
+}
+
+struct WaylandTickState {
+    server: WaylandDisplayServer,
+    panels: HashMap<String, WaylandPanel>,
+    stream_values: HashMap<(String, Option<String>), String>,
+    jsx_evaluator: Option<costae::jsx::JsxEvaluator>,
+    handle: DataLoopHandle,
+    jsx_ctx: serde_json::Value,
+    item_rx: mpsc::Receiver<((String, Option<String>), String)>,
+    bin_reload_rx: mpsc::Receiver<()>,
+    reload_rx: mpsc::Receiver<()>,
+    layout_jsx_path: std::path::PathBuf,
+    stop: Arc<AtomicBool>,
+    last_tick: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl WaylandTickState {
+    fn new(
+        server: WaylandDisplayServer,
+        handle: DataLoopHandle,
+        rx: TickReceivers,
+        layout_jsx_path: std::path::PathBuf,
+        stop: Arc<AtomicBool>,
+        last_tick: Arc<std::sync::atomic::AtomicU64>,
+    ) -> Self {
+        let jsx_ctx = serde_json::json!({
+            "output": "wayland",
+            "dpi": 96.0,
+            "screen_width": 1920,
+            "screen_height": 1080,
+        });
+        let mut state = Self {
+            server,
+            panels: HashMap::new(),
+            stream_values: HashMap::new(),
+            jsx_evaluator: None,
+            handle,
+            jsx_ctx,
+            item_rx: rx.item_rx,
+            bin_reload_rx: rx.bin_reload_rx,
+            reload_rx: rx.reload_rx,
+            layout_jsx_path,
+            stop,
+            last_tick,
+        };
+        state.initial_load();
+        state
+    }
+
+    fn initial_load(&mut self) {
+        if !self.layout_jsx_path.exists() { return; }
+        let source = match std::fs::read_to_string(&self.layout_jsx_path) {
+            Ok(s) => s,
+            Err(e) => { tracing::error!(error = %e, "JSX file error"); return; }
+        };
+        let base_dir = self.layout_jsx_path.parent().unwrap_or(&self.layout_jsx_path);
+        let evaluator = match costae::jsx::JsxEvaluator::new(&source, self.jsx_ctx.clone(), Some(base_dir)) {
+            Ok(e) => e,
+            Err(e) => { tracing::error!(error = %e, "JSX compile error"); return; }
+        };
+        match evaluator.eval(&self.stream_values) {
+            Ok(out) => {
+                apply_wayland_eval_result(&out, &self.handle, &mut self.panels, &mut self.server);
+                self.jsx_evaluator = Some(evaluator);
+            }
+            Err(e) => tracing::error!(error = %e, "JSX eval error"),
+        }
+    }
+
+    fn render_configured_panels(&mut self) {
+        let dpr = 1.0_f32;
+        let key = serde_json::to_value(&self.stream_values).unwrap_or_default();
+        for panel in self.panels.values_mut() {
+            if !panel.configured { continue; }
+            let layout = panel.raw_layout.as_ref().and_then(|l| {
+                parse_layout(l).map_err(|e| tracing::error!(error = %e, "layout parse error")).ok()
+            });
+            let bgrx = render_frame(layout, panel.width, panel.height, dpr);
+            let _ = key; // cache key unused for now
+            panel.render(&bgrx);
+        }
+        self.server.flush();
+    }
+
+    fn tick(&mut self) {
+        self.last_tick.store(
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
+            Ordering::Relaxed,
+        );
+
+        let mut needs_render = false;
+
+        let mut changed = false;
+        while let Ok((key, value)) = self.item_rx.try_recv() {
+            if self.stream_values.get(&key).map(|s| s.as_str()) != Some(value.as_str()) {
+                self.stream_values.insert(key, value);
+                changed = true;
+            }
+        }
+
+        if changed {
+            if let Some(ref evaluator) = self.jsx_evaluator {
+                match evaluator.eval(&self.stream_values) {
+                    Ok(out) => {
+                        apply_wayland_eval_result(&out, &self.handle, &mut self.panels, &mut self.server);
+                        needs_render = true;
+                    }
+                    Err(e) => tracing::error!(error = %e, "JSX re-eval error"),
+                }
+            }
+        }
+
+        if self.bin_reload_rx.try_recv().is_ok() {
+            tracing::info!("binary changed, restarting...");
+            self.stop.store(true, Ordering::Relaxed);
+            return;
+        }
+
+        if self.reload_rx.try_recv().is_ok() {
+            self.handle.set_desired(vec![]);
+            self.stream_values.clear();
+            self.jsx_evaluator = None;
+            self.panels.clear();
+            self.initial_load();
+        }
+
+        match self.server.dispatch() {
+            Ok(events) => {
+                for event in events {
+                    if matches!(event, WindowEvent::OutputsChanged) {
+                        tracing::info!("Wayland outputs changed");
+                    }
+                }
+            }
+            Err(e) => tracing::error!(error = %e, "Wayland dispatch error"),
+        }
+
+        let configured_ids: Vec<ObjectId> = self.server.take_pending_configures();
+        for surface_id in configured_ids {
+            for panel in self.panels.values_mut() {
+                if panel.surface_id == surface_id {
+                    panel.configured = true;
+                    needs_render = true;
+                }
+            }
+        }
+
+        if needs_render {
+            self.render_configured_panels();
+        }
+    }
+}
+
 use x11rb::{
     connection::Connection,
     protocol::{randr::ConnectionExt as RandrExt, xproto::*},
@@ -82,9 +273,9 @@ fn stream_calls_to_specs(calls: &[(String, Option<String>)]) -> Vec<StreamSource
 fn apply_eval_result(
     out: &costae::jsx::EvalOutput,
     handle: &DataLoopHandle,
-    panel_set: &mut ManagedSet<PanelSpec>,
+    panel_set: &mut ManagedSet<PanelSpecData>,
     panel_ctx: &PanelContext,
-    mod_init_fn: &dyn Fn(&[costae::PanelSpec]) -> serde_json::Value,
+    mod_init_fn: &dyn Fn(&[costae::PanelSpecData]) -> serde_json::Value,
 ) -> bool {
     let specs = match costae::parse_root_node(&out.layout) {
         Ok(s) => s,
@@ -124,7 +315,7 @@ fn apply_eval_result(
 
 fn poll_x11_events(
     conn: &RustConnection,
-    panel_set: &mut ManagedSet<PanelSpec>,
+    panel_set: &mut ManagedSet<PanelSpecData>,
     module_event_txs: &std::sync::Mutex<HashMap<String, mpsc::Sender<serde_json::Value>>>,
     dpr: f32,
     depth: u8,
@@ -182,9 +373,9 @@ fn handle_layout_reload(
     jsx_evaluator: &mut Option<costae::jsx::JsxEvaluator>,
     layout_jsx_path: &std::path::Path,
     jsx_ctx: &serde_json::Value,
-    panel_set: &mut ManagedSet<PanelSpec>,
+    panel_set: &mut ManagedSet<PanelSpecData>,
     panel_ctx: &PanelContext,
-    mod_init_fn: &dyn Fn(&[costae::PanelSpec]) -> serde_json::Value,
+    mod_init_fn: &dyn Fn(&[costae::PanelSpecData]) -> serde_json::Value,
 ) -> bool {
     if reload_rx.try_recv().is_err() {
         return false;
@@ -370,7 +561,7 @@ fn init_x11() -> Result<X11Init, Box<dyn std::error::Error>> {
 }
 
 fn make_mod_init_value(
-    specs: &[costae::PanelSpec],
+    specs: &[costae::PanelSpecData],
     dpr: f32,
     output_name: &str,
     dpi: f32,
@@ -402,7 +593,7 @@ struct TickReceivers {
 struct TickState {
     stream_values: HashMap<(String, Option<String>), String>,
     jsx_evaluator: Option<costae::jsx::JsxEvaluator>,
-    panel_set: ManagedSet<PanelSpec>,
+    panel_set: ManagedSet<PanelSpecData>,
     panel_ctx: PanelContext,
     handle: DataLoopHandle,
     jsx_ctx: serde_json::Value,
@@ -457,7 +648,7 @@ impl TickState {
         state
     }
 
-    fn make_mod_init_fn(&self) -> impl Fn(&[costae::PanelSpec]) -> serde_json::Value {
+    fn make_mod_init_fn(&self) -> impl Fn(&[costae::PanelSpecData]) -> serde_json::Value {
         let dpr = self.dpr;
         let dpi = self.dpi;
         let sw = self.screen_width_logical;
@@ -624,24 +815,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     data_loop = data_loop.with_extra_rx(dl_wake_rx);
     let module_event_txs = data_loop.event_txs_handle();
 
-    let x11 = init_x11()?;
-
     // Cross-closure channel: on_item sends key/value here, on_tick processes them.
     let (item_tx, item_rx) = mpsc::channel::<((String, Option<String>), String)>();
     let stop = Arc::new(AtomicBool::new(false));
+    let rx = TickReceivers { item_rx, bin_reload_rx, reload_rx };
 
-    let mut tick_state = TickState::new(
-        x11, handle,
-        TickReceivers { item_rx, bin_reload_rx, reload_rx },
-        layout_jsx_path, module_event_txs,
-        Arc::clone(&stop), Arc::clone(&last_tick),
-    );
-
-    data_loop.run(
-        Arc::clone(&stop),
-        move |item: StreamItem| { let _ = item_tx.send((item.key, item.line)); },
-        move || tick_state.tick(),
-    );
+    if is_wayland_session() {
+        tracing::info!("display backend: Wayland");
+        let server = WaylandDisplayServer::connect()?;
+        init_global_ctx();
+        let mut wayland_state = WaylandTickState::new(
+            server, handle, rx, layout_jsx_path,
+            Arc::clone(&stop), Arc::clone(&last_tick),
+        );
+        data_loop.run(
+            Arc::clone(&stop),
+            move |item: StreamItem| { let _ = item_tx.send((item.key, item.line)); },
+            move || wayland_state.tick(),
+        );
+    } else {
+        tracing::info!("display backend: X11");
+        let x11 = init_x11()?;
+        let mut tick_state = TickState::new(
+            x11, handle, rx, layout_jsx_path, module_event_txs,
+            Arc::clone(&stop), Arc::clone(&last_tick),
+        );
+        data_loop.run(
+            Arc::clone(&stop),
+            move |item: StreamItem| { let _ = item_tx.send((item.key, item.line)); },
+            move || tick_state.tick(),
+        );
+    }
 
     // run() returned because stop was set (binary reload). TickState::drop handles cleanup.
     use std::os::unix::process::CommandExt;

@@ -8,7 +8,7 @@ use x11rb::{
     wrapper::ConnectionExt as _,
 };
 
-use crate::layout::{PanelSpec, PanelAnchor};
+use crate::layout::{PanelSpecData, PanelAnchor};
 
 const XRESOURCES_PROP_MAX_LEN: u32 = 65536;
 const MM_PER_INCH: f32 = 25.4;
@@ -120,7 +120,7 @@ pub fn i3_dpi(conn: &RustConnection, root: Window, screen: &Screen) -> f32 {
 }
 
 fn create_panel(
-    spec: &PanelSpec,
+    spec: &PanelSpecData,
     ctx: &PanelContext,
 ) -> anyhow::Result<Panel> {
     let phys_width = (spec.width as f32 * ctx.dpr).round() as u32;
@@ -198,7 +198,7 @@ fn create_panel(
     })
 }
 
-pub struct PanelContext {
+pub struct X11PanelContext {
     pub conn: Arc<RustConnection>,
     pub root: u32,
     pub depth: u8,
@@ -215,10 +215,13 @@ pub struct PanelContext {
     pub output_map: Arc<HashMap<String, (i16, i16, u32, u32)>>,
 }
 
-impl Lifecycle for PanelSpec {
+/// Backward-compatible alias so callers that import `x11::panel::PanelContext` still compile.
+pub type PanelContext = X11PanelContext;
+
+impl Lifecycle for PanelSpecData {
     type Key = String;
     type State = Panel;
-    type Context = PanelContext;
+    type Context = X11PanelContext;
     type Output = ();
     type Error = anyhow::Error;
 
@@ -335,9 +338,9 @@ mod tests {
         })
     }
 
-    /// Build a minimal PanelSpec with the given id/dimensions.
-    fn make_spec(id: &str, width: u32, height: u32) -> crate::layout::PanelSpec {
-        crate::layout::PanelSpec {
+    /// Build a minimal PanelSpecData with the given id/dimensions.
+    fn make_spec(id: &str, width: u32, height: u32) -> crate::layout::PanelSpecData {
+        crate::layout::PanelSpecData {
             id: id.to_string(),
             anchor: None,
             width,
@@ -367,14 +370,14 @@ mod tests {
         };
 
         let spec = make_spec("test-enter", 200, 30);
-        let panel = <crate::layout::PanelSpec as Lifecycle>::enter(spec, &ctx, &())
+        let panel = <crate::layout::PanelSpecData as Lifecycle>::enter(spec, &ctx, &())
             .expect("enter should succeed when X11 is available");
 
         assert!(panel.phys_width > 0, "phys_width must be > 0");
         assert!(panel.phys_height > 0, "phys_height must be > 0");
 
         // Cleanup
-        let _ = <crate::layout::PanelSpec as Lifecycle>::exit(panel, &ctx);
+        let _ = <crate::layout::PanelSpecData as Lifecycle>::exit(panel, &ctx);
     }
 
     // ---------------------------------------------------------------------------
@@ -395,7 +398,7 @@ mod tests {
         };
 
         let spec = make_spec("test-exit", 200, 30);
-        let panel = <crate::layout::PanelSpec as Lifecycle>::enter(spec, &ctx, &())
+        let panel = <crate::layout::PanelSpecData as Lifecycle>::enter(spec, &ctx, &())
             .expect("enter must succeed for exit test");
 
         let win_id = panel.win_id;
@@ -407,7 +410,7 @@ mod tests {
             .and_then(|c| c.reply().ok());
         assert!(before.is_some(), "window should exist before exit");
 
-        let _ = <crate::layout::PanelSpec as Lifecycle>::exit(panel, &ctx);
+        let _ = <crate::layout::PanelSpecData as Lifecycle>::exit(panel, &ctx);
         ctx.conn.flush().ok();
 
         // After exit the window must no longer exist.
@@ -433,11 +436,11 @@ mod tests {
         };
 
         let spec = make_spec("test-update", 200, 30);
-        let mut panel = <crate::layout::PanelSpec as Lifecycle>::enter(spec, &ctx, &())
+        let mut panel = <crate::layout::PanelSpecData as Lifecycle>::enter(spec, &ctx, &())
             .expect("enter must succeed for update test");
 
         let new_content = serde_json::json!({"type": "text", "text": "hello"});
-        let new_spec = crate::layout::PanelSpec {
+        let new_spec = crate::layout::PanelSpecData {
             id: "test-update".to_string(),
             anchor: None,
             width: 200,
@@ -450,7 +453,7 @@ mod tests {
             content: new_content.clone(),
         };
 
-        <crate::layout::PanelSpec as Lifecycle>::reconcile_self(new_spec, &mut panel, &ctx, &())
+        <crate::layout::PanelSpecData as Lifecycle>::reconcile_self(new_spec, &mut panel, &ctx, &())
             .expect("reconcile_self must succeed");
 
         assert_eq!(
@@ -460,7 +463,7 @@ mod tests {
         );
 
         // Cleanup
-        let _ = <crate::layout::PanelSpec as Lifecycle>::exit(panel, &ctx);
+        let _ = <crate::layout::PanelSpecData as Lifecycle>::exit(panel, &ctx);
     }
 
     // ---------------------------------------------------------------------------
@@ -484,10 +487,10 @@ mod tests {
     // ---------------------------------------------------------------------------
     #[test]
     fn panel_spec_lifecycle_key_returns_id() {
-        use crate::layout::PanelSpec;
+        use crate::layout::PanelSpecData;
         use crate::managed_set::Lifecycle;
 
-        let spec = PanelSpec {
+        let spec = PanelSpecData {
             id: "my-panel".to_string(),
             anchor: None,
             width: 100,
