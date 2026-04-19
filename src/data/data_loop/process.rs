@@ -189,6 +189,7 @@ impl Lifecycle for ProcessSource {
 
     fn exit(mut state: Self::State, _ctx: &()) -> Result<(), Self::Error> {
         let _ = state.child.kill();
+        let _ = state.child.wait();
         Ok(())
     }
 }
