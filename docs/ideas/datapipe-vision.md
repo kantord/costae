@@ -77,6 +77,7 @@ each supervisor.
 
 - StreamValues as a managed stage (currently just process stdout parsed as JSON).
 - Backpressure between stages.
-- Per-stage restart/error policy (see `health-vision.md`).
+- Per-stage restart/error policy, failure taxonomy, zombie processes, and the `Outcome`
+  type for lifecycle operations (see `health-vision.md` and `lifecycle-status-vision.md`).
 - Fan-out: per-panel process supervisors instead of one global process pool
   (see `pipeline-vision.md` — fan-out).

@@ -205,8 +205,10 @@ everything else flows downward.
 ## Open questions
 
 - **Error propagation across levels.** `ReconcileErrors<K, E>` is flat. A deep failure loses
-  its path. A tree-aware error type would carry a key path: `ReconcileErrors<Path<K>, E>`.
-  See `health-vision.md` for the full error handling design.
+  its path. See `health-vision.md` for the error path design and `lifecycle-status-vision.md`
+  for the argument that errors are primarily log events — structural failure information is
+  carried by `ItemStatus.convergence` instead, which propagates naturally through
+  `health_snapshot()`.
 
 - **Tick propagation in deep trees.** The pipeline orchestrator drives timing by sending
   typed messages (including "reconcile now" ticks) to each stage independently, at different

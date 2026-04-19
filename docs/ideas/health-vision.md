@@ -282,10 +282,15 @@ can stand alone (a single component, not part of any pipeline).
 
 ### Rough trait sketch
 
+> For the full item status model — the two dimensions of `LifecyclePhase` and
+> `Convergence`, the failure taxonomy, zombie processes, rate limiting, and the `Outcome`
+> type — see `lifecycle-status-vision.md`. The `HealthStatus` type here maps to
+> `ItemStatus` from that document.
+
 ```rust
 trait Supervisor {
     type Item: Lifecycle;
-    type HealthStatus;
+    type HealthStatus;  // see lifecycle-status-vision.md for the recommended ItemStatus shape
 
     // Called by the driver (tick, event, ...) with new desired state.
     fn apply_desired(
@@ -357,6 +362,10 @@ pattern-matched.
 The `Supervisor` trait design (iteration 5 above) will determine which applies: if the
 supervisor exposes a `health_snapshot()` API that callers query, errors are likely
 inspected programmatically → Option A. If errors are only routed to a log stream → Option B.
+
+See also `lifecycle-status-vision.md` — that document argues errors are primarily log
+events, with structural information carried instead by `ItemStatus`. If that model is
+adopted, Option B becomes the natural default.
 
 ---
 
