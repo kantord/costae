@@ -84,8 +84,20 @@ fn spawn_stdin_thread(mut stdin: std::process::ChildStdin, event_rx: mpsc::Recei
     });
 }
 
+fn expand_tilde(path: &str) -> String {
+    if path.starts_with("~/") {
+        let home = std::env::var("HOME").unwrap_or_default();
+        format!("{}{}", home, &path[1..])
+    } else if path == "~" {
+        std::env::var("HOME").unwrap_or_default()
+    } else {
+        path.to_string()
+    }
+}
+
 pub(super) fn spawn_process(spec: ProcessSource, tx: &mpsc::Sender<StreamItem>) -> Result<ProcessState, SpawnError> {
-    let mut cmd = std::process::Command::new(&spec.identity.bin);
+    let bin = expand_tilde(&spec.identity.bin);
+    let mut cmd = std::process::Command::new(&bin);
     cmd.args(&spec.args);
     for (k, v) in &spec.env {
         cmd.env(k, v);
@@ -117,7 +129,7 @@ pub(super) fn spawn_process(spec: ProcessSource, tx: &mpsc::Sender<StreamItem>) 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            return Err(SpawnError::ProcessSpawnFailed { bin: spec.identity.bin.clone(), source: e });
+            return Err(SpawnError::ProcessSpawnFailed { bin, source: e });
         }
     };
 
@@ -297,6 +309,47 @@ mod tests {
         match result {
             Err(super::SpawnError::ProcessSpawnFailed { bin, .. }) => {
                 assert_eq!(bin, "/nonexistent/binary/that/cannot/exist");
+            }
+            Err(other) => panic!("expected ProcessSpawnFailed, got: {:?}", other),
+            Ok(_) => panic!("expected Err, got Ok"),
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // Cycle 6: spawn_process expands ~/  in bin to $HOME before spawning
+    // ---------------------------------------------------------------------------
+    #[test]
+    fn spawn_process_tilde_bin_is_expanded_to_home_dir() {
+        use std::sync::mpsc;
+        use super::spawn_process;
+
+        let home = std::env::var("HOME").expect("HOME must be set");
+
+        let (tx, _rx) = mpsc::channel();
+        let spec = ProcessSource {
+            identity: ProcessIdentity {
+                bin: "~/nonexistent-tilde-test-binary".to_string(),
+                key: "tilde-test".to_string(),
+            },
+            script: None,
+            args: vec![],
+            env: BTreeMap::new(),
+            current_dir: None,
+            props: None,
+        };
+
+        let result = spawn_process(spec, &tx);
+        assert!(result.is_err(), "spawn of nonexistent tilde binary must fail");
+        match result {
+            Err(super::SpawnError::ProcessSpawnFailed { bin, .. }) => {
+                assert!(
+                    !bin.starts_with('~'),
+                    "bin in error must not contain literal ~; got: {bin}"
+                );
+                assert!(
+                    bin.starts_with(&home),
+                    "bin in error must start with HOME ({home}); got: {bin}"
+                );
             }
             Err(other) => panic!("expected ProcessSpawnFailed, got: {:?}", other),
             Ok(_) => panic!("expected Err, got Ok"),
