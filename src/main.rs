@@ -255,7 +255,10 @@ impl WaylandTickState {
                     }
                 }
             }
-            Err(e) => tracing::error!(error = %e, "Wayland dispatch error"),
+            Err(_) => {
+                tracing::info!("Wayland compositor disconnected, exiting");
+                std::process::exit(0);
+            }
         }
 
         for (surface_id, new_size) in self.server.take_pending_configures() {
