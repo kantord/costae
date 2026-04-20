@@ -56,10 +56,35 @@ pub struct WaylandPanel {
     pub configured: bool,
     pub width: u32,
     pub height: u32,
+    pub anchor: Option<PanelAnchor>,
     pub raw_layout: Option<serde_json::Value>,
 }
 
 impl WaylandPanel {
+    /// Update the panel from a new spec. Resizes the layer surface if the fixed dimension changed,
+    /// which will cause the compositor to send a new configure before the next render.
+    pub fn update_spec(&mut self, data: &PanelSpecData) {
+        self.raw_layout = Some(data.content.clone());
+        // Only the fixed axis needs to be re-set; the span axis stays 0 (compositor-controlled).
+        let fixed_changed = match &self.anchor {
+            Some(PanelAnchor::Left) | Some(PanelAnchor::Right) => data.width != self.width,
+            Some(PanelAnchor::Top) | Some(PanelAnchor::Bottom) => data.height != self.height,
+            None => data.width != self.width || data.height != self.height,
+        };
+        if fixed_changed {
+            self.width = data.width;
+            self.height = data.height;
+            let (set_w, set_h) = match &self.anchor {
+                Some(PanelAnchor::Left) | Some(PanelAnchor::Right) => (data.width, 0),
+                Some(PanelAnchor::Top) | Some(PanelAnchor::Bottom) => (0, data.height),
+                None => (data.width, data.height),
+            };
+            self.layer_surface.set_size(set_w, set_h);
+            self.layer_surface.wl_surface().commit();
+            self.configured = false;
+        }
+    }
+
     /// Paint a BGRX frame onto this panel's layer surface.
     pub fn render(&mut self, bgrx: &[u8]) {
         let stride = self.width as i32 * 4;
@@ -72,7 +97,8 @@ impl WaylandPanel {
             tracing::error!("failed to create Wayland SHM buffer");
             return;
         };
-        canvas.copy_from_slice(bgrx);
+        // SlotPool rounds slot size up to 64 bytes; copy only the actual pixel data.
+        canvas[..bgrx.len()].copy_from_slice(bgrx);
         let wl_surf = self.layer_surface.wl_surface();
         if buffer.attach_to(wl_surf).is_err() {
             tracing::error!("failed to attach buffer to surface");
@@ -96,8 +122,9 @@ pub(crate) struct WaylandState {
     pub(crate) layer_shell: LayerShell,
     pub(crate) seat_state: SeatState,
     pub(crate) pending_events: Vec<WindowEvent>,
-    /// Surface IDs of layer surfaces that received a configure since last take.
-    pub(crate) pending_configures: Vec<ObjectId>,
+    /// (surface_id, new_size) pairs from configure events received since last take.
+    /// new_size of (0, 0) means "use your set_size value".
+    pub(crate) pending_configures: Vec<(ObjectId, (u32, u32))>,
 }
 
 // ---------------------------------------------------------------------------
@@ -148,7 +175,27 @@ impl WaylandDisplayServer {
             pending_configures: Vec::new(),
         };
 
-        Ok(Self { conn, event_queue, state })
+        let mut server = Self { conn, event_queue, state };
+        // Roundtrip so output geometry events are processed before the caller
+        // queries output dimensions.
+        server.event_queue.roundtrip(&mut server.state)
+            .map_err(|e| WaylandConnectError::Connect(e.to_string()))?;
+        Ok(server)
+    }
+
+    /// Returns the logical size of the first known output, falling back to the
+    /// current physical mode if xdg-output logical size is unavailable.
+    pub fn primary_output_size(&self) -> Option<(u32, u32)> {
+        let output = self.state.output_state.outputs().next()?;
+        let info = self.state.output_state.info(&output)?;
+        if let Some((w, h)) = info.logical_size {
+            if w > 0 && h > 0 {
+                return Some((w as u32, h as u32));
+            }
+        }
+        info.modes.iter()
+            .find(|m| m.current)
+            .map(|m| (m.dimensions.0 as u32, m.dimensions.1 as u32))
     }
 
     /// Create a Wayland layer-shell panel for the given spec.
@@ -169,7 +216,14 @@ impl WaylandDisplayServer {
             None,
         );
 
-        layer_surface.set_size(data.width, data.height);
+        // For panels that span the full perpendicular axis (composite anchor), set the spanned
+        // dimension to 0 so the compositor fills it. The actual dimension arrives in the configure.
+        let (set_w, set_h) = match data.anchor {
+            Some(PanelAnchor::Left) | Some(PanelAnchor::Right) => (data.width, 0),
+            Some(PanelAnchor::Top) | Some(PanelAnchor::Bottom) => (0, data.height),
+            None => (data.width, data.height),
+        };
+        layer_surface.set_size(set_w, set_h);
         if !anchor.is_empty() {
             layer_surface.set_anchor(anchor);
             let exclusive_zone = match data.anchor {
@@ -185,8 +239,9 @@ impl WaylandDisplayServer {
 
         let surface_id = layer_surface.wl_surface().id();
 
-        let pool_size = (data.width as usize) * (data.height as usize) * 4;
-        let pool = SlotPool::new(pool_size.max(4096), &self.state.shm)
+        // 3× frame size: supports one buffer in-flight with the compositor + one being prepared.
+        let pool_size = (data.width as usize) * (data.height as usize) * 4 * 3;
+        let pool = SlotPool::new(pool_size.max(4096 * 3), &self.state.shm)
             .map_err(|e| anyhow::anyhow!("SlotPool::new: {e}"))?;
 
         self.conn.flush().map_err(|e| anyhow::anyhow!("flush after create_panel: {e}"))?;
@@ -198,12 +253,14 @@ impl WaylandDisplayServer {
             configured: false,
             width: data.width,
             height: data.height,
+            anchor: data.anchor.clone(),
             raw_layout: Some(data.content.clone()),
         })
     }
 
-    /// Drain and return the IDs of surfaces that received a configure event since the last call.
-    pub fn take_pending_configures(&mut self) -> Vec<ObjectId> {
+    /// Drain and return (surface_id, new_size) pairs from configure events since the last call.
+    /// A new_size of (0, 0) means the compositor accepted the set_size value as-is.
+    pub fn take_pending_configures(&mut self) -> Vec<(ObjectId, (u32, u32))> {
         std::mem::take(&mut self.state.pending_configures)
     }
 
@@ -228,11 +285,13 @@ pub fn build_dispatch_result(
 }
 
 fn anchor_for_panel(anchor: Option<&PanelAnchor>) -> Anchor {
+    // Use composite anchors so the compositor stretches the panel across the full perpendicular
+    // axis (layer-shell spec: anchoring both opposite edges makes the surface span between them).
     match anchor {
-        Some(PanelAnchor::Left) => Anchor::LEFT,
-        Some(PanelAnchor::Right) => Anchor::RIGHT,
-        Some(PanelAnchor::Top) => Anchor::TOP,
-        Some(PanelAnchor::Bottom) => Anchor::BOTTOM,
+        Some(PanelAnchor::Left)   => Anchor::LEFT   | Anchor::TOP | Anchor::BOTTOM,
+        Some(PanelAnchor::Right)  => Anchor::RIGHT  | Anchor::TOP | Anchor::BOTTOM,
+        Some(PanelAnchor::Top)    => Anchor::TOP    | Anchor::LEFT | Anchor::RIGHT,
+        Some(PanelAnchor::Bottom) => Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT,
         None => Anchor::empty(),
     }
 }
@@ -358,11 +417,11 @@ impl LayerShellHandler for WaylandState {
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
         layer: &LayerSurface,
-        _configure: LayerSurfaceConfigure,
+        configure: LayerSurfaceConfigure,
         _serial: u32,
     ) {
         // ack_configure is called automatically by delegate_layer!
-        self.pending_configures.push(layer.wl_surface().id());
+        self.pending_configures.push((layer.wl_surface().id(), configure.new_size));
     }
 }
 

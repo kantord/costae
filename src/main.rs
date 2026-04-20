@@ -13,7 +13,6 @@ use costae::managed_set::{ManagedSet, Reconcile};
 use costae::layout::PanelSpecData;
 use costae::windowing::wayland::{WaylandDisplayServer, WaylandPanel};
 use costae::windowing::{DisplayServer, WindowEvent};
-use wayland_client::backend::ObjectId;
 
 type ModuleEventTxs = Arc<std::sync::Mutex<HashMap<String, mpsc::Sender<serde_json::Value>>>>;
 
@@ -27,8 +26,12 @@ fn log_lifecycle_errors<K: Debug, E: Debug>(errors: costae::managed_set::Reconci
     }
 }
 
-fn is_wayland_session() -> bool {
-    std::env::var("WAYLAND_DISPLAY").is_ok()
+fn detect_backend() -> &'static str {
+    if let Ok(b) = std::env::var("COSTAE_BACKEND") {
+        if b == "wayland" { return "wayland"; }
+        return "x11";
+    }
+    if std::env::var("WAYLAND_DISPLAY").is_ok() { "wayland" } else { "x11" }
 }
 
 fn apply_wayland_eval_result(
@@ -51,7 +54,7 @@ fn apply_wayland_eval_result(
     panels.retain(|id, _| desired_ids.contains(id));
     for data in specs {
         if let Some(panel) = panels.get_mut(&data.id) {
-            panel.raw_layout = Some(data.content.clone());
+            panel.update_spec(&data);
         } else {
             match server.create_panel(&data) {
                 Ok(panel) => { panels.insert(data.id.clone(), panel); }
@@ -86,11 +89,12 @@ impl WaylandTickState {
         stop: Arc<AtomicBool>,
         last_tick: Arc<std::sync::atomic::AtomicU64>,
     ) -> Self {
+        let (screen_width, screen_height) = server.primary_output_size().unwrap_or((1920, 1080));
         let jsx_ctx = serde_json::json!({
             "output": "wayland",
             "dpi": 96.0,
-            "screen_width": 1920,
-            "screen_height": 1080,
+            "screen_width": screen_width,
+            "screen_height": screen_height,
         });
         let mut state = Self {
             server,
@@ -191,20 +195,35 @@ impl WaylandTickState {
             Ok(events) => {
                 for event in events {
                     if matches!(event, WindowEvent::OutputsChanged) {
-                        tracing::info!("Wayland outputs changed");
+                        if let Some((w, h)) = self.server.primary_output_size() {
+                            self.jsx_ctx["screen_width"] = serde_json::json!(w);
+                            self.jsx_ctx["screen_height"] = serde_json::json!(h);
+                            tracing::info!(screen_width = w, screen_height = h, "Wayland output changed");
+                            if let Some(ref evaluator) = self.jsx_evaluator {
+                                match evaluator.eval(&self.stream_values) {
+                                    Ok(out) => {
+                                        apply_wayland_eval_result(&out, &self.handle, &mut self.panels, &mut self.server);
+                                        needs_render = true;
+                                    }
+                                    Err(e) => tracing::error!(error = %e, "JSX re-eval error on output change"),
+                                }
+                            }
+                        }
                     }
                 }
             }
             Err(e) => tracing::error!(error = %e, "Wayland dispatch error"),
         }
 
-        let configured_ids: Vec<ObjectId> = self.server.take_pending_configures();
-        for surface_id in configured_ids {
+        for (surface_id, new_size) in self.server.take_pending_configures() {
             for panel in self.panels.values_mut() {
-                if panel.surface_id == surface_id {
-                    panel.configured = true;
-                    needs_render = true;
-                }
+                if panel.surface_id != surface_id { continue; }
+                // If the compositor sent a nonzero size, use it for rendering so the buffer
+                // matches the allocated surface dimensions exactly.
+                if new_size.0 > 0 { panel.width = new_size.0; }
+                if new_size.1 > 0 { panel.height = new_size.1; }
+                panel.configured = true;
+                needs_render = true;
             }
         }
 
@@ -819,8 +838,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (item_tx, item_rx) = mpsc::channel::<((String, Option<String>), String)>();
     let stop = Arc::new(AtomicBool::new(false));
     let rx = TickReceivers { item_rx, bin_reload_rx, reload_rx };
+    let backend = detect_backend();
 
-    if is_wayland_session() {
+    if backend == "wayland" {
         tracing::info!("display backend: Wayland");
         let server = WaylandDisplayServer::connect()?;
         init_global_ctx();
@@ -850,6 +870,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // run() returned because stop was set (binary reload). TickState::drop handles cleanup.
     use std::os::unix::process::CommandExt;
     let mut cmd = std::process::Command::new(&exe_path);
+    cmd.env("COSTAE_BACKEND", backend);
     if let Ok(mtime) = std::fs::metadata(&exe_path).and_then(|m| m.modified()) {
         if let Ok(dur) = mtime.duration_since(std::time::UNIX_EPOCH) {
             cmd.env("COSTAE_EXE_MTIME_NS", dur.as_nanos().to_string());
