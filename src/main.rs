@@ -34,7 +34,7 @@ fn detect_backend() -> &'static str {
     if std::env::var("WAYLAND_DISPLAY").is_ok() { "wayland" } else { "x11" }
 }
 
-fn make_wayland_mod_init(specs: &[costae::PanelSpecData]) -> serde_json::Value {
+pub(crate) fn make_wayland_mod_init(specs: &[costae::PanelSpecData]) -> serde_json::Value {
     let spec = specs.iter()
         .find(|p| p.anchor == Some(costae::PanelAnchor::Left))
         .or_else(|| specs.first());
@@ -931,7 +931,60 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::stream_calls_to_specs;
+    use super::make_wayland_mod_init;
     use costae::data::data_loop::StreamSource;
+
+    fn left_spec(width: u32) -> costae::PanelSpecData {
+        costae::PanelSpecData {
+            id: "p".into(),
+            width,
+            height: 30,
+            x: 0,
+            y: 0,
+            outer_gap: 0,
+            above: false,
+            output: None,
+            anchor: Some(costae::PanelAnchor::Left),
+            content: serde_json::Value::Null,
+        }
+    }
+
+    /// Claim: output field must be "" (empty string), NOT "wayland" or any compositor name.
+    /// This test would fail with the buggy implementation that returned "wayland".
+    #[test]
+    fn make_wayland_mod_init_output_is_empty_string() {
+        let specs = vec![left_spec(250)];
+        let result = make_wayland_mod_init(&specs);
+        assert_eq!(
+            result["output"].as_str(),
+            Some(""),
+            "output must be empty string — if it is \"wayland\", fetch_workspaces filters all workspaces",
+        );
+    }
+
+    /// Claim: type field must be "init".
+    #[test]
+    fn make_wayland_mod_init_type_is_init() {
+        let specs = vec![left_spec(250)];
+        let result = make_wayland_mod_init(&specs);
+        assert_eq!(
+            result["type"].as_str(),
+            Some("init"),
+            "type must be \"init\"",
+        );
+    }
+
+    /// Claim: config.width must match the width of the left-anchored spec.
+    #[test]
+    fn make_wayland_mod_init_config_width_matches_left_anchor_spec() {
+        let specs = vec![left_spec(320)];
+        let result = make_wayland_mod_init(&specs);
+        assert_eq!(
+            result["config"]["width"].as_u64(),
+            Some(320),
+            "config.width must match the left-anchored spec width",
+        );
+    }
 
     #[test]
     fn stream_calls_to_specs_maps_calls_to_process_sources() {

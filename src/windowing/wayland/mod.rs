@@ -66,20 +66,10 @@ impl WaylandPanel {
     /// which will cause the compositor to send a new configure before the next render.
     pub fn update_spec(&mut self, data: &PanelSpecData) {
         self.raw_layout = Some(data.content.clone());
-        // Only the fixed axis needs to be re-set; the span axis stays 0 (compositor-controlled).
-        let fixed_changed = match &self.anchor {
-            Some(PanelAnchor::Left) | Some(PanelAnchor::Right) => data.width != self.width,
-            Some(PanelAnchor::Top) | Some(PanelAnchor::Bottom) => data.height != self.height,
-            None => data.width != self.width || data.height != self.height,
-        };
-        if fixed_changed {
+        if fixed_axis_changed(self.anchor.as_ref(), self.width, self.height, data.width, data.height) {
             self.width = data.width;
             self.height = data.height;
-            let (set_w, set_h) = match &self.anchor {
-                Some(PanelAnchor::Left) | Some(PanelAnchor::Right) => (data.width, 0),
-                Some(PanelAnchor::Top) | Some(PanelAnchor::Bottom) => (0, data.height),
-                None => (data.width, data.height),
-            };
+            let (set_w, set_h) = compute_set_size(self.anchor.as_ref(), data.width, data.height);
             self.layer_surface.set_size(set_w, set_h);
             self.layer_surface.wl_surface().commit();
             self.configured = false;
@@ -287,7 +277,7 @@ pub fn build_dispatch_result(
     Ok(pending)
 }
 
-fn anchor_for_panel(anchor: Option<&PanelAnchor>) -> Anchor {
+pub(crate) fn anchor_for_panel(anchor: Option<&PanelAnchor>) -> Anchor {
     // Use composite anchors so the compositor stretches the panel across the full perpendicular
     // axis (layer-shell spec: anchoring both opposite edges makes the surface span between them).
     match anchor {
@@ -526,3 +516,272 @@ delegate_seat!(WaylandState);
 delegate_pointer!(WaylandState);
 delegate_shm!(WaylandState);
 delegate_registry!(WaylandState);
+
+// ---------------------------------------------------------------------------
+// Helper functions used internally and by tests
+// ---------------------------------------------------------------------------
+
+/// Returns the `(width, height)` pair to pass to `set_size` for the compositor.
+/// For anchors where the compositor controls one axis (Left/Right → height;
+/// Top/Bottom → width), that axis must be 0 so the compositor can stretch it.
+pub(crate) fn compute_set_size(anchor: Option<&PanelAnchor>, width: u32, height: u32) -> (u32, u32) {
+    match anchor {
+        Some(PanelAnchor::Left) | Some(PanelAnchor::Right) => (width, 0),
+        Some(PanelAnchor::Top) | Some(PanelAnchor::Bottom) => (0, height),
+        None => (width, height),
+    }
+}
+
+/// Returns true if the fixed axis of the panel has changed dimensions, indicating
+/// that a compositor reconfigure is needed. The fixed axis is:
+/// - Left/Right: width
+/// - Top/Bottom: height
+/// - None: either axis
+pub(crate) fn fixed_axis_changed(
+    anchor: Option<&PanelAnchor>,
+    old_w: u32, old_h: u32,
+    new_w: u32, new_h: u32,
+) -> bool {
+    match anchor {
+        Some(PanelAnchor::Left) | Some(PanelAnchor::Right) => new_w != old_w,
+        Some(PanelAnchor::Top) | Some(PanelAnchor::Bottom) => new_h != old_h,
+        None => new_w != old_w || new_h != old_h,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::{anchor_for_panel, compute_set_size, fixed_axis_changed};
+    use crate::layout::PanelAnchor;
+    use smithay_client_toolkit::shell::wlr_layer::Anchor;
+
+    // ---------------------------------------------------------------------------
+    // compute_set_size — the compositor-controlled axis must be 0
+    // ---------------------------------------------------------------------------
+
+    // Left/Right panels: width is fixed, height is compositor-controlled (must be 0)
+    #[test]
+    fn compute_set_size_left_passes_width_zeroes_height() {
+        assert_eq!(
+            compute_set_size(Some(&PanelAnchor::Left), 40, 1080),
+            (40, 0),
+        );
+    }
+
+    #[test]
+    fn compute_set_size_right_passes_width_zeroes_height() {
+        assert_eq!(
+            compute_set_size(Some(&PanelAnchor::Right), 40, 1080),
+            (40, 0),
+        );
+    }
+
+    // Top/Bottom panels: height is fixed, width is compositor-controlled (must be 0)
+    #[test]
+    fn compute_set_size_top_passes_height_zeroes_width() {
+        assert_eq!(
+            compute_set_size(Some(&PanelAnchor::Top), 1920, 30),
+            (0, 30),
+        );
+    }
+
+    #[test]
+    fn compute_set_size_bottom_passes_height_zeroes_width() {
+        assert_eq!(
+            compute_set_size(Some(&PanelAnchor::Bottom), 1920, 30),
+            (0, 30),
+        );
+    }
+
+    // None anchor: both axes are explicit
+    #[test]
+    fn compute_set_size_none_passes_both() {
+        assert_eq!(
+            compute_set_size(None, 800, 600),
+            (800, 600),
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // fixed_axis_changed — only the fixed dimension should trigger reconfigure
+    // ---------------------------------------------------------------------------
+
+    // Left/Right: only width change triggers reconfigure
+    #[test]
+    fn fixed_axis_changed_left_width_change_triggers() {
+        assert!(fixed_axis_changed(Some(&PanelAnchor::Left), 40, 1080, 50, 1080));
+    }
+
+    #[test]
+    fn fixed_axis_changed_left_height_only_does_not_trigger() {
+        // Height is compositor-controlled for Left panels; a height change alone must NOT
+        // trigger reconfigure (the compositor manages it).
+        assert!(!fixed_axis_changed(Some(&PanelAnchor::Left), 40, 1080, 40, 900));
+    }
+
+    #[test]
+    fn fixed_axis_changed_right_width_change_triggers() {
+        assert!(fixed_axis_changed(Some(&PanelAnchor::Right), 40, 1080, 50, 1080));
+    }
+
+    #[test]
+    fn fixed_axis_changed_right_height_only_does_not_trigger() {
+        assert!(!fixed_axis_changed(Some(&PanelAnchor::Right), 40, 1080, 40, 900));
+    }
+
+    // Top/Bottom: only height change triggers reconfigure
+    #[test]
+    fn fixed_axis_changed_top_height_change_triggers() {
+        assert!(fixed_axis_changed(Some(&PanelAnchor::Top), 1920, 30, 1920, 40));
+    }
+
+    #[test]
+    fn fixed_axis_changed_top_width_only_does_not_trigger() {
+        assert!(!fixed_axis_changed(Some(&PanelAnchor::Top), 1920, 30, 1600, 30));
+    }
+
+    #[test]
+    fn fixed_axis_changed_bottom_height_change_triggers() {
+        assert!(fixed_axis_changed(Some(&PanelAnchor::Bottom), 1920, 30, 1920, 40));
+    }
+
+    #[test]
+    fn fixed_axis_changed_bottom_width_only_does_not_trigger() {
+        assert!(!fixed_axis_changed(Some(&PanelAnchor::Bottom), 1920, 30, 1600, 30));
+    }
+
+    // None: either change triggers reconfigure
+    #[test]
+    fn fixed_axis_changed_none_width_change_triggers() {
+        assert!(fixed_axis_changed(None, 800, 600, 900, 600));
+    }
+
+    #[test]
+    fn fixed_axis_changed_none_height_change_triggers() {
+        assert!(fixed_axis_changed(None, 800, 600, 800, 700));
+    }
+
+    #[test]
+    fn fixed_axis_changed_none_no_change_does_not_trigger() {
+        assert!(!fixed_axis_changed(None, 800, 600, 800, 600));
+    }
+
+    // --- None ---
+
+    #[test]
+    fn anchor_none_is_empty() {
+        assert_eq!(anchor_for_panel(None), Anchor::empty());
+    }
+
+    // --- Left: must include LEFT, TOP, and BOTTOM ---
+
+    #[test]
+    fn anchor_left_contains_left() {
+        assert!(anchor_for_panel(Some(&PanelAnchor::Left)).contains(Anchor::LEFT));
+    }
+
+    #[test]
+    fn anchor_left_contains_top() {
+        // Regression: single-anchor-only (LEFT only) would fail this.
+        assert!(anchor_for_panel(Some(&PanelAnchor::Left)).contains(Anchor::TOP));
+    }
+
+    #[test]
+    fn anchor_left_contains_bottom() {
+        // Regression: single-anchor-only (LEFT only) would fail this.
+        assert!(anchor_for_panel(Some(&PanelAnchor::Left)).contains(Anchor::BOTTOM));
+    }
+
+    #[test]
+    fn anchor_left_exact() {
+        assert_eq!(
+            anchor_for_panel(Some(&PanelAnchor::Left)),
+            Anchor::LEFT | Anchor::TOP | Anchor::BOTTOM,
+        );
+    }
+
+    // --- Right: must include RIGHT, TOP, and BOTTOM ---
+
+    #[test]
+    fn anchor_right_contains_right() {
+        assert!(anchor_for_panel(Some(&PanelAnchor::Right)).contains(Anchor::RIGHT));
+    }
+
+    #[test]
+    fn anchor_right_contains_top() {
+        // Regression: single-anchor-only (RIGHT only) would fail this.
+        assert!(anchor_for_panel(Some(&PanelAnchor::Right)).contains(Anchor::TOP));
+    }
+
+    #[test]
+    fn anchor_right_contains_bottom() {
+        // Regression: single-anchor-only (RIGHT only) would fail this.
+        assert!(anchor_for_panel(Some(&PanelAnchor::Right)).contains(Anchor::BOTTOM));
+    }
+
+    #[test]
+    fn anchor_right_exact() {
+        assert_eq!(
+            anchor_for_panel(Some(&PanelAnchor::Right)),
+            Anchor::RIGHT | Anchor::TOP | Anchor::BOTTOM,
+        );
+    }
+
+    // --- Top: must include TOP, LEFT, and RIGHT ---
+
+    #[test]
+    fn anchor_top_contains_top() {
+        assert!(anchor_for_panel(Some(&PanelAnchor::Top)).contains(Anchor::TOP));
+    }
+
+    #[test]
+    fn anchor_top_contains_left() {
+        // Regression: single-anchor-only (TOP only) would fail this.
+        assert!(anchor_for_panel(Some(&PanelAnchor::Top)).contains(Anchor::LEFT));
+    }
+
+    #[test]
+    fn anchor_top_contains_right() {
+        // Regression: single-anchor-only (TOP only) would fail this.
+        assert!(anchor_for_panel(Some(&PanelAnchor::Top)).contains(Anchor::RIGHT));
+    }
+
+    #[test]
+    fn anchor_top_exact() {
+        assert_eq!(
+            anchor_for_panel(Some(&PanelAnchor::Top)),
+            Anchor::TOP | Anchor::LEFT | Anchor::RIGHT,
+        );
+    }
+
+    // --- Bottom: must include BOTTOM, LEFT, and RIGHT ---
+
+    #[test]
+    fn anchor_bottom_contains_bottom() {
+        assert!(anchor_for_panel(Some(&PanelAnchor::Bottom)).contains(Anchor::BOTTOM));
+    }
+
+    #[test]
+    fn anchor_bottom_contains_left() {
+        // Regression: single-anchor-only (BOTTOM only) would fail this.
+        assert!(anchor_for_panel(Some(&PanelAnchor::Bottom)).contains(Anchor::LEFT));
+    }
+
+    #[test]
+    fn anchor_bottom_contains_right() {
+        // Regression: single-anchor-only (BOTTOM only) would fail this.
+        assert!(anchor_for_panel(Some(&PanelAnchor::Bottom)).contains(Anchor::RIGHT));
+    }
+
+    #[test]
+    fn anchor_bottom_exact() {
+        assert_eq!(
+            anchor_for_panel(Some(&PanelAnchor::Bottom)),
+            Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT,
+        );
+    }
+}
