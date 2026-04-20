@@ -15,7 +15,7 @@ pub fn fetch_workspaces(socket: &str, output: &str) -> std::io::Result<Vec<Works
     let arr: Vec<serde_json::Value> = serde_json::from_slice(&payload).unwrap_or_default();
     Ok(arr
         .iter()
-        .filter(|w| w["output"].as_str().unwrap_or("") == output)
+        .filter(|w| output.is_empty() || w["output"].as_str().unwrap_or("") == output)
         .map(|w| Workspace {
             name: w["name"].as_str().unwrap_or("?").to_string(),
             focused: w["focused"].as_bool().unwrap_or(false),

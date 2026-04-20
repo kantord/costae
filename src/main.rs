@@ -34,6 +34,21 @@ fn detect_backend() -> &'static str {
     if std::env::var("WAYLAND_DISPLAY").is_ok() { "wayland" } else { "x11" }
 }
 
+fn make_wayland_mod_init(specs: &[costae::PanelSpecData]) -> serde_json::Value {
+    let spec = specs.iter()
+        .find(|p| p.anchor == Some(costae::PanelAnchor::Left))
+        .or_else(|| specs.first());
+    let (bar_w, og) = spec
+        .map(|p| (p.width, p.outer_gap))
+        .unwrap_or((250, 0));
+    serde_json::json!({
+        "type": "init",
+        "config": {"width": bar_w, "outer_gap": og},
+        "output": "",
+        "dpi": 96.0,
+    })
+}
+
 fn apply_wayland_eval_result(
     out: &costae::jsx::EvalOutput,
     handle: &DataLoopHandle,
@@ -47,7 +62,17 @@ fn apply_wayland_eval_result(
             return false;
         }
     };
-    let stream_specs = stream_calls_to_specs(&out.stream_calls);
+    let mod_init = make_wayland_mod_init(&specs);
+    let stream_specs = stream_calls_to_specs(&out.stream_calls)
+        .into_iter()
+        .map(|source| match source {
+            StreamSource::Process(mut p) => {
+                p.props = Some(mod_init.clone());
+                StreamSource::Process(p)
+            }
+            other => other,
+        })
+        .collect::<Vec<_>>();
     handle.set_desired(stream_specs);
 
     let desired_ids: std::collections::HashSet<String> = specs.iter().map(|s| s.id.clone()).collect();
@@ -76,6 +101,7 @@ struct WaylandTickState {
     bin_reload_rx: mpsc::Receiver<()>,
     reload_rx: mpsc::Receiver<()>,
     layout_jsx_path: std::path::PathBuf,
+    module_event_txs: ModuleEventTxs,
     stop: Arc<AtomicBool>,
     last_tick: Arc<std::sync::atomic::AtomicU64>,
 }
@@ -86,6 +112,7 @@ impl WaylandTickState {
         handle: DataLoopHandle,
         rx: TickReceivers,
         layout_jsx_path: std::path::PathBuf,
+        module_event_txs: ModuleEventTxs,
         stop: Arc<AtomicBool>,
         last_tick: Arc<std::sync::atomic::AtomicU64>,
     ) -> Self {
@@ -107,6 +134,7 @@ impl WaylandTickState {
             bin_reload_rx: rx.bin_reload_rx,
             reload_rx: rx.reload_rx,
             layout_jsx_path,
+            module_event_txs,
             stop,
             last_tick,
         };
@@ -194,19 +222,34 @@ impl WaylandTickState {
         match self.server.dispatch() {
             Ok(events) => {
                 for event in events {
-                    if matches!(event, WindowEvent::OutputsChanged) {
-                        if let Some((w, h)) = self.server.primary_output_size() {
-                            self.jsx_ctx["screen_width"] = serde_json::json!(w);
-                            self.jsx_ctx["screen_height"] = serde_json::json!(h);
-                            tracing::info!(screen_width = w, screen_height = h, "Wayland output changed");
-                            if let Some(ref evaluator) = self.jsx_evaluator {
-                                match evaluator.eval(&self.stream_values) {
-                                    Ok(out) => {
-                                        apply_wayland_eval_result(&out, &self.handle, &mut self.panels, &mut self.server);
-                                        needs_render = true;
+                    match event {
+                        WindowEvent::OutputsChanged => {
+                            if let Some((w, h)) = self.server.primary_output_size() {
+                                self.jsx_ctx["screen_width"] = serde_json::json!(w);
+                                self.jsx_ctx["screen_height"] = serde_json::json!(h);
+                                tracing::info!(screen_width = w, screen_height = h, "Wayland output changed");
+                                if let Some(ref evaluator) = self.jsx_evaluator {
+                                    match evaluator.eval(&self.stream_values) {
+                                        Ok(out) => {
+                                            apply_wayland_eval_result(&out, &self.handle, &mut self.panels, &mut self.server);
+                                            needs_render = true;
+                                        }
+                                        Err(e) => tracing::error!(error = %e, "JSX re-eval error on output change"),
                                     }
-                                    Err(e) => tracing::error!(error = %e, "JSX re-eval error on output change"),
                                 }
+                            }
+                        }
+                        WindowEvent::Click { panel_id, x_logical, y_logical, .. } => {
+                            // panel_id is surface_id.to_string(); find matching panel by surface_id
+                            if let Some(panel) = self.panels.values()
+                                .find(|p| p.surface_id.to_string() == panel_id)
+                            {
+                                let txs = self.module_event_txs.lock().unwrap();
+                                do_hit_test(
+                                    &panel.raw_layout, &txs,
+                                    panel.width, panel.height, 1.0,
+                                    x_logical, y_logical,
+                                );
                             }
                         }
                     }
@@ -846,6 +889,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         init_global_ctx();
         let mut wayland_state = WaylandTickState::new(
             server, handle, rx, layout_jsx_path,
+            Arc::clone(&module_event_txs),
             Arc::clone(&stop), Arc::clone(&last_tick),
         );
         data_loop.run(

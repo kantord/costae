@@ -6,13 +6,14 @@ use smithay_client_toolkit::{
     delegate_compositor,
     delegate_layer,
     delegate_output,
+    delegate_pointer,
     delegate_registry,
     delegate_seat,
     delegate_shm,
     output::{OutputHandler, OutputState},
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
-    seat::{Capability, SeatHandler, SeatState},
+    seat::{Capability, SeatHandler, SeatState, pointer::{PointerEvent, PointerEventKind, PointerHandler}},
     shell::{
         WaylandSurface,
         wlr_layer::{Anchor, Layer, LayerShell, LayerShellHandler, LayerSurface, LayerSurfaceConfigure},
@@ -22,7 +23,7 @@ use smithay_client_toolkit::{
 use wayland_client::{
     backend::ObjectId,
     globals::registry_queue_init,
-    protocol::{wl_output, wl_seat, wl_shm, wl_surface},
+    protocol::{wl_output, wl_pointer, wl_seat, wl_shm, wl_surface},
     Connection, EventQueue, Proxy, QueueHandle,
 };
 
@@ -121,6 +122,7 @@ pub(crate) struct WaylandState {
     pub(crate) shm: Shm,
     pub(crate) layer_shell: LayerShell,
     pub(crate) seat_state: SeatState,
+    pub(crate) pointer: Option<wl_pointer::WlPointer>,
     pub(crate) pending_events: Vec<WindowEvent>,
     /// (surface_id, new_size) pairs from configure events received since last take.
     /// new_size of (0, 0) means "use your set_size value".
@@ -171,6 +173,7 @@ impl WaylandDisplayServer {
             shm,
             layer_shell,
             seat_state,
+            pointer: None,
             pending_events: Vec::new(),
             pending_configures: Vec::new(),
         };
@@ -441,10 +444,16 @@ impl SeatHandler for WaylandState {
     fn new_capability(
         &mut self,
         _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        _seat: wl_seat::WlSeat,
-        _capability: Capability,
+        qh: &QueueHandle<Self>,
+        seat: wl_seat::WlSeat,
+        capability: Capability,
     ) {
+        if capability == Capability::Pointer && self.pointer.is_none() {
+            match self.seat_state.get_pointer(qh, &seat) {
+                Ok(ptr) => { self.pointer = Some(ptr); }
+                Err(e) => tracing::warn!(error = %e, "failed to bind pointer"),
+            }
+        }
     }
 
     fn remove_capability(
@@ -452,8 +461,13 @@ impl SeatHandler for WaylandState {
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
         _seat: wl_seat::WlSeat,
-        _capability: Capability,
+        capability: Capability,
     ) {
+        if capability == Capability::Pointer {
+            if let Some(ptr) = self.pointer.take() {
+                ptr.release();
+            }
+        }
     }
 
     fn remove_seat(
@@ -462,6 +476,32 @@ impl SeatHandler for WaylandState {
         _qh: &QueueHandle<Self>,
         _seat: wl_seat::WlSeat,
     ) {
+    }
+}
+
+impl PointerHandler for WaylandState {
+    fn pointer_frame(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _pointer: &wl_pointer::WlPointer,
+        events: &[PointerEvent],
+    ) {
+        for event in events {
+            let PointerEventKind::Press { button, .. } = event.kind else { continue; };
+            let mouse_button = match button {
+                0x110 => super::MouseButton::Left,
+                0x111 => super::MouseButton::Right,
+                0x112 => super::MouseButton::Middle,
+                other => super::MouseButton::Other(other),
+            };
+            self.pending_events.push(WindowEvent::Click {
+                panel_id: event.surface.id().to_string(),
+                x_logical: event.position.0 as f32,
+                y_logical: event.position.1 as f32,
+                button: mouse_button,
+            });
+        }
     }
 }
 
@@ -483,5 +523,6 @@ delegate_compositor!(WaylandState);
 delegate_output!(WaylandState);
 delegate_layer!(WaylandState);
 delegate_seat!(WaylandState);
+delegate_pointer!(WaylandState);
 delegate_shm!(WaylandState);
 delegate_registry!(WaylandState);
