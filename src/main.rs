@@ -11,33 +11,9 @@ use costae::x11::click::do_hit_test;
 use costae::x11::panel::{sample_root_bg, i3_dpi, PanelContext};
 use costae::managed_set::{ManagedSet, Reconcile};
 use costae::layout::PanelSpecData;
-use costae::windowing::wayland::{WaylandDisplayServer, WaylandPanel};
+use costae::windowing::wayland::{WaylandDisplayServer, WaylandPanelSpec};
 use costae::windowing::{DisplayServer, WindowEvent};
 
-struct WaylandPanelSpec(costae::layout::PanelSpecData);
-
-impl costae::managed_set::Lifecycle for WaylandPanelSpec {
-    type Key = String;
-    type State = WaylandPanel;
-    type Context = ();
-    type Output = WaylandDisplayServer;
-    type Error = anyhow::Error;
-
-    fn key(&self) -> String { self.0.id.clone() }
-
-    fn enter(self, _ctx: &(), server: &mut WaylandDisplayServer) -> Result<WaylandPanel, anyhow::Error> {
-        server.create_panel(&self.0)
-    }
-
-    fn reconcile_self(self, state: &mut WaylandPanel, _ctx: &(), _server: &mut WaylandDisplayServer) -> Result<(), anyhow::Error> {
-        state.update_spec(&self.0);
-        Ok(())
-    }
-
-    fn exit(_state: WaylandPanel, _ctx: &()) -> Result<(), anyhow::Error> {
-        Ok(()) // WaylandPanel drops LayerSurface which cleans up automatically
-    }
-}
 
 type ModuleEventTxs = Arc<std::sync::Mutex<HashMap<String, mpsc::Sender<serde_json::Value>>>>;
 
@@ -99,7 +75,7 @@ fn apply_wayland_eval_result(
         })
         .collect::<Vec<_>>();
     handle.set_desired(stream_specs);
-    panels.reconcile(specs.into_iter().map(WaylandPanelSpec), &(), server);
+    log_lifecycle_errors(panels.reconcile(specs.into_iter().map(WaylandPanelSpec), &(), server));
     true
 }
 
@@ -228,7 +204,7 @@ impl WaylandTickState {
             self.handle.set_desired(vec![]);
             self.stream_values.clear();
             self.jsx_evaluator = None;
-            self.panels.reconcile(vec![], &(), &mut self.server);
+            log_lifecycle_errors(self.panels.reconcile(vec![], &(), &mut self.server));
             self.initial_load();
         }
 
