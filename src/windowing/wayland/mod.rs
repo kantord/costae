@@ -27,6 +27,7 @@ use wayland_client::{
     Connection, EventQueue, Proxy, QueueHandle,
 };
 
+use crate::display_manager::DisplayManager;
 use crate::layout::{PanelAnchor, PanelSpecData};
 use crate::managed_set::Lifecycle;
 use super::{DispatchError, DisplayServer, WindowEvent};
@@ -343,6 +344,39 @@ impl DisplayServer for WaylandDisplayServer {
 }
 
 // ---------------------------------------------------------------------------
+// DisplayManager impl
+// ---------------------------------------------------------------------------
+
+impl DisplayManager for WaylandDisplayServer {
+    type Panel = WaylandPanel;
+    type Error = anyhow::Error;
+
+    fn create_window(&mut self, spec: &PanelSpecData) -> Result<WaylandPanel, anyhow::Error> {
+        self.create_panel(spec)
+    }
+
+    fn update_position(&mut self, _panel: &mut WaylandPanel, _spec: &PanelSpecData) -> Result<(), anyhow::Error> {
+        // No-op: Wayland position is compositor-managed via anchor
+        Ok(())
+    }
+
+    fn update_dimensions(&mut self, panel: &mut WaylandPanel, spec: &PanelSpecData) -> Result<(), anyhow::Error> {
+        panel.update_spec(spec);
+        Ok(())
+    }
+
+    fn update_image(&mut self, panel: &mut WaylandPanel, bgrx: &[u8]) -> Result<(), anyhow::Error> {
+        panel.render(bgrx);
+        Ok(())
+    }
+
+    fn delete_window(&mut self, _panel: WaylandPanel) -> Result<(), anyhow::Error> {
+        // Panel is dropped here by ownership transfer; cleanup is implicit
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // sctk handler implementations
 // ---------------------------------------------------------------------------
 
@@ -585,9 +619,108 @@ pub(crate) fn fixed_axis_changed(
 
 #[cfg(test)]
 mod tests {
-    use super::{anchor_for_panel, compute_set_size, fixed_axis_changed};
-    use crate::layout::PanelAnchor;
+    use super::{anchor_for_panel, compute_set_size, fixed_axis_changed, WaylandDisplayServer};
+    use crate::display_manager::DisplayManager;
+    use crate::layout::{PanelAnchor, PanelSpecData};
     use smithay_client_toolkit::shell::wlr_layer::Anchor;
+
+    // Minimal PanelSpecData for testing
+    fn minimal_spec() -> PanelSpecData {
+        PanelSpecData {
+            id: "test-panel".to_string(),
+            anchor: None,
+            width: 100,
+            height: 30,
+            x: 0,
+            y: 0,
+            outer_gap: 0,
+            output: None,
+            above: false,
+            content: serde_json::Value::Null,
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // DisplayManager trait impl for WaylandDisplayServer
+    // ---------------------------------------------------------------------------
+
+    // update_position is a no-op — Wayland position is compositor-managed via anchor
+    #[test]
+    fn display_manager_update_position_is_noop() {
+        let mut server = match WaylandDisplayServer::connect() {
+            Ok(s) => s,
+            Err(_) => {
+                println!("SKIP: no Wayland compositor available");
+                return;
+            }
+        };
+        let spec = minimal_spec();
+        let mut panel = DisplayManager::create_window(&mut server, &spec).unwrap();
+        let new_spec = PanelSpecData {
+            x: 50,
+            y: 50,
+            ..minimal_spec()
+        };
+        let result = DisplayManager::update_position(&mut server, &mut panel, &new_spec);
+        assert!(result.is_ok());
+    }
+
+    // update_dimensions calls panel.update_spec(spec) which updates width/height for the fixed axis
+    #[test]
+    fn display_manager_update_dimensions_updates_panel() {
+        let mut server = match WaylandDisplayServer::connect() {
+            Ok(s) => s,
+            Err(_) => {
+                println!("SKIP: no Wayland compositor available");
+                return;
+            }
+        };
+        let spec = minimal_spec();
+        let mut panel = DisplayManager::create_window(&mut server, &spec).unwrap();
+        let new_spec = PanelSpecData {
+            width: 200,
+            height: 60,
+            ..minimal_spec()
+        };
+        let result = DisplayManager::update_dimensions(&mut server, &mut panel, &new_spec);
+        assert!(result.is_ok());
+        assert_eq!(panel.width, 200);
+        assert_eq!(panel.height, 60);
+    }
+
+    // update_image calls panel.render(bgrx) and returns Ok(())
+    #[test]
+    fn display_manager_update_image_returns_ok() {
+        let mut server = match WaylandDisplayServer::connect() {
+            Ok(s) => s,
+            Err(_) => {
+                println!("SKIP: no Wayland compositor available");
+                return;
+            }
+        };
+        let spec = minimal_spec();
+        let mut panel = DisplayManager::create_window(&mut server, &spec).unwrap();
+        // Provide a correctly-sized BGRX buffer (width * height * 4 bytes)
+        let bgrx = vec![0u8; (spec.width * spec.height * 4) as usize];
+        let result = DisplayManager::update_image(&mut server, &mut panel, &bgrx);
+        assert!(result.is_ok());
+    }
+
+    // delete_window drops the panel without panicking
+    #[test]
+    fn display_manager_delete_window_returns_ok() {
+        let mut server = match WaylandDisplayServer::connect() {
+            Ok(s) => s,
+            Err(_) => {
+                println!("SKIP: no Wayland compositor available");
+                return;
+            }
+        };
+        let spec = minimal_spec();
+        let panel = DisplayManager::create_window(&mut server, &spec).unwrap();
+        let result = DisplayManager::delete_window(&mut server, panel);
+        assert!(result.is_ok());
+    }
 
     // ---------------------------------------------------------------------------
     // compute_set_size — the compositor-controlled axis must be 0
