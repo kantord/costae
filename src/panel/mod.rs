@@ -48,9 +48,9 @@ impl Lifecycle for PanelSpec {
         }
     }
 
-    fn enter(self, ctx: &Self::Context, output: &mut ()) -> Result<Self::State, Self::Error> {
+    fn enter(self, ctx: &mut Self::Context, output: &mut ()) -> Result<Self::State, Self::Error> {
         match (self, ctx) {
-            (PanelSpec::X11(data), PanelContext::X11(x11_ctx)) => {
+            (PanelSpec::X11(data), PanelContext::X11(ref mut x11_ctx)) => {
                 <PanelSpecData as Lifecycle>::enter(data, x11_ctx, output)
                     .map(PanelState::X11)
             }
@@ -61,9 +61,9 @@ impl Lifecycle for PanelSpec {
         }
     }
 
-    fn reconcile_self(self, state: &mut Self::State, ctx: &Self::Context, output: &mut ()) -> Result<(), Self::Error> {
+    fn reconcile_self(self, state: &mut Self::State, ctx: &mut Self::Context, output: &mut ()) -> Result<(), Self::Error> {
         match (self, state, ctx) {
-            (PanelSpec::X11(data), PanelState::X11(panel), PanelContext::X11(x11_ctx)) => {
+            (PanelSpec::X11(data), PanelState::X11(panel), PanelContext::X11(ref mut x11_ctx)) => {
                 <PanelSpecData as Lifecycle>::reconcile_self(data, panel, x11_ctx, output)
             }
             (PanelSpec::Wayland(_), PanelState::Wayland(_), PanelContext::Wayland(_)) => Ok(()),
@@ -71,9 +71,9 @@ impl Lifecycle for PanelSpec {
         }
     }
 
-    fn exit(state: Self::State, ctx: &Self::Context) -> Result<(), Self::Error> {
+    fn exit(state: Self::State, ctx: &mut Self::Context) -> Result<(), Self::Error> {
         match (state, ctx) {
-            (PanelState::X11(panel), PanelContext::X11(x11_ctx)) => {
+            (PanelState::X11(panel), PanelContext::X11(ref mut x11_ctx)) => {
                 <PanelSpecData as Lifecycle>::exit(panel, x11_ctx)
             }
             (PanelState::Wayland(_), PanelContext::Wayland(_)) => Ok(()),

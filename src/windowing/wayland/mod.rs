@@ -46,16 +46,16 @@ impl Lifecycle for WaylandPanelSpec {
 
     fn key(&self) -> String { self.0.id.clone() }
 
-    fn enter(self, _ctx: &(), server: &mut WaylandDisplayServer) -> Result<WaylandPanel, anyhow::Error> {
+    fn enter(self, _ctx: &mut (), server: &mut WaylandDisplayServer) -> Result<WaylandPanel, anyhow::Error> {
         server.create_panel(&self.0)
     }
 
-    fn reconcile_self(self, state: &mut WaylandPanel, _ctx: &(), _server: &mut WaylandDisplayServer) -> Result<(), anyhow::Error> {
+    fn reconcile_self(self, state: &mut WaylandPanel, _ctx: &mut (), _server: &mut WaylandDisplayServer) -> Result<(), anyhow::Error> {
         state.update_spec(&self.0);
         Ok(())
     }
 
-    fn exit(_state: WaylandPanel, _ctx: &()) -> Result<(), anyhow::Error> {
+    fn exit(_state: WaylandPanel, _ctx: &mut ()) -> Result<(), anyhow::Error> {
         Ok(())
     }
 }

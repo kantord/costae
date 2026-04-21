@@ -75,7 +75,7 @@ fn apply_wayland_eval_result(
         })
         .collect::<Vec<_>>();
     handle.set_desired(stream_specs);
-    log_lifecycle_errors(panels.reconcile(specs.into_iter().map(WaylandPanelSpec), &(), server));
+    log_lifecycle_errors(panels.reconcile(specs.into_iter().map(WaylandPanelSpec), &mut (), server));
     true
 }
 
@@ -204,7 +204,7 @@ impl WaylandTickState {
             self.handle.set_desired(vec![]);
             self.stream_values.clear();
             self.jsx_evaluator = None;
-            log_lifecycle_errors(self.panels.reconcile(vec![], &(), &mut self.server));
+            log_lifecycle_errors(self.panels.reconcile(vec![], &mut (), &mut self.server));
             self.initial_load();
         }
 
@@ -328,7 +328,7 @@ fn apply_eval_result(
     out: &costae::jsx::EvalOutput,
     handle: &DataLoopHandle,
     panel_set: &mut ManagedSet<PanelSpecData>,
-    panel_ctx: &PanelContext,
+    panel_ctx: &mut PanelContext,
     mod_init_fn: &dyn Fn(&[costae::PanelSpecData]) -> serde_json::Value,
 ) -> bool {
     let specs = match costae::parse_root_node(&out.layout) {
@@ -362,7 +362,7 @@ fn apply_eval_result(
     let combined: Vec<StreamSource> = stream_specs.into_iter().chain(module_specs).collect();
     handle.set_desired(combined);
 
-    let panel_errors = panel_set.reconcile(specs, panel_ctx, &mut ());
+    let panel_errors = panel_set.reconcile(specs, &mut *panel_ctx, &mut ());
     log_lifecycle_errors(panel_errors);
     true
 }
@@ -428,7 +428,7 @@ fn handle_layout_reload(
     layout_jsx_path: &std::path::Path,
     jsx_ctx: &serde_json::Value,
     panel_set: &mut ManagedSet<PanelSpecData>,
-    panel_ctx: &PanelContext,
+    panel_ctx: &mut PanelContext,
     mod_init_fn: &dyn Fn(&[costae::PanelSpecData]) -> serde_json::Value,
 ) -> bool {
     if reload_rx.try_recv().is_err() {
@@ -727,7 +727,7 @@ impl TickState {
             Ok(out) => {
                 tracing::debug!(elapsed_ms = t.elapsed().as_millis(), "jsx eval");
                 let make_mod_init = self.make_mod_init_fn();
-                apply_eval_result(&out, &self.handle, &mut self.panel_set, &self.panel_ctx, &make_mod_init);
+                apply_eval_result(&out, &self.handle, &mut self.panel_set, &mut self.panel_ctx, &make_mod_init);
                 self.jsx_evaluator = Some(evaluator);
             }
             Err(e) => tracing::error!(error = %e, "JSX eval error"),
@@ -761,7 +761,7 @@ impl TickState {
                 match evaluator.eval(&self.stream_values) {
                     Ok(out) => {
                         tracing::debug!(elapsed_us = t.elapsed().as_micros(), "jsx re-eval");
-                        if apply_eval_result(&out, &self.handle, &mut self.panel_set, &self.panel_ctx, &make_mod_init) {
+                        if apply_eval_result(&out, &self.handle, &mut self.panel_set, &mut self.panel_ctx, &make_mod_init) {
                             needs_render = true;
                         }
                     }
@@ -779,7 +779,7 @@ impl TickState {
         if handle_layout_reload(
             &self.reload_rx, &self.handle, &mut self.stream_values,
             &mut self.jsx_evaluator, &self.layout_jsx_path, &self.jsx_ctx,
-            &mut self.panel_set, &self.panel_ctx,
+            &mut self.panel_set, &mut self.panel_ctx,
             &make_mod_init,
         ) {
             needs_render = true;
@@ -818,7 +818,7 @@ impl TickState {
 
 impl Drop for TickState {
     fn drop(&mut self) {
-        let panel_errors = self.panel_set.reconcile(vec![], &self.panel_ctx, &mut ());
+        let panel_errors = self.panel_set.reconcile(vec![], &mut self.panel_ctx, &mut ());
         log_lifecycle_errors(panel_errors);
         let _ = self.conn.flush();
     }

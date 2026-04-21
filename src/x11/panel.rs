@@ -229,7 +229,7 @@ impl Lifecycle for PanelSpecData {
         self.id.clone()
     }
 
-    fn enter(self, ctx: &Self::Context, _output: &mut ()) -> Result<Self::State, Self::Error> {
+    fn enter(self, ctx: &mut Self::Context, _output: &mut ()) -> Result<Self::State, Self::Error> {
         init_global_ctx();
         let mut panel = create_panel(&self, ctx).map_err(|e| {
             tracing::error!(panel = %self.id, error = %e, "panel create failed");
@@ -243,7 +243,7 @@ impl Lifecycle for PanelSpecData {
         Ok(panel)
     }
 
-    fn reconcile_self(self, state: &mut Self::State, ctx: &Self::Context, _output: &mut ()) -> Result<(), Self::Error> {
+    fn reconcile_self(self, state: &mut Self::State, ctx: &mut Self::Context, _output: &mut ()) -> Result<(), Self::Error> {
         if !self.content.is_null() {
             preload_layout_images(&self.content);
             state.raw_layout = Some(self.content.clone());
@@ -302,7 +302,7 @@ impl Lifecycle for PanelSpecData {
         Ok(())
     }
 
-    fn exit(state: Self::State, ctx: &Self::Context) -> Result<(), Self::Error> {
+    fn exit(state: Self::State, ctx: &mut Self::Context) -> Result<(), Self::Error> {
         tracing::info!(panel = %state.id, "panel destroyed");
         let _ = ctx.conn.free_gc(state.gc);
         let _ = ctx.conn.destroy_window(state.win_id);
@@ -411,7 +411,7 @@ mod tests {
     fn lifecycle_enter_creates_x11_window() {
         use crate::managed_set::Lifecycle;
 
-        let ctx = match make_panel_ctx() {
+        let mut ctx = match make_panel_ctx() {
             Some(c) => c,
             None => {
                 println!("SKIP: no X11 display available");
@@ -420,14 +420,14 @@ mod tests {
         };
 
         let spec = make_spec("test-enter", 200, 30);
-        let panel = <crate::layout::PanelSpecData as Lifecycle>::enter(spec, &ctx, &mut ())
+        let panel = <crate::layout::PanelSpecData as Lifecycle>::enter(spec, &mut ctx, &mut ())
             .expect("enter should succeed when X11 is available");
 
         assert!(panel.phys_width > 0, "phys_width must be > 0");
         assert!(panel.phys_height > 0, "phys_height must be > 0");
 
         // Cleanup
-        let _ = <crate::layout::PanelSpecData as Lifecycle>::exit(panel, &ctx);
+        let _ = <crate::layout::PanelSpecData as Lifecycle>::exit(panel, &mut ctx);
     }
 
     // ---------------------------------------------------------------------------
@@ -439,7 +439,7 @@ mod tests {
         use x11rb::connection::Connection as _;
         use x11rb::protocol::xproto::ConnectionExt as XprotoExt;
 
-        let ctx = match make_panel_ctx() {
+        let mut ctx = match make_panel_ctx() {
             Some(c) => c,
             None => {
                 println!("SKIP: no X11 display available");
@@ -448,7 +448,7 @@ mod tests {
         };
 
         let spec = make_spec("test-exit", 200, 30);
-        let panel = <crate::layout::PanelSpecData as Lifecycle>::enter(spec, &ctx, &mut ())
+        let panel = <crate::layout::PanelSpecData as Lifecycle>::enter(spec, &mut ctx, &mut ())
             .expect("enter must succeed for exit test");
 
         let win_id = panel.win_id;
@@ -460,7 +460,7 @@ mod tests {
             .and_then(|c| c.reply().ok());
         assert!(before.is_some(), "window should exist before exit");
 
-        let _ = <crate::layout::PanelSpecData as Lifecycle>::exit(panel, &ctx);
+        let _ = <crate::layout::PanelSpecData as Lifecycle>::exit(panel, &mut ctx);
         ctx.conn.flush().ok();
 
         // After exit the window must no longer exist.
@@ -477,7 +477,7 @@ mod tests {
     fn lifecycle_update_sets_raw_layout_when_content_changes() {
         use crate::managed_set::Lifecycle;
 
-        let ctx = match make_panel_ctx() {
+        let mut ctx = match make_panel_ctx() {
             Some(c) => c,
             None => {
                 println!("SKIP: no X11 display available");
@@ -486,7 +486,7 @@ mod tests {
         };
 
         let spec = make_spec("test-update", 200, 30);
-        let mut panel = <crate::layout::PanelSpecData as Lifecycle>::enter(spec, &ctx, &mut ())
+        let mut panel = <crate::layout::PanelSpecData as Lifecycle>::enter(spec, &mut ctx, &mut ())
             .expect("enter must succeed for update test");
 
         let new_content = serde_json::json!({"type": "text", "text": "hello"});
@@ -503,7 +503,7 @@ mod tests {
             content: new_content.clone(),
         };
 
-        <crate::layout::PanelSpecData as Lifecycle>::reconcile_self(new_spec, &mut panel, &ctx, &mut ())
+        <crate::layout::PanelSpecData as Lifecycle>::reconcile_self(new_spec, &mut panel, &mut ctx, &mut ())
             .expect("reconcile_self must succeed");
 
         assert_eq!(
@@ -513,7 +513,7 @@ mod tests {
         );
 
         // Cleanup
-        let _ = <crate::layout::PanelSpecData as Lifecycle>::exit(panel, &ctx);
+        let _ = <crate::layout::PanelSpecData as Lifecycle>::exit(panel, &mut ctx);
     }
 
     // ---------------------------------------------------------------------------
@@ -540,7 +540,7 @@ mod tests {
         use x11rb::connection::Connection as _;
         use x11rb::protocol::xproto::ConnectionExt as XprotoExt;
 
-        let ctx = match make_panel_ctx() {
+        let mut ctx = match make_panel_ctx() {
             Some(c) => c,
             None => {
                 println!("SKIP: no X11 display available");
@@ -549,11 +549,11 @@ mod tests {
         };
 
         let spec = make_spec("test-resize-window", 200, 30);
-        let mut panel = <crate::layout::PanelSpecData as Lifecycle>::enter(spec, &ctx, &mut ())
+        let mut panel = <crate::layout::PanelSpecData as Lifecycle>::enter(spec, &mut ctx, &mut ())
             .expect("enter must succeed for reconcile_self resize test");
 
         let new_spec = make_spec("test-resize-window", 300, 30);
-        <crate::layout::PanelSpecData as Lifecycle>::reconcile_self(new_spec, &mut panel, &ctx, &mut ())
+        <crate::layout::PanelSpecData as Lifecycle>::reconcile_self(new_spec, &mut panel, &mut ctx, &mut ())
             .expect("reconcile_self must succeed");
 
         ctx.conn.flush().ok();
@@ -565,7 +565,7 @@ mod tests {
         assert_eq!(geom.width, 300u16, "X11 window width should be updated to 300");
 
         // Cleanup
-        let _ = <crate::layout::PanelSpecData as Lifecycle>::exit(panel, &ctx);
+        let _ = <crate::layout::PanelSpecData as Lifecycle>::exit(panel, &mut ctx);
     }
 
     // ---------------------------------------------------------------------------
@@ -575,7 +575,7 @@ mod tests {
     fn reconcile_self_updates_phys_width_in_state() {
         use crate::managed_set::Lifecycle;
 
-        let ctx = match make_panel_ctx() {
+        let mut ctx = match make_panel_ctx() {
             Some(c) => c,
             None => {
                 println!("SKIP: no X11 display available");
@@ -584,17 +584,17 @@ mod tests {
         };
 
         let spec = make_spec("test-resize-state", 200, 30);
-        let mut panel = <crate::layout::PanelSpecData as Lifecycle>::enter(spec, &ctx, &mut ())
+        let mut panel = <crate::layout::PanelSpecData as Lifecycle>::enter(spec, &mut ctx, &mut ())
             .expect("enter must succeed for reconcile_self state test");
 
         let new_spec = make_spec("test-resize-state", 300, 30);
-        <crate::layout::PanelSpecData as Lifecycle>::reconcile_self(new_spec, &mut panel, &ctx, &mut ())
+        <crate::layout::PanelSpecData as Lifecycle>::reconcile_self(new_spec, &mut panel, &mut ctx, &mut ())
             .expect("reconcile_self must succeed");
 
         assert_eq!(panel.phys_width, 300, "phys_width in state should be updated to 300 after reconcile_self");
 
         // Cleanup
-        let _ = <crate::layout::PanelSpecData as Lifecycle>::exit(panel, &ctx);
+        let _ = <crate::layout::PanelSpecData as Lifecycle>::exit(panel, &mut ctx);
     }
 
     // ---------------------------------------------------------------------------

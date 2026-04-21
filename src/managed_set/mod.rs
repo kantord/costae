@@ -19,16 +19,16 @@ pub trait Lifecycle {
 
     /// Called once when this item first appears in the desired set. Returns the live
     /// state or an error; on `Err` the item is not added to the store.
-    fn enter(self, ctx: &Self::Context, output: &mut Self::Output) -> Result<Self::State, Self::Error>;
+    fn enter(self, ctx: &mut Self::Context, output: &mut Self::Output) -> Result<Self::State, Self::Error>;
 
     /// Called on every reconciliation cycle while the item remains present. Responsible
     /// for both synchronising this item's own state and triggering reconciliation of any
     /// child items it owns.
-    fn reconcile_self(self, state: &mut Self::State, ctx: &Self::Context, output: &mut Self::Output) -> Result<(), Self::Error>;
+    fn reconcile_self(self, state: &mut Self::State, ctx: &mut Self::Context, output: &mut Self::Output) -> Result<(), Self::Error>;
 
     /// Called when this item leaves the desired set or after a failed `reconcile_self`.
     /// An `Err` return signals a zombie — cleanup did not complete cleanly.
-    fn exit(state: Self::State, ctx: &Self::Context) -> Result<(), Self::Error>;
+    fn exit(state: Self::State, ctx: &mut Self::Context) -> Result<(), Self::Error>;
 }
 
 pub struct ManagedSet<T: Lifecycle> {
@@ -57,7 +57,7 @@ where
         map
     }
 
-    fn exit_removed(&mut self, new_map: &HashMap<T::Key, T>, ctx: &T::Context, errors: &mut ReconcileErrors<T::Key, T::Error>) {
+    fn exit_removed(&mut self, new_map: &HashMap<T::Key, T>, ctx: &mut T::Context, errors: &mut ReconcileErrors<T::Key, T::Error>) {
         let exit_keys: Vec<T::Key> = self.store.keys()
             .filter(|k| !new_map.contains_key(*k))
             .cloned()
@@ -70,7 +70,7 @@ where
         }
     }
 
-    fn update_existing(&mut self, new_map: &mut HashMap<T::Key, T>, ctx: &T::Context, output: &mut T::Output, errors: &mut ReconcileErrors<T::Key, T::Error>) {
+    fn update_existing(&mut self, new_map: &mut HashMap<T::Key, T>, ctx: &mut T::Context, output: &mut T::Output, errors: &mut ReconcileErrors<T::Key, T::Error>) {
         let update_keys: Vec<T::Key> = new_map.keys()
             .filter(|k| self.store.contains_key(*k))
             .cloned()
@@ -88,7 +88,7 @@ where
         }
     }
 
-    fn enter_new(&mut self, mut new_map: HashMap<T::Key, T>, ctx: &T::Context, output: &mut T::Output, errors: &mut ReconcileErrors<T::Key, T::Error>) {
+    fn enter_new(&mut self, mut new_map: HashMap<T::Key, T>, ctx: &mut T::Context, output: &mut T::Output, errors: &mut ReconcileErrors<T::Key, T::Error>) {
         let enter_keys: Vec<T::Key> = new_map.keys()
             .filter(|k| !self.store.contains_key(*k))
             .cloned()
@@ -123,7 +123,7 @@ impl<T: Lifecycle + 'static> reconcile::Reconcile<T> for ManagedSet<T>
 where
     T::Error: Debug,
 {
-    fn reconcile(&mut self, desired: impl IntoIterator<Item = T>, ctx: &T::Context, output: &mut T::Output)
+    fn reconcile(&mut self, desired: impl IntoIterator<Item = T>, ctx: &mut T::Context, output: &mut T::Output)
         -> ReconcileErrors<T::Key, T::Error>
     {
         let mut errors = ReconcileErrors::new();
@@ -157,18 +157,18 @@ mod tests {
             self.id.clone()
         }
 
-        fn enter(self, ctx: &Self::Context, _output: &mut ()) -> Result<Self::State, Self::Error> {
+        fn enter(self, ctx: &mut Self::Context, _output: &mut ()) -> Result<Self::State, Self::Error> {
             ctx.lock().unwrap().push(format!("enter:{}", self.id));
             Ok(self.value)
         }
 
-        fn reconcile_self(self, state: &mut Self::State, ctx: &Self::Context, _output: &mut ()) -> Result<(), Self::Error> {
+        fn reconcile_self(self, state: &mut Self::State, ctx: &mut Self::Context, _output: &mut ()) -> Result<(), Self::Error> {
             ctx.lock().unwrap().push(format!("reconcile_self:{}", self.id));
             *state = self.value;
             Ok(())
         }
 
-        fn exit(state: Self::State, ctx: &Self::Context) -> Result<(), Self::Error> {
+        fn exit(state: Self::State, ctx: &mut Self::Context) -> Result<(), Self::Error> {
             ctx.lock().unwrap().push(format!("exit:{}", state));
             Ok(())
         }
@@ -184,28 +184,28 @@ mod tests {
 
     #[test]
     fn new_item_calls_enter_and_stores_state() {
-        let ctx = make_ctx();
+        let mut ctx = make_ctx();
         let mut ms: ManagedSet<TestSpec> = ManagedSet::new();
-        ms.reconcile(vec![TestSpec { id: "a".to_string(), value: 42 }], &ctx, &mut ());
+        ms.reconcile(vec![TestSpec { id: "a".to_string(), value: 42 }], &mut ctx, &mut ());
         assert!(calls(&ctx).contains(&"enter:a".to_string()));
         assert_eq!(ms.get(&"a".to_string()), Some(&42));
     }
 
     #[test]
     fn removed_item_calls_exit_with_old_state() {
-        let ctx = make_ctx();
+        let mut ctx = make_ctx();
         let mut ms: ManagedSet<TestSpec> = ManagedSet::new();
-        ms.reconcile(vec![TestSpec { id: "a".to_string(), value: 99 }], &ctx, &mut ());
-        ms.reconcile(vec![], &ctx, &mut ());
+        ms.reconcile(vec![TestSpec { id: "a".to_string(), value: 99 }], &mut ctx, &mut ());
+        ms.reconcile(vec![], &mut ctx, &mut ());
         assert!(calls(&ctx).contains(&"exit:99".to_string()));
     }
 
     #[test]
     fn existing_item_calls_reconcile_self_not_enter() {
-        let ctx = make_ctx();
+        let mut ctx = make_ctx();
         let mut ms: ManagedSet<TestSpec> = ManagedSet::new();
-        ms.reconcile(vec![TestSpec { id: "a".to_string(), value: 1 }], &ctx, &mut ());
-        ms.reconcile(vec![TestSpec { id: "a".to_string(), value: 2 }], &ctx, &mut ());
+        ms.reconcile(vec![TestSpec { id: "a".to_string(), value: 1 }], &mut ctx, &mut ());
+        ms.reconcile(vec![TestSpec { id: "a".to_string(), value: 2 }], &mut ctx, &mut ());
         let log = calls(&ctx);
         assert_eq!(log.iter().filter(|c| *c == "enter:a").count(), 1);
         assert!(log.contains(&"reconcile_self:a".to_string()));
@@ -213,38 +213,38 @@ mod tests {
 
     #[test]
     fn duplicate_keys_in_batch_only_one_enter() {
-        let ctx = make_ctx();
+        let mut ctx = make_ctx();
         let mut ms: ManagedSet<TestSpec> = ManagedSet::new();
         ms.reconcile(vec![
             TestSpec { id: "a".to_string(), value: 1 },
             TestSpec { id: "a".to_string(), value: 2 },
-        ], &ctx, &mut ());
+        ], &mut ctx, &mut ());
         let log = calls(&ctx);
         assert_eq!(log.iter().filter(|c| *c == "enter:a").count(), 1);
     }
 
     #[test]
     fn get_returns_state_after_enter() {
-        let ctx = make_ctx();
+        let mut ctx = make_ctx();
         let mut ms: ManagedSet<TestSpec> = ManagedSet::new();
-        ms.reconcile(vec![TestSpec { id: "b".to_string(), value: 7 }], &ctx, &mut ());
+        ms.reconcile(vec![TestSpec { id: "b".to_string(), value: 7 }], &mut ctx, &mut ());
         assert_eq!(ms.get(&"b".to_string()), Some(&7));
     }
 
     #[test]
     fn get_returns_updated_state_after_reconcile() {
-        let ctx = make_ctx();
+        let mut ctx = make_ctx();
         let mut ms: ManagedSet<TestSpec> = ManagedSet::new();
-        ms.reconcile(vec![TestSpec { id: "c".to_string(), value: 10 }], &ctx, &mut ());
-        ms.reconcile(vec![TestSpec { id: "c".to_string(), value: 20 }], &ctx, &mut ());
+        ms.reconcile(vec![TestSpec { id: "c".to_string(), value: 10 }], &mut ctx, &mut ());
+        ms.reconcile(vec![TestSpec { id: "c".to_string(), value: 20 }], &mut ctx, &mut ());
         assert_eq!(ms.get(&"c".to_string()), Some(&20));
     }
 
     #[test]
     fn iter_mut_yields_mutable_state_visible_via_get() {
-        let ctx = make_ctx();
+        let mut ctx = make_ctx();
         let mut ms: ManagedSet<TestSpec> = ManagedSet::new();
-        ms.reconcile(vec![TestSpec { id: "d".to_string(), value: 5 }], &ctx, &mut ());
+        ms.reconcile(vec![TestSpec { id: "d".to_string(), value: 5 }], &mut ctx, &mut ());
         for (_k, v) in ms.iter_mut() {
             *v = 99;
         }
@@ -253,9 +253,9 @@ mod tests {
 
     #[test]
     fn get_mut_returns_mutable_reference_visible_via_get() {
-        let ctx = make_ctx();
+        let mut ctx = make_ctx();
         let mut ms: ManagedSet<TestSpec> = ManagedSet::new();
-        ms.reconcile(vec![TestSpec { id: "e".to_string(), value: 3 }], &ctx, &mut ());
+        ms.reconcile(vec![TestSpec { id: "e".to_string(), value: 3 }], &mut ctx, &mut ());
         if let Some(v) = ms.get_mut(&"e".to_string()) {
             *v = 77;
         }
@@ -285,7 +285,7 @@ mod tests {
                 self.id.clone()
             }
 
-            fn enter(self, _ctx: &(), _output: &mut ()) -> Result<String, FallibleError> {
+            fn enter(self, _ctx: &mut (), _output: &mut ()) -> Result<String, FallibleError> {
                 if self.fail {
                     Err(FallibleError(format!("enter failed for {}", self.id)))
                 } else {
@@ -293,12 +293,12 @@ mod tests {
                 }
             }
 
-            fn reconcile_self(self, state: &mut String, _ctx: &(), _output: &mut ()) -> Result<(), FallibleError> {
+            fn reconcile_self(self, state: &mut String, _ctx: &mut (), _output: &mut ()) -> Result<(), FallibleError> {
                 *state = format!("updated:{}", self.id);
                 Ok(())
             }
 
-            fn exit(_state: String, _ctx: &()) -> Result<(), FallibleError> {
+            fn exit(_state: String, _ctx: &mut ()) -> Result<(), FallibleError> {
                 Ok(())
             }
         }
@@ -306,7 +306,7 @@ mod tests {
         #[test]
         fn enter_err_not_added_to_store_error_returned() {
             let mut ms: ManagedSet<FallibleSpec> = ManagedSet::new();
-            let errors = ms.reconcile(vec![FallibleSpec { id: "x".to_string(), fail: true }], &(), &mut ());
+            let errors = ms.reconcile(vec![FallibleSpec { id: "x".to_string(), fail: true }], &mut (), &mut ());
             assert!(ms.get(&"x".to_string()).is_none(), "item must not be in store after enter Err");
             assert_eq!(errors.len(), 1, "one error must be returned");
             assert_eq!(errors[0].0, "x");
@@ -316,7 +316,7 @@ mod tests {
         #[test]
         fn enter_ok_adds_item_to_store_no_errors() {
             let mut ms: ManagedSet<FallibleSpec> = ManagedSet::new();
-            let errors = ms.reconcile(vec![FallibleSpec { id: "y".to_string(), fail: false }], &(), &mut ());
+            let errors = ms.reconcile(vec![FallibleSpec { id: "y".to_string(), fail: false }], &mut (), &mut ());
             assert_eq!(ms.get(&"y".to_string()), Some(&"state:y".to_string()));
             assert!(errors.is_empty(), "no errors when enter returns Ok");
         }
@@ -347,11 +347,11 @@ mod tests {
                 self.id.clone()
             }
 
-            fn enter(self, _ctx: &(), _output: &mut ()) -> Result<String, UpdateError> {
+            fn enter(self, _ctx: &mut (), _output: &mut ()) -> Result<String, UpdateError> {
                 Ok(format!("state:{}", self.id))
             }
 
-            fn reconcile_self(self, _state: &mut String, _ctx: &(), _output: &mut ()) -> Result<(), UpdateError> {
+            fn reconcile_self(self, _state: &mut String, _ctx: &mut (), _output: &mut ()) -> Result<(), UpdateError> {
                 if self.fail_update {
                     Err(UpdateError(format!("update failed for {}", self.id)))
                 } else {
@@ -359,7 +359,7 @@ mod tests {
                 }
             }
 
-            fn exit(_state: String, _ctx: &()) -> Result<(), UpdateError> {
+            fn exit(_state: String, _ctx: &mut ()) -> Result<(), UpdateError> {
                 EXIT_CALLED.store(true, std::sync::atomic::Ordering::SeqCst);
                 Ok(())
             }
@@ -370,11 +370,11 @@ mod tests {
             EXIT_CALLED.store(false, std::sync::atomic::Ordering::SeqCst);
             let mut ms: ManagedSet<UpdateFallibleSpec> = ManagedSet::new();
 
-            let e1 = ms.reconcile(vec![UpdateFallibleSpec { id: "z".to_string(), fail_update: false }], &(), &mut ());
+            let e1 = ms.reconcile(vec![UpdateFallibleSpec { id: "z".to_string(), fail_update: false }], &mut (), &mut ());
             assert!(e1.is_empty());
             assert!(ms.get(&"z".to_string()).is_some(), "item should be in store after successful enter");
 
-            let errors = ms.reconcile(vec![UpdateFallibleSpec { id: "z".to_string(), fail_update: true }], &(), &mut ());
+            let errors = ms.reconcile(vec![UpdateFallibleSpec { id: "z".to_string(), fail_update: true }], &mut (), &mut ());
             assert_eq!(errors.len(), 1, "one error must be returned on reconcile failure");
             assert_eq!(errors[0].0, "z");
             assert_eq!(errors[0].1, UpdateError("update failed for z".to_string()));
@@ -382,7 +382,7 @@ mod tests {
             assert!(EXIT_CALLED.load(std::sync::atomic::Ordering::SeqCst), "exit must be called after reconcile Err");
 
             EXIT_CALLED.store(false, std::sync::atomic::Ordering::SeqCst);
-            let e3 = ms.reconcile(vec![UpdateFallibleSpec { id: "z".to_string(), fail_update: false }], &(), &mut ());
+            let e3 = ms.reconcile(vec![UpdateFallibleSpec { id: "z".to_string(), fail_update: false }], &mut (), &mut ());
             assert!(e3.is_empty(), "third call should succeed via enter");
             assert!(ms.get(&"z".to_string()).is_some(), "item should be re-entered on third call");
         }
@@ -408,17 +408,17 @@ mod tests {
                 self.id.clone()
             }
 
-            fn enter(self, _ctx: &(), output: &mut mpsc::Sender<String>) -> Result<(), Self::Error> {
+            fn enter(self, _ctx: &mut (), output: &mut mpsc::Sender<String>) -> Result<(), Self::Error> {
                 output.send(format!("entered:{}", self.id)).unwrap();
                 Ok(())
             }
 
-            fn reconcile_self(self, _state: &mut (), _ctx: &(), output: &mut mpsc::Sender<String>) -> Result<(), Self::Error> {
+            fn reconcile_self(self, _state: &mut (), _ctx: &mut (), output: &mut mpsc::Sender<String>) -> Result<(), Self::Error> {
                 output.send(format!("reconciled:{}", self.id)).unwrap();
                 Ok(())
             }
 
-            fn exit(_state: (), _ctx: &()) -> Result<(), Self::Error> {
+            fn exit(_state: (), _ctx: &mut ()) -> Result<(), Self::Error> {
                 Ok(())
             }
         }
@@ -427,7 +427,7 @@ mod tests {
         fn enter_receives_output_and_can_write_to_it() {
             let (mut tx, rx) = mpsc::channel::<String>();
             let mut ms: ManagedSet<ChannelOutputLifecycle> = ManagedSet::new();
-            ms.reconcile(vec![ChannelOutputLifecycle { id: "o1".to_string() }], &(), &mut tx);
+            ms.reconcile(vec![ChannelOutputLifecycle { id: "o1".to_string() }], &mut (), &mut tx);
             drop(tx);
             let msgs: Vec<String> = rx.try_iter().collect();
             assert!(msgs.contains(&"entered:o1".to_string()), "enter must write to output; got: {:?}", msgs);
@@ -437,8 +437,8 @@ mod tests {
         fn exit_does_not_receive_output() {
             let (mut tx, rx) = mpsc::channel::<String>();
             let mut ms: ManagedSet<ChannelOutputLifecycle> = ManagedSet::new();
-            ms.reconcile(vec![ChannelOutputLifecycle { id: "o2".to_string() }], &(), &mut tx);
-            ms.reconcile(vec![], &(), &mut tx);
+            ms.reconcile(vec![ChannelOutputLifecycle { id: "o2".to_string() }], &mut (), &mut tx);
+            ms.reconcile(vec![], &mut (), &mut tx);
             drop(tx);
             let msgs: Vec<String> = rx.try_iter().collect();
             assert!(!msgs.iter().any(|m| m.starts_with("exited:")), "exit must not write to output; got: {:?}", msgs);
