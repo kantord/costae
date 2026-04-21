@@ -243,12 +243,62 @@ impl Lifecycle for PanelSpecData {
         Ok(panel)
     }
 
-    fn reconcile_self(self, state: &mut Self::State, _ctx: &Self::Context, _output: &()) -> Result<(), Self::Error> {
+    fn reconcile_self(self, state: &mut Self::State, ctx: &Self::Context, _output: &()) -> Result<(), Self::Error> {
         if !self.content.is_null() {
             preload_layout_images(&self.content);
-            state.raw_layout = Some(self.content);
+            state.raw_layout = Some(self.content.clone());
             state.render_cache = RenderCache::new(30);
         }
+
+        let new_phys_width = (self.width as f32 * ctx.dpr).round() as u32;
+        let new_phys_height = (self.height as f32 * ctx.dpr).round() as u32;
+
+        if new_phys_width != state.phys_width || new_phys_height != state.phys_height {
+            ctx.conn.configure_window(
+                state.win_id,
+                &ConfigureWindowAux::new()
+                    .width(new_phys_width)
+                    .height(new_phys_height),
+            )?;
+            state.phys_width = new_phys_width;
+            state.phys_height = new_phys_height;
+
+            // Recompute position using the same anchor logic as create_panel.
+            let (mon_x, mon_y, mon_width, mon_height) = self.output.as_ref()
+                .and_then(|name| ctx.output_map.get(name).copied())
+                .unwrap_or((ctx.mon_x, ctx.mon_y, ctx.mon_width, ctx.mon_height));
+
+            let (win_x, win_y) = match &self.anchor {
+                Some(PanelAnchor::Left) | Some(PanelAnchor::Top) => (mon_x, mon_y),
+                Some(PanelAnchor::Right) => (mon_x + mon_width as i16 - new_phys_width as i16, mon_y),
+                Some(PanelAnchor::Bottom) => (mon_x, mon_y + mon_height as i16 - new_phys_height as i16),
+                None => (
+                    mon_x + (self.x as f32 * ctx.dpr).round() as i16,
+                    mon_y + (self.y as f32 * ctx.dpr).round() as i16,
+                ),
+            };
+
+            if win_x != state.win_x || win_y != state.win_y {
+                ctx.conn.configure_window(
+                    state.win_id,
+                    &ConfigureWindowAux::new().x(win_x as i32).y(win_y as i32),
+                )?;
+                state.win_x = win_x;
+                state.win_y = win_y;
+            }
+
+            // Re-set strut properties if anchor is Some.
+            if let Some(anchor) = self.anchor.clone() {
+                let strut_vals = strut_partial_values_for_anchor(
+                    anchor, mon_x, mon_y, mon_width, mon_height, new_phys_width, new_phys_height,
+                );
+                ctx.conn.change_property32(PropMode::REPLACE, state.win_id, ctx.strut_atom, AtomEnum::CARDINAL, &strut_vals)?;
+                ctx.conn.change_property32(PropMode::REPLACE, state.win_id, ctx.strut_legacy_atom, AtomEnum::CARDINAL, &strut_vals[..4])?;
+            }
+
+            ctx.conn.flush()?;
+        }
+
         Ok(())
     }
 
@@ -479,6 +529,72 @@ mod tests {
         // missing the crate will not compile and this test will not run.
         // We just need one statement here so the test is not empty.
         let _ = std::marker::PhantomData::<super::PanelContext>::default;
+    }
+
+    // ---------------------------------------------------------------------------
+    // Claim D: reconcile_self resizes the X11 window when width changes.
+    // ---------------------------------------------------------------------------
+    #[test]
+    fn reconcile_self_resizes_window_when_width_changes() {
+        use crate::managed_set::Lifecycle;
+        use x11rb::connection::Connection as _;
+        use x11rb::protocol::xproto::ConnectionExt as XprotoExt;
+
+        let ctx = match make_panel_ctx() {
+            Some(c) => c,
+            None => {
+                println!("SKIP: no X11 display available");
+                return;
+            }
+        };
+
+        let spec = make_spec("test-resize-window", 200, 30);
+        let mut panel = <crate::layout::PanelSpecData as Lifecycle>::enter(spec, &ctx, &())
+            .expect("enter must succeed for reconcile_self resize test");
+
+        let new_spec = make_spec("test-resize-window", 300, 30);
+        <crate::layout::PanelSpecData as Lifecycle>::reconcile_self(new_spec, &mut panel, &ctx, &())
+            .expect("reconcile_self must succeed");
+
+        ctx.conn.flush().ok();
+        let geom = XprotoExt::get_geometry(&*ctx.conn, panel.win_id)
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .expect("get_geometry should succeed after reconcile_self");
+
+        assert_eq!(geom.width, 300u16, "X11 window width should be updated to 300");
+
+        // Cleanup
+        let _ = <crate::layout::PanelSpecData as Lifecycle>::exit(panel, &ctx);
+    }
+
+    // ---------------------------------------------------------------------------
+    // Claim E: reconcile_self updates phys_width in state when width changes.
+    // ---------------------------------------------------------------------------
+    #[test]
+    fn reconcile_self_updates_phys_width_in_state() {
+        use crate::managed_set::Lifecycle;
+
+        let ctx = match make_panel_ctx() {
+            Some(c) => c,
+            None => {
+                println!("SKIP: no X11 display available");
+                return;
+            }
+        };
+
+        let spec = make_spec("test-resize-state", 200, 30);
+        let mut panel = <crate::layout::PanelSpecData as Lifecycle>::enter(spec, &ctx, &())
+            .expect("enter must succeed for reconcile_self state test");
+
+        let new_spec = make_spec("test-resize-state", 300, 30);
+        <crate::layout::PanelSpecData as Lifecycle>::reconcile_self(new_spec, &mut panel, &ctx, &())
+            .expect("reconcile_self must succeed");
+
+        assert_eq!(panel.phys_width, 300, "phys_width in state should be updated to 300 after reconcile_self");
+
+        // Cleanup
+        let _ = <crate::layout::PanelSpecData as Lifecycle>::exit(panel, &ctx);
     }
 
     // ---------------------------------------------------------------------------
