@@ -12,7 +12,7 @@ pub struct Dimensions {
 
 pub trait DisplayManager {
     type Panel;
-    type Error: std::error::Error + Send + Sync + 'static;
+    type Error: std::fmt::Debug + std::fmt::Display + Send + Sync + 'static;
 
     fn create_window(&mut self, spec: &PanelSpecData) -> Result<Self::Panel, Self::Error>;
     fn update_position(&mut self, panel: &mut Self::Panel, spec: &PanelSpecData) -> Result<(), Self::Error>;
