@@ -48,7 +48,7 @@ impl Lifecycle for PanelSpec {
         }
     }
 
-    fn enter(self, ctx: &Self::Context, output: &()) -> Result<Self::State, Self::Error> {
+    fn enter(self, ctx: &Self::Context, output: &mut ()) -> Result<Self::State, Self::Error> {
         match (self, ctx) {
             (PanelSpec::X11(data), PanelContext::X11(x11_ctx)) => {
                 <PanelSpecData as Lifecycle>::enter(data, x11_ctx, output)
@@ -61,7 +61,7 @@ impl Lifecycle for PanelSpec {
         }
     }
 
-    fn reconcile_self(self, state: &mut Self::State, ctx: &Self::Context, output: &()) -> Result<(), Self::Error> {
+    fn reconcile_self(self, state: &mut Self::State, ctx: &Self::Context, output: &mut ()) -> Result<(), Self::Error> {
         match (self, state, ctx) {
             (PanelSpec::X11(data), PanelState::X11(panel), PanelContext::X11(x11_ctx)) => {
                 <PanelSpecData as Lifecycle>::reconcile_self(data, panel, x11_ctx, output)

@@ -14,6 +14,31 @@ use costae::layout::PanelSpecData;
 use costae::windowing::wayland::{WaylandDisplayServer, WaylandPanel};
 use costae::windowing::{DisplayServer, WindowEvent};
 
+struct WaylandPanelSpec(costae::layout::PanelSpecData);
+
+impl costae::managed_set::Lifecycle for WaylandPanelSpec {
+    type Key = String;
+    type State = WaylandPanel;
+    type Context = ();
+    type Output = WaylandDisplayServer;
+    type Error = anyhow::Error;
+
+    fn key(&self) -> String { self.0.id.clone() }
+
+    fn enter(self, _ctx: &(), server: &mut WaylandDisplayServer) -> Result<WaylandPanel, anyhow::Error> {
+        server.create_panel(&self.0)
+    }
+
+    fn reconcile_self(self, state: &mut WaylandPanel, _ctx: &(), _server: &mut WaylandDisplayServer) -> Result<(), anyhow::Error> {
+        state.update_spec(&self.0);
+        Ok(())
+    }
+
+    fn exit(_state: WaylandPanel, _ctx: &()) -> Result<(), anyhow::Error> {
+        Ok(()) // WaylandPanel drops LayerSurface which cleans up automatically
+    }
+}
+
 type ModuleEventTxs = Arc<std::sync::Mutex<HashMap<String, mpsc::Sender<serde_json::Value>>>>;
 
 const FREEZE_WATCHDOG_POLL_SECS: u64 = 10;
@@ -52,7 +77,7 @@ pub(crate) fn make_wayland_mod_init(specs: &[costae::PanelSpecData]) -> serde_js
 fn apply_wayland_eval_result(
     out: &costae::jsx::EvalOutput,
     handle: &DataLoopHandle,
-    panels: &mut HashMap<String, WaylandPanel>,
+    panels: &mut ManagedSet<WaylandPanelSpec>,
     server: &mut WaylandDisplayServer,
 ) -> bool {
     let specs = match costae::parse_root_node(&out.layout) {
@@ -74,25 +99,13 @@ fn apply_wayland_eval_result(
         })
         .collect::<Vec<_>>();
     handle.set_desired(stream_specs);
-
-    let desired_ids: std::collections::HashSet<String> = specs.iter().map(|s| s.id.clone()).collect();
-    panels.retain(|id, _| desired_ids.contains(id));
-    for data in specs {
-        if let Some(panel) = panels.get_mut(&data.id) {
-            panel.update_spec(&data);
-        } else {
-            match server.create_panel(&data) {
-                Ok(panel) => { panels.insert(data.id.clone(), panel); }
-                Err(e) => tracing::error!(id = %data.id, error = %e, "create_panel failed"),
-            }
-        }
-    }
+    panels.reconcile(specs.into_iter().map(WaylandPanelSpec), &(), server);
     true
 }
 
 struct WaylandTickState {
     server: WaylandDisplayServer,
-    panels: HashMap<String, WaylandPanel>,
+    panels: ManagedSet<WaylandPanelSpec>,
     stream_values: HashMap<(String, Option<String>), String>,
     jsx_evaluator: Option<costae::jsx::JsxEvaluator>,
     handle: DataLoopHandle,
@@ -125,7 +138,7 @@ impl WaylandTickState {
         });
         let mut state = Self {
             server,
-            panels: HashMap::new(),
+            panels: ManagedSet::new(),
             stream_values: HashMap::new(),
             jsx_evaluator: None,
             handle,
@@ -165,7 +178,7 @@ impl WaylandTickState {
     fn render_configured_panels(&mut self) {
         let dpr = 1.0_f32;
         let key = serde_json::to_value(&self.stream_values).unwrap_or_default();
-        for panel in self.panels.values_mut() {
+        for panel in self.panels.iter_mut().map(|(_, p)| p) {
             if !panel.configured { continue; }
             let layout = panel.raw_layout.as_ref().and_then(|l| {
                 parse_layout(l).map_err(|e| tracing::error!(error = %e, "layout parse error")).ok()
@@ -215,7 +228,7 @@ impl WaylandTickState {
             self.handle.set_desired(vec![]);
             self.stream_values.clear();
             self.jsx_evaluator = None;
-            self.panels.clear();
+            self.panels.reconcile(vec![], &(), &mut self.server);
             self.initial_load();
         }
 
@@ -241,7 +254,7 @@ impl WaylandTickState {
                         }
                         WindowEvent::Click { panel_id, x_logical, y_logical, .. } => {
                             // panel_id is surface_id.to_string(); find matching panel by surface_id
-                            if let Some(panel) = self.panels.values()
+                            if let Some(panel) = self.panels.iter().map(|(_, p)| p)
                                 .find(|p| p.surface_id.to_string() == panel_id)
                             {
                                 let txs = self.module_event_txs.lock().unwrap();
@@ -262,7 +275,7 @@ impl WaylandTickState {
         }
 
         for (surface_id, new_size) in self.server.take_pending_configures() {
-            for panel in self.panels.values_mut() {
+            for panel in self.panels.iter_mut().map(|(_, p)| p) {
                 if panel.surface_id != surface_id { continue; }
                 // If the compositor sent a nonzero size, use it for rendering so the buffer
                 // matches the allocated surface dimensions exactly.
@@ -373,7 +386,7 @@ fn apply_eval_result(
     let combined: Vec<StreamSource> = stream_specs.into_iter().chain(module_specs).collect();
     handle.set_desired(combined);
 
-    let panel_errors = panel_set.reconcile(specs, panel_ctx, &());
+    let panel_errors = panel_set.reconcile(specs, panel_ctx, &mut ());
     log_lifecycle_errors(panel_errors);
     true
 }
@@ -829,7 +842,7 @@ impl TickState {
 
 impl Drop for TickState {
     fn drop(&mut self) {
-        let panel_errors = self.panel_set.reconcile(vec![], &self.panel_ctx, &());
+        let panel_errors = self.panel_set.reconcile(vec![], &self.panel_ctx, &mut ());
         log_lifecycle_errors(panel_errors);
         let _ = self.conn.flush();
     }

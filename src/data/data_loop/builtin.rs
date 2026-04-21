@@ -28,7 +28,7 @@ impl Lifecycle for BuiltInSource {
         self.key.clone()
     }
 
-    fn enter(self, _ctx: &(), output: &Self::Output) -> Result<Self::State, Self::Error> {
+    fn enter(self, _ctx: &(), output: &mut Self::Output) -> Result<Self::State, Self::Error> {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_clone = Arc::clone(&stop);
         let output_clone = output.clone();
@@ -37,7 +37,7 @@ impl Lifecycle for BuiltInSource {
         Ok(BuiltInState { handle, stop })
     }
 
-    fn reconcile_self(self, state: &mut Self::State, _ctx: &(), output: &Self::Output) -> Result<(), Self::Error> {
+    fn reconcile_self(self, state: &mut Self::State, _ctx: &(), output: &mut Self::Output) -> Result<(), Self::Error> {
         if state.handle.is_finished() {
             let stop = Arc::new(AtomicBool::new(false));
             let stop_clone = Arc::clone(&stop);
@@ -77,13 +77,13 @@ mod tests {
     // should deliver that item to the receiver.
     #[test]
     fn enter_spawns_thread_and_delivers_item() {
-        let (tx, rx) = mpsc::channel::<StreamItem>();
+        let (mut tx, rx) = mpsc::channel::<StreamItem>();
         let source = BuiltInSource {
             key: "test-source".to_string(),
             func: send_one_item,
         };
 
-        let _state = source.enter(&(), &tx).expect("enter must return Ok(state)");
+        let _state = source.enter(&(), &mut tx).expect("enter must return Ok(state)");
 
         let item = rx.recv_timeout(Duration::from_millis(500))
             .expect("enter must spawn a thread that delivers a StreamItem");
@@ -101,14 +101,14 @@ mod tests {
     // naturally, calling `update` should spawn a fresh thread that delivers another item.
     #[test]
     fn update_restarts_finished_thread() {
-        let (tx, rx) = mpsc::channel::<StreamItem>();
+        let (mut tx, rx) = mpsc::channel::<StreamItem>();
         let source = BuiltInSource {
             key: "restart-source".to_string(),
             func: send_one_item,
         };
 
         // enter: thread runs, sends item, then finishes
-        let mut state = source.clone().enter(&(), &tx).expect("enter must succeed");
+        let mut state = source.clone().enter(&(), &mut tx).expect("enter must succeed");
 
         // drain the first item
         let _ = rx.recv_timeout(Duration::from_millis(500))
@@ -118,7 +118,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(100));
 
         // update: should detect finished thread and restart it
-        source.reconcile_self(&mut state, &(), &tx).expect("reconcile_self must return Ok");
+        source.reconcile_self(&mut state, &(), &mut tx).expect("reconcile_self must return Ok");
 
         let item = rx.recv_timeout(Duration::from_millis(500))
             .expect("update must restart the thread and deliver a new StreamItem");
@@ -136,13 +136,13 @@ mod tests {
     // `stop` AtomicBool to true.
     #[test]
     fn exit_sets_stop_flag() {
-        let (tx, rx) = mpsc::channel::<StreamItem>();
+        let (mut tx, rx) = mpsc::channel::<StreamItem>();
         let source = BuiltInSource {
             key: "exit-source".to_string(),
             func: send_one_item,
         };
 
-        let state = source.enter(&(), &tx).expect("enter must succeed");
+        let state = source.enter(&(), &mut tx).expect("enter must succeed");
 
         // drain item so the channel doesn't block anything
         let _ = rx.recv_timeout(Duration::from_millis(500));

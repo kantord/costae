@@ -108,7 +108,7 @@ impl DataLoop {
         while let Ok(sources) = self.desired_rx.try_recv() {
             self.set_desired(sources);
         }
-        let errors = self.process_pool.reconcile(self.desired_processes.clone(), &(), &self.stream_tx);
+        let errors = self.process_pool.reconcile(self.desired_processes.clone(), &(), &mut self.stream_tx);
         log_lifecycle_errors(errors);
         if let Some(state) = self.process_pool.get(identity) {
             let _ = state.event_tx.send(event);
@@ -130,9 +130,9 @@ impl DataLoop {
             .filter(|s| seen.insert(s.identity.clone()))
             .collect();
         self.desired_builtins = builtins;
-        let proc_errors = self.process_pool.reconcile(self.desired_processes.clone(), &(), &self.stream_tx);
+        let proc_errors = self.process_pool.reconcile(self.desired_processes.clone(), &(), &mut self.stream_tx);
         log_lifecycle_errors(proc_errors);
-        let builtin_errors = self.builtin_pool.reconcile(self.desired_builtins.clone(), &(), &self.stream_tx);
+        let builtin_errors = self.builtin_pool.reconcile(self.desired_builtins.clone(), &(), &mut self.stream_tx);
         log_lifecycle_errors(builtin_errors);
         self.update_event_txs_snapshot();
     }
@@ -175,9 +175,9 @@ impl DataLoop {
             }
 
             // Reconcile: enter new, exit removed, update existing (restarts crashed processes).
-            let proc_errors = self.process_pool.reconcile(self.desired_processes.clone(), &(), &self.stream_tx);
+            let proc_errors = self.process_pool.reconcile(self.desired_processes.clone(), &(), &mut self.stream_tx);
             log_lifecycle_errors(proc_errors);
-            let builtin_errors = self.builtin_pool.reconcile(self.desired_builtins.clone(), &(), &self.stream_tx);
+            let builtin_errors = self.builtin_pool.reconcile(self.desired_builtins.clone(), &(), &mut self.stream_tx);
             log_lifecycle_errors(builtin_errors);
             self.update_event_txs_snapshot();
 

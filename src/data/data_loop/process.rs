@@ -158,7 +158,7 @@ impl Lifecycle for ProcessSource {
         self.identity.clone()
     }
 
-    fn enter(self, _ctx: &(), output: &Self::Output) -> Result<Self::State, Self::Error> {
+    fn enter(self, _ctx: &(), output: &mut Self::Output) -> Result<Self::State, Self::Error> {
         let props = self.props.clone();
         let mut state = spawn_process(self, output)?;
         if let Some(p) = props {
@@ -168,7 +168,7 @@ impl Lifecycle for ProcessSource {
         Ok(state)
     }
 
-    fn reconcile_self(self, state: &mut Self::State, _ctx: &(), output: &Self::Output) -> Result<(), Self::Error> {
+    fn reconcile_self(self, state: &mut Self::State, _ctx: &(), output: &mut Self::Output) -> Result<(), Self::Error> {
         if matches!(state.child.try_wait(), Ok(Some(_))) {
             tracing::warn!(bin = %self.identity.bin, "process exited");
             let props = self.props.clone();
@@ -300,7 +300,7 @@ mod tests {
 
         #[test]
         fn reconcile_self_propagates_err_when_restart_spawn_fails() {
-            let (tx, _rx) = mpsc::channel();
+            let (mut tx, _rx) = mpsc::channel();
 
             let mut state = ProcessSource {
                 identity: ProcessIdentity { bin: "/bin/sh".to_string(), key: "t".to_string() },
@@ -309,13 +309,13 @@ mod tests {
                 env: BTreeMap::new(),
                 current_dir: None,
                 props: None,
-            }.enter(&(), &tx).expect("enter must succeed with /bin/sh");
+            }.enter(&(), &mut tx).expect("enter must succeed with /bin/sh");
 
             std::thread::sleep(std::time::Duration::from_millis(200));
             assert!(matches!(state.child.try_wait(), Ok(Some(_))), "child should have exited");
 
             let result = super::make_source("/nonexistent/binary/that/cannot/exist")
-                .reconcile_self(&mut state, &(), &tx);
+                .reconcile_self(&mut state, &(), &mut tx);
             match result {
                 Err(SpawnError::ProcessSpawnFailed { .. }) => {}
                 Err(other) => panic!("expected ProcessSpawnFailed, got: {:?}", other),
