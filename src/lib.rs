@@ -1,5 +1,6 @@
 pub mod jsx;
 pub mod data;
+pub mod display_manager;
 pub mod layout;
 pub mod panel;
 pub mod render;
