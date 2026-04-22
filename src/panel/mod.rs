@@ -1,4 +1,5 @@
-use crate::layout::{PanelSpec, PanelSpecData};
+use crate::display_manager::DisplayManager;
+use crate::layout::PanelSpecData;
 use crate::managed_set::Lifecycle;
 use crate::x11::panel::Panel;
 pub use crate::x11::panel::X11PanelContext;
@@ -31,54 +32,153 @@ pub enum PanelState {
 }
 
 // ---------------------------------------------------------------------------
-// Lifecycle impl for PanelSpec — Wayland variant is a no-op placeholder;
-// real Wayland panels are managed directly by WaylandTickState in main.rs.
+// Generic PanelSpec<DM> — wraps PanelSpecData with the display manager type
+// that should own the panel window.
 // ---------------------------------------------------------------------------
 
-impl Lifecycle for PanelSpec {
+pub struct PanelSpec<DM>(pub PanelSpecData, pub std::marker::PhantomData<DM>);
+
+impl<DM: DisplayManager> Lifecycle for PanelSpec<DM>
+where
+    DM::Error: std::fmt::Display,
+{
     type Key = String;
-    type State = PanelState;
-    type Context = PanelContext;
+    type State = DM::Panel;
+    type Context = DM;
     type Output = ();
     type Error = anyhow::Error;
 
     fn key(&self) -> String {
-        match self {
-            PanelSpec::X11(data) | PanelSpec::Wayland(data) => data.id.clone(),
+        self.0.id.clone()
+    }
+
+    fn enter(self, ctx: &mut DM, _output: &mut ()) -> Result<DM::Panel, anyhow::Error> {
+        ctx.create_window(&self.0).map_err(|e| anyhow::anyhow!("{e}"))
+    }
+
+    fn reconcile_self(self, state: &mut DM::Panel, ctx: &mut DM, _output: &mut ()) -> Result<(), anyhow::Error> {
+        ctx.update_dimensions(state, &self.0).map_err(|e| anyhow::anyhow!("{e}"))?;
+        ctx.update_position(state, &self.0).map_err(|e| anyhow::anyhow!("{e}"))
+    }
+
+    fn exit(state: DM::Panel, ctx: &mut DM) -> Result<(), anyhow::Error> {
+        ctx.delete_window(state).map_err(|e| anyhow::anyhow!("{e}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::display_manager::DisplayManager;
+    use crate::layout::PanelSpecData;
+    use crate::managed_set::Lifecycle;
+    use super::PanelSpec;
+
+    // -----------------------------------------------------------------------
+    // MockDM — records which DisplayManager methods were called; no X11/Wayland
+    // connection required.
+    // -----------------------------------------------------------------------
+    struct MockDM {
+        calls: Vec<&'static str>,
+        panel_id: u32,
+    }
+
+    impl MockDM {
+        fn new() -> Self {
+            MockDM { calls: Vec::new(), panel_id: 0 }
         }
     }
 
-    fn enter(self, ctx: &mut Self::Context, output: &mut ()) -> Result<Self::State, Self::Error> {
-        match (self, ctx) {
-            (PanelSpec::X11(data), PanelContext::X11(ref mut x11_ctx)) => {
-                <PanelSpecData as Lifecycle>::enter(data, x11_ctx, output)
-                    .map(PanelState::X11)
-            }
-            (PanelSpec::Wayland(_), PanelContext::Wayland(_)) => {
-                Ok(PanelState::Wayland(WaylandPanel))
-            }
-            _ => Err(anyhow::anyhow!("context/spec mismatch")),
+    impl DisplayManager for MockDM {
+        type Panel = u32;
+        type Error = String;
+
+        fn create_window(&mut self, _spec: &PanelSpecData) -> Result<u32, String> {
+            self.calls.push("create_window");
+            self.panel_id += 1;
+            Ok(self.panel_id)
+        }
+
+        fn update_position(&mut self, _panel: &mut u32, _spec: &PanelSpecData) -> Result<(), String> {
+            self.calls.push("update_position");
+            Ok(())
+        }
+
+        fn update_dimensions(&mut self, _panel: &mut u32, _spec: &PanelSpecData) -> Result<(), String> {
+            self.calls.push("update_dimensions");
+            Ok(())
+        }
+
+        fn update_image(&mut self, _panel: &mut u32, _bgrx: &[u8]) -> Result<(), String> {
+            self.calls.push("update_image");
+            Ok(())
+        }
+
+        fn delete_window(&mut self, _panel: u32) -> Result<(), String> {
+            self.calls.push("delete_window");
+            Ok(())
         }
     }
 
-    fn reconcile_self(self, state: &mut Self::State, ctx: &mut Self::Context, output: &mut ()) -> Result<(), Self::Error> {
-        match (self, state, ctx) {
-            (PanelSpec::X11(data), PanelState::X11(panel), PanelContext::X11(ref mut x11_ctx)) => {
-                <PanelSpecData as Lifecycle>::reconcile_self(data, panel, x11_ctx, output)
-            }
-            (PanelSpec::Wayland(_), PanelState::Wayland(_), PanelContext::Wayland(_)) => Ok(()),
-            _ => Err(anyhow::anyhow!("context/spec/state mismatch during reconcile")),
+    fn make_spec_data(id: &str) -> PanelSpecData {
+        PanelSpecData {
+            id: id.to_string(),
+            anchor: None,
+            width: 100,
+            height: 30,
+            x: 0,
+            y: 0,
+            outer_gap: 0,
+            output: None,
+            above: false,
+            content: serde_json::Value::Null,
         }
     }
 
-    fn exit(state: Self::State, ctx: &mut Self::Context) -> Result<(), Self::Error> {
-        match (state, ctx) {
-            (PanelState::X11(panel), PanelContext::X11(ref mut x11_ctx)) => {
-                <PanelSpecData as Lifecycle>::exit(panel, x11_ctx)
-            }
-            (PanelState::Wayland(_), PanelContext::Wayland(_)) => Ok(()),
-            _ => Err(anyhow::anyhow!("context/state mismatch during exit")),
-        }
+    // -----------------------------------------------------------------------
+    // Claim 1: PanelSpec::enter delegates to ctx.create_window(&spec_data)
+    //          and returns the panel produced by the DM.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn panel_spec_enter_calls_create_window_and_returns_panel() {
+        let mut dm = MockDM::new();
+        let spec: PanelSpec<MockDM> = PanelSpec(make_spec_data("p1"), std::marker::PhantomData);
+
+        let panel = <PanelSpec<MockDM> as Lifecycle>::enter(spec, &mut dm, &mut ())
+            .expect("enter should succeed");
+
+        assert!(dm.calls.contains(&"create_window"), "enter must call create_window; got: {:?}", dm.calls);
+        assert_eq!(panel, 1u32, "enter must return the panel produced by create_window");
+    }
+
+    // -----------------------------------------------------------------------
+    // Claim 2: PanelSpec::reconcile_self calls ctx.update_dimensions AND
+    //          ctx.update_position (both must appear in the call log).
+    // -----------------------------------------------------------------------
+    #[test]
+    fn panel_spec_reconcile_self_calls_update_dimensions_and_update_position() {
+        let mut dm = MockDM::new();
+        let spec: PanelSpec<MockDM> = PanelSpec(make_spec_data("p2"), std::marker::PhantomData);
+        let mut panel: u32 = 42;
+
+        <PanelSpec<MockDM> as Lifecycle>::reconcile_self(spec, &mut panel, &mut dm, &mut ())
+            .expect("reconcile_self should succeed");
+
+        assert!(dm.calls.contains(&"update_dimensions"), "reconcile_self must call update_dimensions; got: {:?}", dm.calls);
+        assert!(dm.calls.contains(&"update_position"), "reconcile_self must call update_position; got: {:?}", dm.calls);
+    }
+
+    // -----------------------------------------------------------------------
+    // Claim 3: PanelSpec::exit calls ctx.delete_window(panel).
+    // -----------------------------------------------------------------------
+    #[test]
+    fn panel_spec_exit_calls_delete_window() {
+        let mut dm = MockDM::new();
+        let panel: u32 = 7;
+
+        <PanelSpec<MockDM> as Lifecycle>::exit(panel, &mut dm)
+            .expect("exit should succeed");
+
+        assert!(dm.calls.contains(&"delete_window"), "exit must call delete_window; got: {:?}", dm.calls);
     }
 }
 

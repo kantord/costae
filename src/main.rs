@@ -11,7 +11,8 @@ use costae::x11::click::do_hit_test;
 use costae::x11::panel::{sample_root_bg, i3_dpi, PanelContext};
 use costae::managed_set::{ManagedSet, Reconcile};
 use costae::layout::PanelSpecData;
-use costae::windowing::wayland::{WaylandDisplayServer, WaylandPanelSpec};
+use costae::windowing::wayland::WaylandDisplayServer;
+use costae::panel::PanelSpec;
 use costae::windowing::{DisplayServer, WindowEvent};
 
 
@@ -53,7 +54,7 @@ pub(crate) fn make_wayland_mod_init(specs: &[costae::PanelSpecData]) -> serde_js
 fn apply_wayland_eval_result(
     out: &costae::jsx::EvalOutput,
     handle: &DataLoopHandle,
-    panels: &mut ManagedSet<WaylandPanelSpec>,
+    panels: &mut ManagedSet<PanelSpec<WaylandDisplayServer>>,
     server: &mut WaylandDisplayServer,
 ) -> bool {
     let specs = match costae::parse_root_node(&out.layout) {
@@ -75,13 +76,13 @@ fn apply_wayland_eval_result(
         })
         .collect::<Vec<_>>();
     handle.set_desired(stream_specs);
-    log_lifecycle_errors(panels.reconcile(specs.into_iter().map(WaylandPanelSpec), &mut (), server));
+    log_lifecycle_errors(panels.reconcile(specs.into_iter().map(|s| PanelSpec::<WaylandDisplayServer>(s, std::marker::PhantomData)), server, &mut ()));
     true
 }
 
 struct WaylandTickState {
     server: WaylandDisplayServer,
-    panels: ManagedSet<WaylandPanelSpec>,
+    panels: ManagedSet<PanelSpec<WaylandDisplayServer>>,
     stream_values: HashMap<(String, Option<String>), String>,
     jsx_evaluator: Option<costae::jsx::JsxEvaluator>,
     handle: DataLoopHandle,
@@ -204,7 +205,7 @@ impl WaylandTickState {
             self.handle.set_desired(vec![]);
             self.stream_values.clear();
             self.jsx_evaluator = None;
-            log_lifecycle_errors(self.panels.reconcile(vec![], &mut (), &mut self.server));
+            log_lifecycle_errors(self.panels.reconcile(vec![], &mut self.server, &mut ()));
             self.initial_load();
         }
 

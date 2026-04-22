@@ -2,7 +2,7 @@ use tiny_skia::{IntSize, Pixmap};
 use takumi::resources::image::ImageSource;
 use crate::render::with_global_ctx;
 
-pub use crate::layout::{PanelAnchor, PanelSpec};
+pub use crate::layout::PanelAnchor;
 
 const RGBA_BYTES_PER_PIXEL: usize = 4;
 

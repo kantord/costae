@@ -15,11 +15,13 @@ pub use takumi::rendering::MeasuredNode;
 // layout
 pub use layout::{
     PanelAnchor,
-    PanelSpec,
     PanelSpecData,
     parse_layout,
     parse_root_node,
 };
+
+// panel — generic PanelSpec<DM>
+pub use panel::PanelSpec;
 
 // managed_set
 pub use managed_set::ManagedSet;

@@ -1,16 +1,16 @@
-/// Tests for cycle 6: `impl Lifecycle for PanelSpec` with unified `PanelContext`.
+/// Tests for `PanelSpec<DM>` — a generic wrapper over `PanelSpecData` that
+/// implements `Lifecycle<Context = DM>` for any `DM: DisplayManager`.
 ///
 /// Behavioral claims:
-/// 1. `PanelSpec` implements `Lifecycle` — compile-time proof via coercion to trait object.
-/// 2. `PanelSpec::X11(data).key()` returns `data.id`.
-/// 3. `PanelSpec::Wayland(data).key()` returns `data.id`.
-/// 4. `PanelContext` is an enum with at least `X11` and `Wayland` variants (constructible).
+/// 1. `PanelSpec<DM>` implements `Lifecycle` — compile-time proof via generic bound.
+/// 2. `PanelSpec<DM>.key()` returns the inner `PanelSpecData.id`.
+/// 3. `PanelContext` is an enum with at least `X11` and `Wayland` variants (constructible).
 ///
-/// No real X11 or Wayland display connection is required.
-/// Tests use only struct construction and trait method calls that do not touch I/O.
+/// No real X11 or Wayland display connection is required for claims 2 and 3.
 
-use costae::layout::{PanelSpec, PanelSpecData};
+use costae::layout::PanelSpecData;
 use costae::managed_set::Lifecycle;
+use costae::PanelSpec;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -32,7 +32,7 @@ fn make_data(id: &str) -> PanelSpecData {
 }
 
 // ---------------------------------------------------------------------------
-// Claim 4: PanelContext is an enum with X11 and Wayland variants.
+// Claim 3: PanelContext is an enum with X11 and Wayland variants.
 // ---------------------------------------------------------------------------
 
 /// `PanelContext::X11` and `PanelContext::Wayland` must be constructible without a
@@ -57,65 +57,55 @@ fn panel_context_enum_has_x11_and_wayland_variants() {
 }
 
 // ---------------------------------------------------------------------------
-// Claim 2: PanelSpec::X11(data).key() == data.id
+// Claim 2: PanelSpec<DM>.key() returns the inner PanelSpecData.id
 // ---------------------------------------------------------------------------
 
-#[test]
-fn panel_spec_x11_key_returns_inner_id() {
-    let data = make_data("sidebar");
-    let spec = PanelSpec::X11(data);
+/// Use a minimal no-op DM just to instantiate the struct for the key test.
+struct NullDM;
+impl costae::display_manager::DisplayManager for NullDM {
+    type Panel = ();
+    type Error = String;
+    fn create_window(&mut self, _spec: &PanelSpecData) -> Result<(), String> { Ok(()) }
+    fn update_position(&mut self, _panel: &mut (), _spec: &PanelSpecData) -> Result<(), String> { Ok(()) }
+    fn update_dimensions(&mut self, _panel: &mut (), _spec: &PanelSpecData) -> Result<(), String> { Ok(()) }
+    fn update_image(&mut self, _panel: &mut (), _bgrx: &[u8]) -> Result<(), String> { Ok(()) }
+    fn delete_window(&mut self, _panel: ()) -> Result<(), String> { Ok(()) }
+}
 
+#[test]
+fn panel_spec_key_returns_inner_id() {
+    let spec: PanelSpec<NullDM> = PanelSpec(make_data("sidebar"), std::marker::PhantomData);
     assert_eq!(
-        spec.key(),
+        <PanelSpec<NullDM> as Lifecycle>::key(&spec),
         "sidebar".to_string(),
-        "PanelSpec::X11(data).key() must equal data.id"
+        "PanelSpec.key() must equal the inner PanelSpecData.id"
     );
 }
 
 // ---------------------------------------------------------------------------
-// Claim 3: PanelSpec::Wayland(data).key() == data.id
-// ---------------------------------------------------------------------------
-
-#[test]
-fn panel_spec_wayland_key_returns_inner_id() {
-    let data = make_data("topbar");
-    let spec = PanelSpec::Wayland(data);
-
-    assert_eq!(
-        spec.key(),
-        "topbar".to_string(),
-        "PanelSpec::Wayland(data).key() must equal data.id"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Claim 1: PanelSpec implements Lifecycle — compile-time proof via generic bound.
+// Claim 1: PanelSpec<DM> implements Lifecycle — compile-time proof.
 // ---------------------------------------------------------------------------
 
 /// This function is never called at runtime. Its only purpose is to prove at compile
-/// time that `PanelSpec` satisfies the `Lifecycle` bound with the expected associated
-/// types. If `impl Lifecycle for PanelSpec` does not exist (or uses wrong associated
-/// types), this will produce a compile error and the test suite will not build.
-///
-/// We use a generic function constrained to `Lifecycle<Key=String, Context=PanelContext>`
-/// because `Lifecycle` is not dyn-compatible (exit takes `state: Self::State` by value).
+/// time that `PanelSpec<NullDM>` satisfies the `Lifecycle` bound with the expected
+/// associated types. If the impl is absent or has wrong associated types, this will
+/// produce a compile error and the test suite will not build.
 #[allow(dead_code)]
 fn _assert_panel_spec_implements_lifecycle<T>(_spec: &T)
 where
-    T: Lifecycle<Key = String, Context = costae::panel::PanelContext>,
+    T: Lifecycle<Key = String, Context = NullDM>,
 {
     // Body intentionally empty — compile-time check only.
 }
 
 #[allow(dead_code)]
-fn _call_with_panel_spec(spec: &PanelSpec) {
+fn _call_with_panel_spec(spec: &PanelSpec<NullDM>) {
     _assert_panel_spec_implements_lifecycle(spec);
 }
 
 #[test]
 fn panel_spec_lifecycle_impl_compiles() {
-    // If `_call_with_panel_spec` compiled (it references `_assert_panel_spec_implements_lifecycle`
-    // instantiated with `PanelSpec`), the impl exists with the correct associated types.
-    // This test is a placeholder that passes once the crate compiles.
-    let _ = std::marker::PhantomData::<PanelSpec>::default;
+    // If `_call_with_panel_spec` compiled, the impl exists with the correct associated types.
+    // This test passes as long as the crate compiles.
+    let _spec: PanelSpec<NullDM> = PanelSpec(make_data("test"), std::marker::PhantomData);
 }
