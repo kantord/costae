@@ -45,6 +45,12 @@ pub struct PanelSpecData {
     pub content: serde_json::Value,
 }
 
+impl std::fmt::Display for PanelSpecData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.id)
+    }
+}
+
 pub fn parse_layout(value: &serde_json::Value) -> Result<Node, serde_json::Error> {
     use serde::Deserialize;
     Node::deserialize(value)

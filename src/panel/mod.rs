@@ -38,6 +38,12 @@ pub enum PanelState {
 
 pub struct PanelSpec<DM>(pub PanelSpecData, pub std::marker::PhantomData<DM>);
 
+impl<DM> std::fmt::Display for PanelSpec<DM> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0.id)
+    }
+}
+
 impl<DM: DisplayManager> Lifecycle for PanelSpec<DM>
 where
     DM::Error: std::fmt::Display,

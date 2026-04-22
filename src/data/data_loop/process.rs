@@ -7,6 +7,7 @@ use std::sync::mpsc;
 use std::thread;
 
 use crate::managed_set::Lifecycle;
+use costae_lifecycle_derive::lifecycle_trace;
 
 use super::{StreamItem, StreamKind};
 
@@ -147,6 +148,13 @@ pub(super) fn spawn_process(spec: ProcessSource, tx: &mpsc::Sender<StreamItem>) 
     Ok(ProcessState { child, event_tx, last_sent_props: None })
 }
 
+impl std::fmt::Display for ProcessSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.identity.bin)
+    }
+}
+
+#[lifecycle_trace]
 impl Lifecycle for ProcessSource {
     type Key = ProcessIdentity;
     type State = ProcessState;

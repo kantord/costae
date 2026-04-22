@@ -3,6 +3,7 @@ use std::sync::{mpsc, Arc};
 use std::thread::JoinHandle;
 
 use crate::managed_set::Lifecycle;
+use costae_lifecycle_derive::lifecycle_trace;
 
 use super::StreamItem;
 
@@ -17,6 +18,13 @@ pub struct BuiltInSource {
     pub func: fn(mpsc::Sender<StreamItem>, String, Arc<AtomicBool>),
 }
 
+impl std::fmt::Display for BuiltInSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.key)
+    }
+}
+
+#[lifecycle_trace]
 impl Lifecycle for BuiltInSource {
     type Key = String;
     type State = BuiltInState;

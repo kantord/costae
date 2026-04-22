@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "costae-i3", "costae-luax", "costae-notify"]
+members = [".", "costae-i3", "costae-luax", "costae-notify", "costae-lifecycle-derive"]
 resolver = "2"
 
 [package]
@@ -37,8 +37,10 @@ oxc_span = "0.124"
 oxc_ast = "0.124"
 oxc_resolver = "11.19.1"
 anyhow = "1.0.102"
+costae-lifecycle-derive = { path = "costae-lifecycle-derive" }
 smithay-client-toolkit = "0.19"
 wayland-client = "0.31"
 
 [dev-dependencies]
 image = "0.25"
+tracing-test = "0.2"

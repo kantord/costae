@@ -26,6 +26,10 @@ mod tests {
             pub value: i32,
         }
 
+        impl std::fmt::Display for Item {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "{}", self.id) }
+        }
+
         pub type Ctx = Arc<Mutex<Vec<String>>>;
 
         impl Lifecycle for Item {
@@ -89,7 +93,7 @@ mod tests {
     }
 
     // Claim 1: any type implementing Reconcile<T> can be used where
-    // impl Reconcile<Item> is expected — ManagedSet or a hand-written mock.
+    // impl Reconcile<Item> is expected - ManagedSet or a hand-written mock.
     mod trait_usability {
         use super::fixtures::{make_ctx, drive, Item, RecordingReconciler};
         use crate::managed_set::ManagedSet;
