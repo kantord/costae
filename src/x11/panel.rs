@@ -14,6 +14,7 @@ const XRESOURCES_PROP_MAX_LEN: u32 = 65536;
 const MM_PER_INCH: f32 = 25.4;
 const FALLBACK_DPI: f32 = 96.0;
 use crate::managed_set::Lifecycle;
+use costae_lifecycle_derive::lifecycle_trace;
 use crate::render::{RenderCache, render_frame, preload_layout_images, init_global_ctx};
 use crate::x11::{x11_bgrx_to_rgba, inject_root_bg, solid_color_rgba, strut_partial_values_for_anchor};
 
@@ -215,6 +216,7 @@ pub struct PanelContext {
     pub output_map: Arc<HashMap<String, (i16, i16, u32, u32)>>,
 }
 
+#[lifecycle_trace]
 impl Lifecycle for PanelSpec {
     type Key = String;
     type State = Panel;
