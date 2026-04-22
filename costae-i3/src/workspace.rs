@@ -8,6 +8,15 @@ pub struct Workspace {
     pub urgent: bool,
 }
 
+/// Returns true if `workspace_output` matches the given `filter`.
+///
+/// An empty `filter` means "show all outputs" (used by Wayland callers that
+/// have no per-monitor filtering), so every `workspace_output` value passes.
+/// A non-empty `filter` requires an exact match.
+pub fn workspace_matches_output(workspace_output: &str, filter: &str) -> bool {
+    filter.is_empty() || workspace_output == filter
+}
+
 pub fn fetch_workspaces(socket: &str, output: &str) -> std::io::Result<Vec<Workspace>> {
     let mut s = UnixStream::connect(socket)?;
     i3_send(&mut s, 1, b"")?;
@@ -15,7 +24,7 @@ pub fn fetch_workspaces(socket: &str, output: &str) -> std::io::Result<Vec<Works
     let arr: Vec<serde_json::Value> = serde_json::from_slice(&payload).unwrap_or_default();
     Ok(arr
         .iter()
-        .filter(|w| w["output"].as_str().unwrap_or("") == output)
+        .filter(|w| workspace_matches_output(w["output"].as_str().unwrap_or(""), output))
         .map(|w| Workspace {
             name: w["name"].as_str().unwrap_or("?").to_string(),
             focused: w["focused"].as_bool().unwrap_or(false),
@@ -37,6 +46,35 @@ pub fn build_workspace_data(workspaces: &[Workspace]) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- workspace_matches_output ---
+
+    #[test]
+    fn workspace_matches_output_empty_filter_passes_all() {
+        // When filter is "" every workspace_output value should be accepted,
+        // because Wayland passes "" to mean "no filter".
+        assert!(workspace_matches_output("DP-1", ""));
+        assert!(workspace_matches_output("HDMI-A-1", ""));
+        assert!(workspace_matches_output("", ""));
+    }
+
+    #[test]
+    fn workspace_matches_output_nonempty_filter_accepts_exact_match() {
+        assert!(workspace_matches_output("DP-1", "DP-1"));
+    }
+
+    #[test]
+    fn workspace_matches_output_nonempty_filter_rejects_different_output() {
+        assert!(!workspace_matches_output("HDMI-A-1", "DP-1"));
+    }
+
+    #[test]
+    fn workspace_matches_output_nonempty_filter_rejects_empty_workspace_output() {
+        // If filter is non-empty, a workspace with an empty output string must NOT match.
+        assert!(!workspace_matches_output("", "DP-1"));
+    }
+
+    // --- build_workspace_data ---
 
     #[test]
     fn build_workspace_data_has_workspaces_array() {

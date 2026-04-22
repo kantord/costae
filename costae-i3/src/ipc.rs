@@ -21,13 +21,17 @@ pub fn i3_recv(s: &mut UnixStream) -> std::io::Result<(u32, Vec<u8>)> {
 }
 
 pub fn i3_socket_path() -> String {
-    std::env::var("I3SOCK").unwrap_or_else(|_| {
-        std::process::Command::new("i3")
-            .arg("--get-socketpath")
-            .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-            .unwrap_or_default()
-    })
+    if let Ok(path) = std::env::var("I3SOCK") {
+        return path;
+    }
+    if let Ok(path) = std::env::var("SWAYSOCK") {
+        return path;
+    }
+    std::process::Command::new("i3")
+        .arg("--get-socketpath")
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default()
 }
 
 const I3_DPI_SCALE_THRESHOLD: f32 = 1.25;
@@ -49,6 +53,13 @@ pub fn bar_gap_command(dpi: f32, bar_width: u32, outer_gap: u32) -> String {
     } else {
         format!("gaps left current set {left}; gaps top current set {og}; gaps right current set {og}; gaps bottom current set {og}")
     }
+}
+
+/// Returns true when gap commands should be sent — only in X11/i3 mode where the WM
+/// needs IPC gap commands to reserve sidebar space. In Wayland mode the layer-shell
+/// exclusive zone handles this, so output is always "".
+pub fn should_apply_bar_gap(output: &str) -> bool {
+    !output.is_empty()
 }
 
 pub fn apply_bar_gap(socket: &str, dpi: f32, bar_width: u32, outer_gap: u32) {
@@ -76,6 +87,21 @@ pub fn switch_workspace(socket: &str, name: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn should_apply_bar_gap_returns_false_for_empty_output() {
+        assert!(!should_apply_bar_gap(""));
+    }
+
+    #[test]
+    fn should_apply_bar_gap_returns_true_for_named_output() {
+        assert!(should_apply_bar_gap("X11-1"));
+    }
+
+    #[test]
+    fn should_apply_bar_gap_returns_true_for_randr_output() {
+        assert!(should_apply_bar_gap("DP-2"));
+    }
 
     #[test]
     fn bar_gap_command_sets_only_left_when_outer_gap_zero() {

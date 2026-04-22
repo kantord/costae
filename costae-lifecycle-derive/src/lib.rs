@@ -17,7 +17,7 @@ pub fn lifecycle_trace(_attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 
     let entering: ImplItem = syn::parse_quote! {
-        fn wrap_enter(self, ctx: &Self::Context, output: &Self::Output) -> Result<Self::State, Self::Error> {
+        fn wrap_enter(self, ctx: &mut Self::Context, output: &mut Self::Output) -> Result<Self::State, Self::Error> {
             let _lc = self.lifecycle_context();
             let _key = self.key();
             let _meta = serde_json::to_string(&_lc.metadata).unwrap_or_default();
@@ -31,7 +31,7 @@ pub fn lifecycle_trace(_attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     let reconciling: ImplItem = syn::parse_quote! {
-        fn wrap_reconcile(self, state: &mut Self::State, ctx: &Self::Context, output: &Self::Output) -> Result<(), Self::Error> {
+        fn wrap_reconcile(self, state: &mut Self::State, ctx: &mut Self::Context, output: &mut Self::Output) -> Result<(), Self::Error> {
             let _lc = self.lifecycle_context();
             let _key = self.key();
             let _meta = serde_json::to_string(&_lc.metadata).unwrap_or_default();
@@ -44,7 +44,7 @@ pub fn lifecycle_trace(_attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     let exiting: ImplItem = syn::parse_quote! {
-        fn wrap_exit(state: Self::State, ctx: &Self::Context) -> Result<(), Self::Error> {
+        fn wrap_exit(state: Self::State, ctx: &mut Self::Context) -> Result<(), Self::Error> {
             let _lc = Self::lifecycle_state_context(&state);
             let _meta = serde_json::to_string(&_lc.metadata).unwrap_or_default();
             let result = Self::exit(state, ctx);

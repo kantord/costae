@@ -243,6 +243,14 @@ enum Outcome<E> {
 }
 ```
 
+> **Design note (added after initial draft):** `Outcome<E>` as a fixed enum may be too
+> prescriptive. Different `Lifecycle` domains have different error semantics — panel
+> creation (Retry makes sense), data streams (Fatal may be right), render stages (no
+> error state at all). Consider making `Outcome` an **associated type** on `Lifecycle`
+> rather than a fixed enum, so each domain defines its own outcome space. The Ok/Retry/Fatal
+> taxonomy above remains a useful concrete implementation for most cases but should not be
+> the only option the framework allows.
+
 Mapping:
 - **`Ok`**: happy path
 - **`Retry`**: rate limited, temporarily unavailable, still initialising, backoff period.

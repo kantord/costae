@@ -1,10 +1,13 @@
 pub mod jsx;
 pub mod data;
+pub mod display_manager;
 pub mod layout;
+pub mod panel;
 pub mod render;
 pub mod modules;
 pub mod x11;
 pub mod managed_set;
+pub mod windowing;
 
 pub use takumi::GlobalContext;
 pub use takumi::rendering::MeasuredNode;
@@ -12,16 +15,19 @@ pub use takumi::rendering::MeasuredNode;
 // layout
 pub use layout::{
     PanelAnchor,
-    PanelSpec,
+    PanelSpecData,
     parse_layout,
     parse_root_node,
 };
 
+// panel — generic PanelSpec<DM>
+pub use panel::PanelSpec;
+
 // managed_set
 pub use managed_set::ManagedSet;
 
-// x11 panel context
-pub use x11::panel::PanelContext;
+// panel module — unified context and lifecycle
+pub use panel::{PanelContext, X11PanelContext, WaylandPanelContext, WaylandPanel};
 
 // render
 pub use render::{
