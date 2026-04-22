@@ -19,4 +19,5 @@ pub trait DisplayManager {
     fn update_dimensions(&mut self, panel: &mut Self::Panel, spec: &PanelSpecData) -> Result<(), Self::Error>;
     fn update_image(&mut self, panel: &mut Self::Panel, bgrx: &[u8]) -> Result<(), Self::Error>;
     fn delete_window(&mut self, panel: Self::Panel) -> Result<(), Self::Error>;
+    fn flush(&mut self) {}
 }

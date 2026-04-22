@@ -1,19 +1,5 @@
 pub mod wayland;
 
-/// Platform tag identifying which display backend owns a panel.
-/// Carries no live connection state — the real connection lives in `TickState`.
-/// This keeps `DisplayContext` freely constructible in tests without a display.
-#[derive(Debug)]
-pub enum DisplayContext {
-    X11,
-    Wayland,
-}
-
-impl DisplayContext {
-    pub fn test_x11() -> Self { DisplayContext::X11 }
-    pub fn test_wayland() -> Self { DisplayContext::Wayland }
-}
-
 #[derive(Debug)]
 pub enum MouseButton {
     Left,

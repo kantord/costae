@@ -1,5 +1,4 @@
 use takumi::layout::node::Node;
-use crate::windowing::DisplayContext;
 
 /// Which screen edge a panel is anchored to. Drives both window placement and EWMH strut
 /// reservation. Panels without an anchor are free-floating (no strut).
@@ -44,24 +43,6 @@ pub struct PanelSpecData {
     pub above: bool,
     /// The layout subtree that lives inside this panel (first child of the panel node).
     pub content: serde_json::Value,
-}
-
-/// Platform-tagged panel specification. Wraps `PanelSpecData` with the display backend
-/// that should own the panel window.
-#[derive(Debug)]
-pub enum PanelSpec {
-    X11(PanelSpecData),
-    Wayland(PanelSpecData),
-}
-
-impl PanelSpec {
-    /// Create a `PanelSpec` variant matching the given `DisplayContext`.
-    pub fn for_context(data: PanelSpecData, ctx: &DisplayContext) -> Self {
-        match ctx {
-            DisplayContext::X11 => PanelSpec::X11(data),
-            DisplayContext::Wayland => PanelSpec::Wayland(data),
-        }
-    }
 }
 
 pub fn parse_layout(value: &serde_json::Value) -> Result<Node, serde_json::Error> {

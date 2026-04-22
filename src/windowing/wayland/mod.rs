@@ -344,6 +344,10 @@ impl DisplayManager for WaylandDisplayServer {
         // Panel is dropped here by ownership transfer; cleanup is implicit
         Ok(())
     }
+
+    fn flush(&mut self) {
+        let _ = self.conn.flush();
+    }
 }
 
 // ---------------------------------------------------------------------------

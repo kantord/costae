@@ -214,6 +214,10 @@ pub struct X11PanelContext {
     pub strut_atom: u32,
     pub strut_legacy_atom: u32,
     pub output_map: Arc<HashMap<String, (i16, i16, u32, u32)>>,
+    pub dpi: f32,
+    pub output_name: String,
+    pub screen_width_logical: u32,
+    pub screen_height_logical: u32,
 }
 
 /// Backward-compatible alias so callers that import `x11::panel::PanelContext` still compile.
@@ -317,7 +321,12 @@ impl DisplayManager for X11PanelContext {
 
     fn create_window(&mut self, spec: &PanelSpecData) -> Result<Panel, anyhow::Error> {
         init_global_ctx();
-        create_panel(spec, self)
+        let mut panel = create_panel(spec, self)?;
+        if !spec.content.is_null() {
+            preload_layout_images(&spec.content);
+            panel.raw_layout = Some(spec.content.clone());
+        }
+        Ok(panel)
     }
 
     fn delete_window(&mut self, panel: Panel) -> Result<(), anyhow::Error> {
@@ -371,6 +380,12 @@ impl DisplayManager for X11PanelContext {
     }
 
     fn update_dimensions(&mut self, panel: &mut Panel, spec: &PanelSpecData) -> Result<(), anyhow::Error> {
+        if !spec.content.is_null() {
+            preload_layout_images(&spec.content);
+            panel.raw_layout = Some(spec.content.clone());
+            panel.render_cache = RenderCache::new(30);
+        }
+
         let new_phys_width = (spec.width as f32 * self.dpr).round() as u32;
         let new_phys_height = (spec.height as f32 * self.dpr).round() as u32;
 
@@ -403,6 +418,10 @@ impl DisplayManager for X11PanelContext {
 
         Ok(())
     }
+
+    fn flush(&mut self) {
+        let _ = self.conn.flush();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -428,6 +447,10 @@ fn _check_panel_context_fields(ctx: PanelContext) {
     let _ = ctx.strut_atom;
     let _ = ctx.strut_legacy_atom;
     let _ = ctx.output_map;
+    let _ = ctx.dpi;
+    let _ = ctx.output_name;
+    let _ = ctx.screen_width_logical;
+    let _ = ctx.screen_height_logical;
 }
 
 #[cfg(test)]
@@ -480,6 +503,10 @@ mod tests {
             strut_atom,
             strut_legacy_atom,
             output_map: Arc::new(HashMap::new()),
+            dpi: 96.0,
+            output_name: String::new(),
+            screen_width_logical: mon_width,
+            screen_height_logical: mon_height,
         })
     }
 
@@ -834,6 +861,62 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
+    // R1b: DisplayManager::update_dimensions sets raw_layout when content is
+    // not null JSON.
+    // ---------------------------------------------------------------------------
+    #[test]
+    fn display_manager_update_dimensions_sets_raw_layout_when_content_is_not_null() {
+        use crate::display_manager::DisplayManager;
+
+        let mut ctx = match make_panel_ctx() {
+            Some(c) => c,
+            None => {
+                println!("SKIP: no X11 display available");
+                return;
+            }
+        };
+
+        // Create the window with null content so raw_layout starts as None.
+        let spec_no_content = make_spec("dm-upd-raw-layout", 200, 30);
+        let mut panel = <super::X11PanelContext as DisplayManager>::create_window(
+            &mut ctx,
+            &spec_no_content,
+        )
+        .expect("create_window should succeed when X11 is available");
+
+        // Build a spec with non-null content.
+        let expected_content = serde_json::json!({"type": "container"});
+        let spec_with_content = crate::layout::PanelSpecData {
+            id: "dm-upd-raw-layout".to_string(),
+            anchor: None,
+            width: 200,
+            height: 30,
+            x: 0,
+            y: 0,
+            outer_gap: 0,
+            output: None,
+            above: false,
+            content: expected_content.clone(),
+        };
+
+        <super::X11PanelContext as DisplayManager>::update_dimensions(
+            &mut ctx,
+            &mut panel,
+            &spec_with_content,
+        )
+        .expect("update_dimensions should succeed");
+
+        assert_eq!(
+            panel.raw_layout,
+            Some(expected_content),
+            "update_dimensions should set raw_layout to Some(spec.content) when content is not null"
+        );
+
+        // Cleanup
+        let _ = <super::X11PanelContext as DisplayManager>::delete_window(&mut ctx, panel);
+    }
+
+    // ---------------------------------------------------------------------------
     // R2: DisplayManager::update_position moves the window and updates state.
     // ---------------------------------------------------------------------------
     #[test]
@@ -873,6 +956,49 @@ mod tests {
         // With dpr=1.0, mon_x=0, mon_y=0: win_x = 0 + (50 * 1.0) = 50, win_y = 0 + (20 * 1.0) = 20
         assert_eq!(panel.win_x, 50, "win_x should be updated to 50 after update_position");
         assert_eq!(panel.win_y, 20, "win_y should be updated to 20 after update_position");
+
+        // Cleanup
+        let _ = <super::X11PanelContext as DisplayManager>::delete_window(&mut ctx, panel);
+    }
+
+    // ---------------------------------------------------------------------------
+    // Claim H: create_window sets raw_layout to Some(spec.content) when
+    // spec.content is not null JSON.
+    // ---------------------------------------------------------------------------
+    #[test]
+    fn create_window_sets_raw_layout_when_content_is_not_null() {
+        use crate::display_manager::DisplayManager;
+
+        let mut ctx = match make_panel_ctx() {
+            Some(c) => c,
+            None => {
+                println!("SKIP: no X11 display available");
+                return;
+            }
+        };
+
+        let expected_content = serde_json::json!({"type": "container"});
+        let spec = crate::layout::PanelSpecData {
+            id: "dm-create-raw-layout".to_string(),
+            anchor: None,
+            width: 200,
+            height: 30,
+            x: 0,
+            y: 0,
+            outer_gap: 0,
+            output: None,
+            above: false,
+            content: expected_content.clone(),
+        };
+
+        let panel = <super::X11PanelContext as DisplayManager>::create_window(&mut ctx, &spec)
+            .expect("create_window should succeed when X11 is available");
+
+        assert_eq!(
+            panel.raw_layout,
+            Some(expected_content),
+            "raw_layout should be set to Some(spec.content) after create_window"
+        );
 
         // Cleanup
         let _ = <super::X11PanelContext as DisplayManager>::delete_window(&mut ctx, panel);

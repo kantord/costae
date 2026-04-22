@@ -117,6 +117,8 @@ mod tests {
             self.calls.push("delete_window");
             Ok(())
         }
+
+        fn flush(&mut self) {}
     }
 
     fn make_spec_data(id: &str) -> PanelSpecData {
@@ -209,6 +211,10 @@ impl X11PanelContext {
             strut_atom,
             strut_legacy_atom,
             output_map: std::sync::Arc::new(HashMap::new()),
+            dpi: 96.0,
+            output_name: String::new(),
+            screen_width_logical: 1920,
+            screen_height_logical: 1080,
         }
     }
 }
