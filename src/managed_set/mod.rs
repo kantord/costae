@@ -1,11 +1,16 @@
 use std::collections::HashMap;
-use std::fmt::Debug;
+use std::fmt::{Debug, Display};
 use std::hash::Hash;
 
 pub mod reconcile;
 pub use reconcile::{Reconcile, ReconcileErrors};
 
-pub trait Lifecycle {
+pub struct LifecycleContext {
+    pub display_name: String,
+    pub metadata: serde_json::Map<String, serde_json::Value>,
+}
+
+pub trait Lifecycle: Display {
     /// Stable identity for this item. Forms a segment in the `KeyPath` used to address
     /// this item's logs and status in a supervisor tree.
     type Key: Hash + Eq + Clone + serde::Serialize + serde::de::DeserializeOwned;
@@ -27,8 +32,47 @@ pub trait Lifecycle {
     fn reconcile_self(self, state: &mut Self::State, ctx: &Self::Context, output: &Self::Output) -> Result<(), Self::Error>;
 
     /// Called when this item leaves the desired set or after a failed `reconcile_self`.
-    /// An `Err` return signals a zombie — cleanup did not complete cleanly.
+    /// An `Err` return signals a zombie - cleanup did not complete cleanly.
     fn exit(state: Self::State, ctx: &Self::Context) -> Result<(), Self::Error>;
+
+    fn enhance_lifecycle_context(&self, _ctx: &mut LifecycleContext) {}
+
+    fn enhance_lifecycle_state_context(_state: &Self::State, _ctx: &mut LifecycleContext) {}
+
+    fn lifecycle_context(&self) -> LifecycleContext {
+        let mut ctx = LifecycleContext {
+            display_name: self.to_string(),
+            metadata: serde_json::Map::new(),
+        };
+        self.enhance_lifecycle_context(&mut ctx);
+        ctx
+    }
+
+    fn lifecycle_state_context(state: &Self::State) -> LifecycleContext {
+        let mut ctx = LifecycleContext {
+            display_name: String::new(),
+            metadata: serde_json::Map::new(),
+        };
+        Self::enhance_lifecycle_state_context(state, &mut ctx);
+        ctx
+    }
+
+    /// Override this wrapper to inject an observability hook around `enter`.
+    fn wrap_enter(self, ctx: &Self::Context, output: &Self::Output) -> Result<Self::State, Self::Error>
+    where Self: Sized {
+        self.enter(ctx, output)
+    }
+
+    /// Override this wrapper to inject an observability hook around `reconcile_self`.
+    fn wrap_reconcile(self, state: &mut Self::State, ctx: &Self::Context, output: &Self::Output) -> Result<(), Self::Error>
+    where Self: Sized {
+        self.reconcile_self(state, ctx, output)
+    }
+
+    /// Override this wrapper to inject an observability hook around `exit`.
+    fn wrap_exit(state: Self::State, ctx: &Self::Context) -> Result<(), Self::Error> {
+        Self::exit(state, ctx)
+    }
 }
 
 pub struct ManagedSet<T: Lifecycle> {
@@ -64,7 +108,7 @@ where
             .collect();
         for key in exit_keys {
             let state = self.store.remove(&key).unwrap();
-            if let Err(e) = T::exit(state, ctx) {
+            if let Err(e) = T::wrap_exit(state, ctx) {
                 errors.push((key, e));
             }
         }
@@ -78,9 +122,9 @@ where
         for key in update_keys {
             let item = new_map.remove(&key).unwrap();
             let state = self.store.get_mut(&key).unwrap();
-            if let Err(e) = item.reconcile_self(state, ctx, output) {
+            if let Err(e) = item.wrap_reconcile(state, ctx, output) {
                 let old_state = self.store.remove(&key).unwrap();
-                if let Err(exit_e) = T::exit(old_state, ctx) {
+                if let Err(exit_e) = T::wrap_exit(old_state, ctx) {
                     errors.push((key.clone(), exit_e));
                 }
                 errors.push((key, e));
@@ -95,7 +139,7 @@ where
             .collect();
         for key in enter_keys {
             let item = new_map.remove(&key).unwrap();
-            match item.enter(ctx, output) {
+            match item.wrap_enter(ctx, output) {
                 Ok(state) => { self.store.insert(key, state); }
                 Err(e) => { errors.push((key, e)); }
             }
@@ -144,6 +188,10 @@ mod tests {
     struct TestSpec {
         id: String,
         value: i32,
+    }
+
+    impl std::fmt::Display for TestSpec {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "{}", self.id) }
     }
 
     impl Lifecycle for TestSpec {
@@ -271,6 +319,10 @@ mod tests {
             fail: bool,
         }
 
+        impl std::fmt::Display for FallibleSpec {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "{}", self.id) }
+        }
+
         #[derive(Debug, PartialEq)]
         struct FallibleError(String);
 
@@ -331,6 +383,10 @@ mod tests {
             fail_update: bool,
         }
 
+        impl std::fmt::Display for UpdateFallibleSpec {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "{}", self.id) }
+        }
+
         #[derive(Debug, PartialEq)]
         struct UpdateError(String);
 
@@ -388,6 +444,55 @@ mod tests {
         }
     }
 
+    mod lifecycle_trace_tests {
+        use super::super::*;
+        use costae_lifecycle_derive::lifecycle_trace;
+
+        struct TraceSpec {
+            id: String,
+        }
+
+        impl std::fmt::Display for TraceSpec {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "{}", self.id)
+            }
+        }
+
+        #[lifecycle_trace]
+        impl Lifecycle for TraceSpec {
+            type Key = String;
+            type State = ();
+            type Context = ();
+            type Output = ();
+            type Error = std::convert::Infallible;
+
+            fn key(&self) -> String {
+                self.id.clone()
+            }
+
+            fn enter(self, _ctx: &(), _output: &()) -> Result<(), Self::Error> {
+                Ok(())
+            }
+
+            fn reconcile_self(self, _state: &mut (), _ctx: &(), _output: &()) -> Result<(), Self::Error> {
+                Ok(())
+            }
+
+            fn exit(_state: (), _ctx: &()) -> Result<(), Self::Error> {
+                Ok(())
+            }
+        }
+
+        #[test]
+        #[tracing_test::traced_test]
+        fn lifecycle_trace_entering_emits_info_event_with_key_name_metadata() {
+            let mut ms: ManagedSet<TraceSpec> = ManagedSet::new();
+            ms.reconcile(vec![TraceSpec { id: "trace-panel".to_string() }], &(), &());
+            assert!(logs_contain("entering"), "expected an 'entering' log entry");
+            assert!(logs_contain("trace-panel"), "expected key/name 'trace-panel' in log");
+        }
+    }
+
     mod channel_output {
         use super::super::*;
         use std::sync::mpsc;
@@ -395,6 +500,10 @@ mod tests {
         #[derive(Clone)]
         struct ChannelOutputLifecycle {
             id: String,
+        }
+
+        impl std::fmt::Display for ChannelOutputLifecycle {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "{}", self.id) }
         }
 
         impl Lifecycle for ChannelOutputLifecycle {
@@ -425,9 +534,9 @@ mod tests {
 
         #[test]
         fn enter_receives_output_and_can_write_to_it() {
-            let (tx, rx) = mpsc::channel::<String>();
+            let (mut tx, rx) = mpsc::channel::<String>();
             let mut ms: ManagedSet<ChannelOutputLifecycle> = ManagedSet::new();
-            ms.reconcile(vec![ChannelOutputLifecycle { id: "o1".to_string() }], &(), &tx);
+            ms.reconcile(vec![ChannelOutputLifecycle { id: "o1".to_string() }], &(), &mut tx);
             drop(tx);
             let msgs: Vec<String> = rx.try_iter().collect();
             assert!(msgs.contains(&"entered:o1".to_string()), "enter must write to output; got: {:?}", msgs);
@@ -435,10 +544,10 @@ mod tests {
 
         #[test]
         fn exit_does_not_receive_output() {
-            let (tx, rx) = mpsc::channel::<String>();
+            let (mut tx, rx) = mpsc::channel::<String>();
             let mut ms: ManagedSet<ChannelOutputLifecycle> = ManagedSet::new();
-            ms.reconcile(vec![ChannelOutputLifecycle { id: "o2".to_string() }], &(), &tx);
-            ms.reconcile(vec![], &(), &tx);
+            ms.reconcile(vec![ChannelOutputLifecycle { id: "o2".to_string() }], &(), &mut tx);
+            ms.reconcile(vec![], &(), &mut tx);
             drop(tx);
             let msgs: Vec<String> = rx.try_iter().collect();
             assert!(!msgs.iter().any(|m| m.starts_with("exited:")), "exit must not write to output; got: {:?}", msgs);
