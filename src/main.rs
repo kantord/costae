@@ -53,8 +53,7 @@ pub(crate) fn make_wayland_mod_init(specs: &[costae::PanelSpecData]) -> serde_js
 fn apply_wayland_eval_result(
     out: &costae::jsx::EvalOutput,
     handle: &DataLoopHandle,
-    panels: &mut ManagedSet<PanelSpec<WaylandDisplayServer>>,
-    server: &mut WaylandDisplayServer,
+    panels: &mut ManagedSet<PanelSpec>,
     command_tx: &mut mpsc::Sender<costae::presentation::PanelCommand>,
 ) -> bool {
     let specs = match costae::parse_root_node(&out.layout) {
@@ -76,13 +75,16 @@ fn apply_wayland_eval_result(
         })
         .collect::<Vec<_>>();
     handle.set_desired(stream_specs);
-    log_lifecycle_errors(panels.reconcile(specs.into_iter().map(|s| PanelSpec::<WaylandDisplayServer>(s, std::marker::PhantomData)), server, command_tx));
+    log_lifecycle_errors(panels.reconcile(specs.into_iter().map(PanelSpec), &mut (), command_tx));
     true
 }
 
-struct App<DM: costae::display_manager::DisplayManager + 'static> {
+struct App<DM: costae::display_manager::DisplayManager + 'static>
+where DM::Error: std::fmt::Display
+{
     dm: DM,
-    panels: ManagedSet<PanelSpec<DM>>,
+    panels: ManagedSet<PanelSpec>,
+    presenter: costae::presentation::Presenter<DM>,
     stream_values: HashMap<(String, Option<String>), String>,
     jsx_evaluator: Option<costae::jsx::JsxEvaluator>,
     handle: DataLoopHandle,
@@ -94,9 +96,9 @@ struct App<DM: costae::display_manager::DisplayManager + 'static> {
     module_event_txs: ModuleEventTxs,
     stop: Arc<AtomicBool>,
     last_tick: Arc<std::sync::atomic::AtomicU64>,
-    // Phase 2: shadow channel. Lifecycle emissions go here alongside direct
-    // DM calls. Drained-and-discarded in tick() until Phase 3 wires a real
-    // presenter.
+    /// Command channel: pipeline writes PanelCommands, presenter drains them
+    /// inside tick(). A single mpsc on the App (both ends on the same thread
+    /// for now); Phase 4 will move the receiver end to a separate thread.
     command_tx: mpsc::Sender<costae::presentation::PanelCommand>,
     command_rx: mpsc::Receiver<costae::presentation::PanelCommand>,
 }
@@ -122,6 +124,7 @@ impl App<WaylandDisplayServer> {
         let mut state = Self {
             dm: server,
             panels: ManagedSet::new(),
+            presenter: costae::presentation::Presenter::new(),
             stream_values: HashMap::new(),
             jsx_evaluator: None,
             handle,
@@ -153,7 +156,7 @@ impl App<WaylandDisplayServer> {
         };
         match evaluator.eval(&self.stream_values) {
             Ok(out) => {
-                apply_wayland_eval_result(&out, &self.handle, &mut self.panels, &mut self.dm, &mut self.command_tx);
+                apply_wayland_eval_result(&out, &self.handle, &mut self.panels, &mut self.command_tx);
                 self.jsx_evaluator = Some(evaluator);
             }
             Err(e) => tracing::error!(error = %e, "JSX eval error"),
@@ -163,7 +166,7 @@ impl App<WaylandDisplayServer> {
     fn render_configured_panels(&mut self) {
         let dpr = 1.0_f32;
         let key = serde_json::to_value(&self.stream_values).unwrap_or_default();
-        for panel in self.panels.iter_mut().map(|(_, p)| p) {
+        for panel in self.presenter.panels.values_mut() {
             if !panel.configured { continue; }
             let layout = panel.raw_layout.as_ref().and_then(|l| {
                 parse_layout(l).map_err(|e| tracing::error!(error = %e, "layout parse error")).ok()
@@ -195,7 +198,7 @@ impl App<WaylandDisplayServer> {
             if let Some(ref evaluator) = self.jsx_evaluator {
                 match evaluator.eval(&self.stream_values) {
                     Ok(out) => {
-                        apply_wayland_eval_result(&out, &self.handle, &mut self.panels, &mut self.dm, &mut self.command_tx);
+                        apply_wayland_eval_result(&out, &self.handle, &mut self.panels, &mut self.command_tx);
                         needs_render = true;
                     }
                     Err(e) => tracing::error!(error = %e, "JSX re-eval error"),
@@ -213,7 +216,8 @@ impl App<WaylandDisplayServer> {
             self.handle.set_desired(vec![]);
             self.stream_values.clear();
             self.jsx_evaluator = None;
-            log_lifecycle_errors(self.panels.reconcile(vec![], &mut self.dm, &mut self.command_tx));
+            log_lifecycle_errors(self.panels.reconcile(vec![], &mut (), &mut self.command_tx));
+            self.presenter.drain(&self.command_rx, &mut self.dm);
             self.initial_load();
         }
 
@@ -229,7 +233,7 @@ impl App<WaylandDisplayServer> {
                                 if let Some(ref evaluator) = self.jsx_evaluator {
                                     match evaluator.eval(&self.stream_values) {
                                         Ok(out) => {
-                                            apply_wayland_eval_result(&out, &self.handle, &mut self.panels, &mut self.dm, &mut self.command_tx);
+                                            apply_wayland_eval_result(&out, &self.handle, &mut self.panels, &mut self.command_tx);
                                             needs_render = true;
                                         }
                                         Err(e) => tracing::error!(error = %e, "JSX re-eval error on output change"),
@@ -239,7 +243,7 @@ impl App<WaylandDisplayServer> {
                         }
                         WindowEvent::Click { panel_id, x_logical, y_logical, .. } => {
                             // panel_id is surface_id.to_string(); find matching panel by surface_id
-                            if let Some(panel) = self.panels.iter().map(|(_, p)| p)
+                            if let Some(panel) = self.presenter.panels.values()
                                 .find(|p| p.surface_id.to_string() == panel_id)
                             {
                                 let txs = self.module_event_txs.lock().unwrap();
@@ -260,7 +264,7 @@ impl App<WaylandDisplayServer> {
         }
 
         for (surface_id, new_size) in self.dm.take_pending_configures() {
-            for panel in self.panels.iter_mut().map(|(_, p)| p) {
+            for panel in self.presenter.panels.values_mut() {
                 if panel.surface_id != surface_id { continue; }
                 // If the compositor sent a nonzero size, use it for rendering so the buffer
                 // matches the allocated surface dimensions exactly.
@@ -271,11 +275,12 @@ impl App<WaylandDisplayServer> {
             }
         }
 
+        // Phase 3: apply emitted commands to the presenter before render.
+        self.presenter.drain(&self.command_rx, &mut self.dm);
+
         if needs_render {
             self.render_configured_panels();
         }
-        // Phase 2: drain and discard shadow commands until Phase 3 wires a presenter.
-        while self.command_rx.try_recv().is_ok() {}
     }
 }
 
@@ -338,8 +343,7 @@ fn stream_calls_to_specs(calls: &[(String, Option<String>)]) -> Vec<StreamSource
 fn apply_eval_result(
     out: &costae::jsx::EvalOutput,
     handle: &DataLoopHandle,
-    panel_set: &mut ManagedSet<PanelSpec<X11PanelContext>>,
-    panel_ctx: &mut X11PanelContext,
+    panel_set: &mut ManagedSet<PanelSpec>,
     command_tx: &mut mpsc::Sender<costae::presentation::PanelCommand>,
     mod_init_fn: &dyn Fn(&[costae::PanelSpecData]) -> serde_json::Value,
 ) -> bool {
@@ -375,8 +379,8 @@ fn apply_eval_result(
     handle.set_desired(combined);
 
     let panel_errors = panel_set.reconcile(
-        specs.into_iter().map(|s| PanelSpec::<X11PanelContext>(s, std::marker::PhantomData)),
-        panel_ctx, command_tx,
+        specs.into_iter().map(PanelSpec),
+        &mut (), command_tx,
     );
     log_lifecycle_errors(panel_errors);
     true
@@ -384,7 +388,7 @@ fn apply_eval_result(
 
 fn poll_x11_events(
     conn: &RustConnection,
-    panel_set: &mut ManagedSet<PanelSpec<X11PanelContext>>,
+    presenter_panels: &mut HashMap<String, costae::x11::panel::Panel>,
     module_event_txs: &std::sync::Mutex<HashMap<String, mpsc::Sender<serde_json::Value>>>,
     dpr: f32,
     depth: u8,
@@ -395,16 +399,16 @@ fn poll_x11_events(
     while let Some(event) = conn.poll_for_event()? {
         match event {
             x11rb::protocol::Event::Expose(e) => {
-                if let Some(panel) = panel_set.iter().find(|(_, p)| p.win_id == e.window).map(|(_, p)| p) {
+                if let Some(panel) = presenter_panels.values().find(|p| p.win_id == e.window) {
                     tracing::debug!(panel = %panel.id, win_id = panel.win_id, "expose repaint");
                     conn.put_image(ImageFormat::Z_PIXMAP, panel.win_id, panel.gc, panel.phys_width as u16, panel.phys_height as u16, 0, 0, 0, depth, &panel.bgrx[..])?;
                     conn.flush()?;
                 }
             }
             x11rb::protocol::Event::ButtonPress(e) => {
-                let panel_ids: Vec<u32> = panel_set.iter().map(|(_, p)| p.win_id).collect();
+                let panel_ids: Vec<u32> = presenter_panels.values().map(|p| p.win_id).collect();
                 tracing::debug!(event_win = e.event, x = e.event_x, y = e.event_y, known_wins = ?panel_ids, "ButtonPress");
-                if let Some(panel) = panel_set.iter().find(|(_, p)| p.win_id == e.event).map(|(_, p)| p) {
+                if let Some(panel) = presenter_panels.values().find(|p| p.win_id == e.event) {
                     let txs = module_event_txs.lock().unwrap();
                     do_hit_test(
                         &panel.raw_layout, &txs,
@@ -415,7 +419,7 @@ fn poll_x11_events(
             }
             x11rb::protocol::Event::PropertyNotify(e) => {
                 if xrootpmap_atom == Some(e.atom) {
-                    for (_, panel) in panel_set.iter_mut() {
+                    for panel in presenter_panels.values_mut() {
                         if let Some(rgba) = sample_root_bg(conn, root, panel.win_x, panel.win_y, panel.phys_width, panel.phys_height, xrootpmap_atom) {
                             panel.root_bg_rgba = rgba;
                             tracing::debug!(panel = %panel.id, "root bg updated");
@@ -633,6 +637,7 @@ impl App<X11PanelContext> {
         let mut state = Self {
             dm: panel_ctx,
             panels: ManagedSet::new(),
+            presenter: costae::presentation::Presenter::new(),
             stream_values: HashMap::new(),
             jsx_evaluator: None,
             handle,
@@ -676,7 +681,7 @@ impl App<X11PanelContext> {
             Ok(out) => {
                 tracing::debug!(elapsed_ms = t.elapsed().as_millis(), "jsx eval");
                 let make_mod_init = self.make_mod_init_fn();
-                apply_eval_result(&out, &self.handle, &mut self.panels, &mut self.dm, &mut self.command_tx, &make_mod_init);
+                apply_eval_result(&out, &self.handle, &mut self.panels, &mut self.command_tx, &make_mod_init);
                 self.jsx_evaluator = Some(evaluator);
             }
             Err(e) => tracing::error!(error = %e, "JSX eval error"),
@@ -710,7 +715,7 @@ impl App<X11PanelContext> {
                 match evaluator.eval(&self.stream_values) {
                     Ok(out) => {
                         tracing::debug!(elapsed_us = t.elapsed().as_micros(), "jsx re-eval");
-                        if apply_eval_result(&out, &self.handle, &mut self.panels, &mut self.dm, &mut self.command_tx, &make_mod_init) {
+                        if apply_eval_result(&out, &self.handle, &mut self.panels, &mut self.command_tx, &make_mod_init) {
                             needs_render = true;
                         }
                     }
@@ -729,8 +734,12 @@ impl App<X11PanelContext> {
             needs_render = true;
         }
 
+        // Phase 3: apply emitted commands to the presenter before anything
+        // that reads presenter state (poll_x11_events, render loop).
+        self.presenter.drain(&self.command_rx, &mut self.dm);
+
         match poll_x11_events(
-            &self.dm.conn, &mut self.panels, &self.module_event_txs,
+            &self.dm.conn, &mut self.presenter.panels, &self.module_event_txs,
             self.dm.dpr, self.dm.depth, self.dm.root, self.dm.xrootpmap_atom,
         ) {
             Ok(wallpaper_changed) => { if wallpaper_changed { needs_render = true; } }
@@ -739,16 +748,18 @@ impl App<X11PanelContext> {
 
         if needs_render {
             let key = serde_json::to_value(&self.stream_values).unwrap_or_default();
-            for (_, panel) in self.panels.iter_mut() {
+            let dpr = self.dm.dpr;
+            let depth = self.dm.depth;
+            for panel in self.presenter.panels.values_mut() {
                 inject_root_bg(panel.root_bg_rgba.clone(), panel.phys_width, panel.phys_height);
                 panel.bgrx = panel.render_cache.get_or_render(&key, || {
                     let t = std::time::Instant::now();
                     let layout = resolve_layout(&panel.raw_layout);
                     tracing::debug!(elapsed_us = t.elapsed().as_micros(), "resolve_layout");
-                    render_frame(layout, panel.phys_width, panel.phys_height, self.dm.dpr)
+                    render_frame(layout, panel.phys_width, panel.phys_height, dpr)
                 });
                 tracing::debug!(panel = %panel.id, win_id = panel.win_id, "put_image");
-                if let Err(e) = self.dm.conn.put_image(ImageFormat::Z_PIXMAP, panel.win_id, panel.gc, panel.phys_width as u16, panel.phys_height as u16, 0, 0, 0, self.dm.depth, &panel.bgrx[..]) {
+                if let Err(e) = self.dm.conn.put_image(ImageFormat::Z_PIXMAP, panel.win_id, panel.gc, panel.phys_width as u16, panel.phys_height as u16, 0, 0, 0, depth, &panel.bgrx[..]) {
                     tracing::error!(error = %e, "put_image failed");
                 }
             }
@@ -757,8 +768,7 @@ impl App<X11PanelContext> {
             }
             tracing::debug!("flush ok");
         }
-        // Phase 2: drain and discard shadow commands until Phase 3 wires a presenter.
-        while self.command_rx.try_recv().is_ok() {}
+        self.presenter.drain(&self.command_rx, &mut self.dm);
     }
 
     fn handle_layout_reload(&mut self, mod_init_fn: &dyn Fn(&[costae::PanelSpecData]) -> serde_json::Value) -> bool {
@@ -776,7 +786,7 @@ impl App<X11PanelContext> {
                     match costae::jsx::JsxEvaluator::new(&source, self.jsx_ctx.clone(), Some(base_dir)) {
                         Ok(evaluator) => match evaluator.eval(&self.stream_values) {
                             Ok(out) => {
-                                apply_eval_result(&out, &self.handle, &mut self.panels, &mut self.dm, &mut self.command_tx, mod_init_fn);
+                                apply_eval_result(&out, &self.handle, &mut self.panels, &mut self.command_tx, mod_init_fn);
                                 self.jsx_evaluator = Some(evaluator);
                             }
                             Err(e) => tracing::error!(error = %e, "JSX eval error"),
@@ -794,7 +804,8 @@ impl App<X11PanelContext> {
 
 impl<DM: costae::display_manager::DisplayManager + 'static> Drop for App<DM> {
     fn drop(&mut self) {
-        let panel_errors = self.panels.reconcile(vec![], &mut self.dm, &mut self.command_tx);
+        let panel_errors = self.panels.reconcile(vec![], &mut (), &mut self.command_tx);
+        self.presenter.drain(&self.command_rx, &mut self.dm);
         log_lifecycle_errors(panel_errors);
         self.dm.flush();
     }

@@ -1,6 +1,5 @@
 use std::sync::mpsc::Sender;
 
-use crate::display_manager::DisplayManager;
 use crate::layout::PanelSpecData;
 use crate::managed_set::Lifecycle;
 use crate::presentation::PanelCommand;
@@ -8,8 +7,8 @@ use crate::x11::panel::Panel;
 pub use crate::x11::panel::X11PanelContext;
 
 // ---------------------------------------------------------------------------
-// Stub Wayland types — no live connection required, used in tests and as the
-// Context type in the unified PanelContext enum.
+// Stub Wayland types — kept public for downstream code that still references
+// them. The real Wayland panel state lives in windowing::wayland.
 // ---------------------------------------------------------------------------
 
 pub struct WaylandPanelContext;
@@ -19,10 +18,6 @@ impl WaylandPanelContext {
 }
 
 pub struct WaylandPanel;
-
-// ---------------------------------------------------------------------------
-// Unified context and state enums
-// ---------------------------------------------------------------------------
 
 pub enum PanelContext {
     X11(X11PanelContext),
@@ -35,25 +30,26 @@ pub enum PanelState {
 }
 
 // ---------------------------------------------------------------------------
-// Generic PanelSpec<DM> — wraps PanelSpecData with the display manager type
-// that should own the panel window.
+// PanelSpec — pipeline-side tracker of desired panels. Emits typed
+// PanelCommand messages on lifecycle transitions; does NOT call DisplayManager
+// methods directly. The presenter (src/presentation) applies the commands to
+// an actual backend.
 // ---------------------------------------------------------------------------
 
-pub struct PanelSpec<DM>(pub PanelSpecData, pub std::marker::PhantomData<DM>);
+pub struct PanelSpec(pub PanelSpecData);
 
-impl<DM> std::fmt::Display for PanelSpec<DM> {
+impl std::fmt::Display for PanelSpec {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0.id)
     }
 }
 
-impl<DM: DisplayManager> Lifecycle for PanelSpec<DM>
-where
-    DM::Error: std::fmt::Display,
-{
+impl Lifecycle for PanelSpec {
     type Key = String;
-    type State = DM::Panel;
-    type Context = DM;
+    /// The pipeline tracks the last-reconciled spec so reconcile_self can diff
+    /// and emit Move/Resize commands only when something actually changed.
+    type State = PanelSpecData;
+    type Context = ();
     type Output = Sender<PanelCommand>;
     type Error = anyhow::Error;
 
@@ -61,84 +57,40 @@ where
         self.0.id.clone()
     }
 
-    fn enter(self, ctx: &mut DM, output: &mut Sender<PanelCommand>) -> Result<DM::Panel, anyhow::Error> {
+    fn enter(self, _ctx: &mut (), output: &mut Sender<PanelCommand>) -> Result<PanelSpecData, anyhow::Error> {
         let _ = output.send(PanelCommand::Create(self.0.clone()));
-        ctx.create_window(&self.0).map_err(|e| anyhow::anyhow!("{e}"))
+        Ok(self.0)
     }
 
-    fn reconcile_self(self, state: &mut DM::Panel, ctx: &mut DM, output: &mut Sender<PanelCommand>) -> Result<(), anyhow::Error> {
-        let _ = output.send(PanelCommand::Resize(self.0.clone()));
-        let _ = output.send(PanelCommand::Move(self.0.clone()));
-        ctx.update_dimensions(state, &self.0).map_err(|e| anyhow::anyhow!("{e}"))?;
-        ctx.update_position(state, &self.0).map_err(|e| anyhow::anyhow!("{e}"))
+    fn reconcile_self(self, state: &mut PanelSpecData, _ctx: &mut (), output: &mut Sender<PanelCommand>) -> Result<(), anyhow::Error> {
+        let resized = state.width != self.0.width || state.height != self.0.height;
+        let moved = state.x != self.0.x
+            || state.y != self.0.y
+            || state.anchor != self.0.anchor
+            || state.output != self.0.output
+            || state.outer_gap != self.0.outer_gap;
+        if resized {
+            let _ = output.send(PanelCommand::Resize(self.0.clone()));
+        }
+        if moved {
+            let _ = output.send(PanelCommand::Move(self.0.clone()));
+        }
+        *state = self.0;
+        Ok(())
     }
 
-    fn exit(state: DM::Panel, ctx: &mut DM, output: &mut Sender<PanelCommand>) -> Result<(), anyhow::Error> {
-        // Emit Delete by key. State doesn't carry the id, so the presenter
-        // looks up the panel by the id it tracked from the Create command.
-        // The spec id lives in the State via DM::Panel (X11: Panel has id; Wayland: WaylandPanel has id).
-        // For now, emit a best-effort Delete — Phase 3 will tighten this when
-        // the presenter owns the id ↔ panel mapping.
-        // TODO Phase 3: thread the id through so Delete carries it reliably.
-        let _ = output;
-        ctx.delete_window(state).map_err(|e| anyhow::anyhow!("{e}"))
+    fn exit(state: PanelSpecData, _ctx: &mut (), output: &mut Sender<PanelCommand>) -> Result<(), anyhow::Error> {
+        let _ = output.send(PanelCommand::Delete { id: state.id });
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::display_manager::DisplayManager;
     use crate::layout::PanelSpecData;
     use crate::managed_set::Lifecycle;
+    use crate::presentation::PanelCommand;
     use super::PanelSpec;
-
-    // -----------------------------------------------------------------------
-    // MockDM — records which DisplayManager methods were called; no X11/Wayland
-    // connection required.
-    // -----------------------------------------------------------------------
-    struct MockDM {
-        calls: Vec<&'static str>,
-        panel_id: u32,
-    }
-
-    impl MockDM {
-        fn new() -> Self {
-            MockDM { calls: Vec::new(), panel_id: 0 }
-        }
-    }
-
-    impl DisplayManager for MockDM {
-        type Panel = u32;
-        type Error = String;
-
-        fn create_window(&mut self, _spec: &PanelSpecData) -> Result<u32, String> {
-            self.calls.push("create_window");
-            self.panel_id += 1;
-            Ok(self.panel_id)
-        }
-
-        fn update_position(&mut self, _panel: &mut u32, _spec: &PanelSpecData) -> Result<(), String> {
-            self.calls.push("update_position");
-            Ok(())
-        }
-
-        fn update_dimensions(&mut self, _panel: &mut u32, _spec: &PanelSpecData) -> Result<(), String> {
-            self.calls.push("update_dimensions");
-            Ok(())
-        }
-
-        fn update_image(&mut self, _panel: &mut u32, _bgrx: &[u8]) -> Result<(), String> {
-            self.calls.push("update_image");
-            Ok(())
-        }
-
-        fn delete_window(&mut self, _panel: u32) -> Result<(), String> {
-            self.calls.push("delete_window");
-            Ok(())
-        }
-
-        fn flush(&mut self) {}
-    }
 
     fn make_spec_data(id: &str) -> PanelSpecData {
         PanelSpecData {
@@ -155,65 +107,65 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // Claim 1: PanelSpec::enter delegates to ctx.create_window(&spec_data)
-    //          and emits PanelCommand::Create on the output channel.
-    // -----------------------------------------------------------------------
     #[test]
-    fn panel_spec_enter_calls_create_window_and_emits_create_command() {
-        use crate::presentation::PanelCommand;
-        let mut dm = MockDM::new();
+    fn panel_spec_enter_emits_create_command_and_returns_state() {
         let (mut tx, rx) = std::sync::mpsc::channel::<PanelCommand>();
-        let spec: PanelSpec<MockDM> = PanelSpec(make_spec_data("p1"), std::marker::PhantomData);
-
-        let panel = <PanelSpec<MockDM> as Lifecycle>::enter(spec, &mut dm, &mut tx)
-            .expect("enter should succeed");
-
-        assert!(dm.calls.contains(&"create_window"), "enter must call create_window; got: {:?}", dm.calls);
-        assert_eq!(panel, 1u32, "enter must return the panel produced by create_window");
+        let spec = PanelSpec(make_spec_data("p1"));
+        let state = <PanelSpec as Lifecycle>::enter(spec, &mut (), &mut tx).expect("enter should succeed");
+        assert_eq!(state.id, "p1", "enter returns the spec data as state");
         let cmds: Vec<PanelCommand> = rx.try_iter().collect();
-        assert!(matches!(cmds.as_slice(), [PanelCommand::Create(spec)] if spec.id == "p1"),
-            "enter must emit PanelCommand::Create; got {} command(s)", cmds.len());
+        assert!(matches!(cmds.as_slice(), [PanelCommand::Create(s)] if s.id == "p1"),
+            "enter must emit exactly one Create command; got {} commands", cmds.len());
     }
 
-    // -----------------------------------------------------------------------
-    // Claim 2: PanelSpec::reconcile_self calls update_dimensions AND
-    //          update_position, and emits Resize and Move commands.
-    // -----------------------------------------------------------------------
     #[test]
-    fn panel_spec_reconcile_self_calls_dm_methods_and_emits_resize_and_move() {
-        use crate::presentation::PanelCommand;
-        let mut dm = MockDM::new();
+    fn panel_spec_reconcile_self_emits_nothing_when_unchanged() {
         let (mut tx, rx) = std::sync::mpsc::channel::<PanelCommand>();
-        let spec: PanelSpec<MockDM> = PanelSpec(make_spec_data("p2"), std::marker::PhantomData);
-        let mut panel: u32 = 42;
-
-        <PanelSpec<MockDM> as Lifecycle>::reconcile_self(spec, &mut panel, &mut dm, &mut tx)
-            .expect("reconcile_self should succeed");
-
-        assert!(dm.calls.contains(&"update_dimensions"), "reconcile_self must call update_dimensions; got: {:?}", dm.calls);
-        assert!(dm.calls.contains(&"update_position"), "reconcile_self must call update_position; got: {:?}", dm.calls);
+        let mut state = make_spec_data("p1");
+        let spec = PanelSpec(make_spec_data("p1"));
+        <PanelSpec as Lifecycle>::reconcile_self(spec, &mut state, &mut (), &mut tx).unwrap();
         let cmds: Vec<PanelCommand> = rx.try_iter().collect();
-        assert!(cmds.iter().any(|c| matches!(c, PanelCommand::Resize(s) if s.id == "p2")),
-            "reconcile_self must emit PanelCommand::Resize");
-        assert!(cmds.iter().any(|c| matches!(c, PanelCommand::Move(s) if s.id == "p2")),
-            "reconcile_self must emit PanelCommand::Move");
+        assert!(cmds.is_empty(), "reconcile_self must emit no commands when nothing changed; got {}", cmds.len());
     }
 
-    // -----------------------------------------------------------------------
-    // Claim 3: PanelSpec::exit calls ctx.delete_window(panel).
-    // -----------------------------------------------------------------------
     #[test]
-    fn panel_spec_exit_calls_delete_window() {
-        use crate::presentation::PanelCommand;
-        let mut dm = MockDM::new();
-        let (mut tx, _rx) = std::sync::mpsc::channel::<PanelCommand>();
-        let panel: u32 = 7;
+    fn panel_spec_reconcile_self_emits_resize_when_dimensions_change() {
+        let (mut tx, rx) = std::sync::mpsc::channel::<PanelCommand>();
+        let mut state = make_spec_data("p1");
+        let mut next = make_spec_data("p1");
+        next.width = 200;
+        let spec = PanelSpec(next);
+        <PanelSpec as Lifecycle>::reconcile_self(spec, &mut state, &mut (), &mut tx).unwrap();
+        let cmds: Vec<PanelCommand> = rx.try_iter().collect();
+        assert!(cmds.iter().any(|c| matches!(c, PanelCommand::Resize(s) if s.id == "p1")),
+            "reconcile_self must emit Resize when dimensions change");
+        assert!(!cmds.iter().any(|c| matches!(c, PanelCommand::Move(_))),
+            "reconcile_self must NOT emit Move when only dimensions change");
+    }
 
-        <PanelSpec<MockDM> as Lifecycle>::exit(panel, &mut dm, &mut tx)
-            .expect("exit should succeed");
+    #[test]
+    fn panel_spec_reconcile_self_emits_move_when_position_changes() {
+        let (mut tx, rx) = std::sync::mpsc::channel::<PanelCommand>();
+        let mut state = make_spec_data("p1");
+        let mut next = make_spec_data("p1");
+        next.x = 50;
+        let spec = PanelSpec(next);
+        <PanelSpec as Lifecycle>::reconcile_self(spec, &mut state, &mut (), &mut tx).unwrap();
+        let cmds: Vec<PanelCommand> = rx.try_iter().collect();
+        assert!(cmds.iter().any(|c| matches!(c, PanelCommand::Move(s) if s.id == "p1")),
+            "reconcile_self must emit Move when position changes");
+        assert!(!cmds.iter().any(|c| matches!(c, PanelCommand::Resize(_))),
+            "reconcile_self must NOT emit Resize when only position changes");
+    }
 
-        assert!(dm.calls.contains(&"delete_window"), "exit must call delete_window; got: {:?}", dm.calls);
+    #[test]
+    fn panel_spec_exit_emits_delete_with_id() {
+        let (mut tx, rx) = std::sync::mpsc::channel::<PanelCommand>();
+        let state = make_spec_data("p1");
+        <PanelSpec as Lifecycle>::exit(state, &mut (), &mut tx).unwrap();
+        let cmds: Vec<PanelCommand> = rx.try_iter().collect();
+        assert!(matches!(cmds.as_slice(), [PanelCommand::Delete { id }] if id == "p1"),
+            "exit must emit exactly one Delete command carrying the id");
     }
 }
 
