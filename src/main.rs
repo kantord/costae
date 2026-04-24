@@ -166,15 +166,24 @@ impl App<WaylandDisplayServer> {
     fn render_configured_panels(&mut self) {
         let dpr = 1.0_f32;
         let key = serde_json::to_value(&self.stream_values).unwrap_or_default();
-        for panel in self.presenter.panels.values_mut() {
+        for (id, panel) in self.presenter.panels.iter_mut() {
             if !panel.configured { continue; }
             let layout = panel.raw_layout.as_ref().and_then(|l| {
                 parse_layout(l).map_err(|e| tracing::error!(error = %e, "layout parse error")).ok()
             });
             let bgrx = render_frame(layout, panel.width, panel.height, dpr);
             let _ = key; // cache key unused for now
-            panel.render(&bgrx);
+            let _ = self.command_tx.send(costae::presentation::PanelCommand::UpdatePicture {
+                id: id.clone(),
+                frame: costae::presentation::PanelFrame {
+                    pixels: Arc::new(bgrx),
+                    width: panel.width,
+                    height: panel.height,
+                },
+            });
         }
+        self.presenter.drain(&self.command_rx, &mut self.dm);
+        self.presenter.flush_pixels(&mut self.dm);
         self.dm.flush();
     }
 
@@ -749,7 +758,6 @@ impl App<X11PanelContext> {
         if needs_render {
             let key = serde_json::to_value(&self.stream_values).unwrap_or_default();
             let dpr = self.dm.dpr;
-            let depth = self.dm.depth;
             for panel in self.presenter.panels.values_mut() {
                 inject_root_bg(panel.root_bg_rgba.clone(), panel.phys_width, panel.phys_height);
                 panel.bgrx = panel.render_cache.get_or_render(&key, || {
@@ -758,17 +766,19 @@ impl App<X11PanelContext> {
                     tracing::debug!(elapsed_us = t.elapsed().as_micros(), "resolve_layout");
                     render_frame(layout, panel.phys_width, panel.phys_height, dpr)
                 });
-                tracing::debug!(panel = %panel.id, win_id = panel.win_id, "put_image");
-                if let Err(e) = self.dm.conn.put_image(ImageFormat::Z_PIXMAP, panel.win_id, panel.gc, panel.phys_width as u16, panel.phys_height as u16, 0, 0, 0, depth, &panel.bgrx[..]) {
-                    tracing::error!(error = %e, "put_image failed");
-                }
+                tracing::debug!(panel = %panel.id, win_id = panel.win_id, "emit UpdatePicture");
+                let _ = self.command_tx.send(costae::presentation::PanelCommand::UpdatePicture {
+                    id: panel.id.clone(),
+                    frame: costae::presentation::PanelFrame {
+                        pixels: Arc::clone(&panel.bgrx),
+                        width: panel.phys_width,
+                        height: panel.phys_height,
+                    },
+                });
             }
-            if let Err(e) = self.dm.conn.flush() {
-                tracing::error!(error = %e, "flush failed");
-            }
-            tracing::debug!("flush ok");
         }
         self.presenter.drain(&self.command_rx, &mut self.dm);
+        self.presenter.flush_pixels(&mut self.dm);
     }
 
     fn handle_layout_reload(&mut self, mod_init_fn: &dyn Fn(&[costae::PanelSpecData]) -> serde_json::Value) -> bool {

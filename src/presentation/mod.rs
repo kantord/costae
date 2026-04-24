@@ -7,11 +7,13 @@ use crate::layout::PanelSpecData;
 
 /// A rasterized panel frame ready to be committed to a display.
 ///
-/// Pixel data is held behind `Arc<[u8]>` so the pipeline, the command
-/// channel, and the presenter's coalescing buffer can share one allocation.
+/// Pixel data is `Arc<Vec<u8>>` so the pipeline, the command channel, and
+/// the presenter's coalescing buffer share one allocation via ref-count.
+/// X11's existing `Panel::bgrx` is already this type, so the pipeline can
+/// clone the Arc directly with no byte copy.
 #[derive(Clone)]
 pub struct PanelFrame {
-    pub pixels: Arc<[u8]>,
+    pub pixels: Arc<Vec<u8>>,
     pub width: u32,
     pub height: u32,
 }
@@ -89,6 +91,19 @@ where DM::Error: std::fmt::Display
             }
         }
     }
+
+    /// Commit all coalesced pixel updates to the backend. Each pending entry
+    /// is fed to `DM::update_image` for the matching panel; entries for
+    /// unknown panel ids are dropped silently (likely a Delete arrived
+    /// between the UpdatePicture and this flush).
+    pub fn flush_pixels(&mut self, dm: &mut DM) {
+        for (id, frame) in self.pending_pixels.drain() {
+            let Some(panel) = self.panels.get_mut(&id) else { continue; };
+            if let Err(e) = dm.update_image(panel, &frame.pixels[..]) {
+                tracing::error!(panel = %id, error = %e, "presenter flush_pixels failed");
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -163,11 +178,43 @@ mod tests {
         let mut p: Presenter<MockDM> = Presenter::new();
         let mut dm = MockDM::new();
         p.apply(PanelCommand::Create(spec("p1")), &mut dm).unwrap();
-        let f1 = PanelFrame { pixels: Arc::from(vec![0u8; 4]), width: 1, height: 1 };
-        let f2 = PanelFrame { pixels: Arc::from(vec![1u8; 4]), width: 1, height: 1 };
+        let f1 = PanelFrame { pixels: Arc::new(vec![0u8; 4]), width: 1, height: 1 };
+        let f2 = PanelFrame { pixels: Arc::new(vec![1u8; 4]), width: 1, height: 1 };
         p.apply(PanelCommand::UpdatePicture { id: "p1".to_string(), frame: f1 }, &mut dm).unwrap();
         p.apply(PanelCommand::UpdatePicture { id: "p1".to_string(), frame: f2 }, &mut dm).unwrap();
         assert_eq!(p.pending_pixels.len(), 1, "second UpdatePicture must replace first for same id");
+    }
+
+    #[test]
+    fn presenter_flush_pixels_calls_update_image_and_clears_pending() {
+        let mut p: Presenter<MockDM> = Presenter::new();
+        let mut dm = MockDM::new();
+        p.apply(PanelCommand::Create(spec("p1")), &mut dm).unwrap();
+        let frame = PanelFrame { pixels: Arc::new(vec![42u8; 4]), width: 1, height: 1 };
+        p.apply(PanelCommand::UpdatePicture { id: "p1".to_string(), frame }, &mut dm).unwrap();
+        assert_eq!(p.pending_pixels.len(), 1, "UpdatePicture must populate pending_pixels");
+
+        p.flush_pixels(&mut dm);
+        assert!(p.pending_pixels.is_empty(), "flush_pixels must drain pending_pixels");
+        assert!(dm.calls.iter().any(|c| c.starts_with("image:")),
+            "flush_pixels must call dm.update_image; got {:?}", dm.calls);
+    }
+
+    #[test]
+    fn presenter_flush_pixels_drops_entries_for_deleted_panels() {
+        let mut p: Presenter<MockDM> = Presenter::new();
+        let mut dm = MockDM::new();
+        p.apply(PanelCommand::Create(spec("p1")), &mut dm).unwrap();
+        let frame = PanelFrame { pixels: Arc::new(vec![42u8; 4]), width: 1, height: 1 };
+        // UpdatePicture first, then Delete — pending entry should be gone after Delete.
+        p.apply(PanelCommand::UpdatePicture { id: "p1".to_string(), frame }, &mut dm).unwrap();
+        p.apply(PanelCommand::Delete { id: "p1".to_string() }, &mut dm).unwrap();
+        assert!(p.pending_pixels.is_empty(), "Delete must invalidate pending pixel entry for that id");
+
+        // flush_pixels is a no-op on the update_image path now.
+        let calls_before = dm.calls.len();
+        p.flush_pixels(&mut dm);
+        assert_eq!(dm.calls.len(), calls_before, "flush_pixels must not call update_image for a deleted panel");
     }
 
     #[test]
