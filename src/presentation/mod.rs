@@ -41,6 +41,25 @@ pub struct Presenter<DM: DisplayManager> {
     pub pending_pixels: HashMap<String, PanelFrame>,
 }
 
+/// Bundles `dm: DM` and `presenter: Presenter<DM>` so they travel together
+/// as one owned unit. Phase 4a shape: still lives on the main thread, but
+/// the App accesses DM via `self.presentation.dm` and panel state via
+/// `self.presentation.presenter.panels`. Phase 4b will spawn this struct
+/// on a dedicated thread and route commands + window events across an mpsc
+/// boundary.
+pub struct PresentationThread<DM: DisplayManager> {
+    pub dm: DM,
+    pub presenter: Presenter<DM>,
+}
+
+impl<DM: DisplayManager> PresentationThread<DM>
+where DM::Error: std::fmt::Display
+{
+    pub fn new(dm: DM) -> Self {
+        Self { dm, presenter: Presenter::new() }
+    }
+}
+
 impl<DM: DisplayManager> Default for Presenter<DM> {
     fn default() -> Self {
         Self { panels: HashMap::new(), pending_pixels: HashMap::new() }

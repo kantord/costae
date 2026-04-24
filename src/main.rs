@@ -82,9 +82,8 @@ fn apply_wayland_eval_result(
 struct App<DM: costae::display_manager::DisplayManager + 'static>
 where DM::Error: std::fmt::Display
 {
-    dm: DM,
+    presentation: costae::presentation::PresentationThread<DM>,
     panels: ManagedSet<PanelSpec>,
-    presenter: costae::presentation::Presenter<DM>,
     stream_values: HashMap<(String, Option<String>), String>,
     jsx_evaluator: Option<costae::jsx::JsxEvaluator>,
     handle: DataLoopHandle,
@@ -122,9 +121,8 @@ impl App<WaylandDisplayServer> {
         });
         let (command_tx, command_rx) = mpsc::channel();
         let mut state = Self {
-            dm: server,
+            presentation: costae::presentation::PresentationThread::new(server),
             panels: ManagedSet::new(),
-            presenter: costae::presentation::Presenter::new(),
             stream_values: HashMap::new(),
             jsx_evaluator: None,
             handle,
@@ -166,7 +164,7 @@ impl App<WaylandDisplayServer> {
     fn render_configured_panels(&mut self) {
         let dpr = 1.0_f32;
         let key = serde_json::to_value(&self.stream_values).unwrap_or_default();
-        for (id, panel) in self.presenter.panels.iter_mut() {
+        for (id, panel) in self.presentation.presenter.panels.iter_mut() {
             if !panel.configured { continue; }
             let layout = panel.raw_layout.as_ref().and_then(|l| {
                 parse_layout(l).map_err(|e| tracing::error!(error = %e, "layout parse error")).ok()
@@ -182,9 +180,9 @@ impl App<WaylandDisplayServer> {
                 },
             });
         }
-        self.presenter.drain(&self.command_rx, &mut self.dm);
-        self.presenter.flush_pixels(&mut self.dm);
-        self.dm.flush();
+        self.presentation.presenter.drain(&self.command_rx, &mut self.presentation.dm);
+        self.presentation.presenter.flush_pixels(&mut self.presentation.dm);
+        self.presentation.dm.flush();
     }
 
     fn tick(&mut self) {
@@ -226,16 +224,16 @@ impl App<WaylandDisplayServer> {
             self.stream_values.clear();
             self.jsx_evaluator = None;
             log_lifecycle_errors(self.panels.reconcile(vec![], &mut (), &mut self.command_tx));
-            self.presenter.drain(&self.command_rx, &mut self.dm);
+            self.presentation.presenter.drain(&self.command_rx, &mut self.presentation.dm);
             self.initial_load();
         }
 
-        match self.dm.dispatch() {
+        match self.presentation.dm.dispatch() {
             Ok(events) => {
                 for event in events {
                     match event {
                         WindowEvent::OutputsChanged => {
-                            if let Some((w, h)) = self.dm.primary_output_size() {
+                            if let Some((w, h)) = self.presentation.dm.primary_output_size() {
                                 self.jsx_ctx["screen_width"] = serde_json::json!(w);
                                 self.jsx_ctx["screen_height"] = serde_json::json!(h);
                                 tracing::info!(screen_width = w, screen_height = h, "Wayland output changed");
@@ -252,7 +250,7 @@ impl App<WaylandDisplayServer> {
                         }
                         WindowEvent::Click { panel_id, x_logical, y_logical, .. } => {
                             // panel_id is surface_id.to_string(); find matching panel by surface_id
-                            if let Some(panel) = self.presenter.panels.values()
+                            if let Some(panel) = self.presentation.presenter.panels.values()
                                 .find(|p| p.surface_id.to_string() == panel_id)
                             {
                                 let txs = self.module_event_txs.lock().unwrap();
@@ -272,8 +270,8 @@ impl App<WaylandDisplayServer> {
             }
         }
 
-        for (surface_id, new_size) in self.dm.take_pending_configures() {
-            for panel in self.presenter.panels.values_mut() {
+        for (surface_id, new_size) in self.presentation.dm.take_pending_configures() {
+            for panel in self.presentation.presenter.panels.values_mut() {
                 if panel.surface_id != surface_id { continue; }
                 // If the compositor sent a nonzero size, use it for rendering so the buffer
                 // matches the allocated surface dimensions exactly.
@@ -285,7 +283,7 @@ impl App<WaylandDisplayServer> {
         }
 
         // Phase 3: apply emitted commands to the presenter before render.
-        self.presenter.drain(&self.command_rx, &mut self.dm);
+        self.presentation.presenter.drain(&self.command_rx, &mut self.presentation.dm);
 
         if needs_render {
             self.render_configured_panels();
@@ -644,9 +642,8 @@ impl App<X11PanelContext> {
         let X11Init { panel_ctx, jsx_ctx } = x11;
         let (command_tx, command_rx) = mpsc::channel();
         let mut state = Self {
-            dm: panel_ctx,
+            presentation: costae::presentation::PresentationThread::new(panel_ctx),
             panels: ManagedSet::new(),
-            presenter: costae::presentation::Presenter::new(),
             stream_values: HashMap::new(),
             jsx_evaluator: None,
             handle,
@@ -666,11 +663,11 @@ impl App<X11PanelContext> {
     }
 
     fn make_mod_init_fn(&self) -> impl Fn(&[costae::PanelSpecData]) -> serde_json::Value {
-        let dpr = self.dm.dpr;
-        let dpi = self.dm.dpi;
-        let sw = self.dm.screen_width_logical;
-        let sh = self.dm.screen_height_logical;
-        let output_name = self.dm.output_name.clone();
+        let dpr = self.presentation.dm.dpr;
+        let dpi = self.presentation.dm.dpi;
+        let sw = self.presentation.dm.screen_width_logical;
+        let sh = self.presentation.dm.screen_height_logical;
+        let output_name = self.presentation.dm.output_name.clone();
         move |specs| make_mod_init_value(specs, dpr, &output_name, dpi, sw, sh)
     }
 
@@ -717,7 +714,7 @@ impl App<X11PanelContext> {
 
         if changed {
             if let Some(new_map) = rebuild_output_map_from_stream(&self.stream_values) {
-                self.dm.output_map = Arc::new(new_map);
+                self.presentation.dm.output_map = Arc::new(new_map);
             }
             if let Some(ref evaluator) = self.jsx_evaluator {
                 let t = std::time::Instant::now();
@@ -745,11 +742,11 @@ impl App<X11PanelContext> {
 
         // Phase 3: apply emitted commands to the presenter before anything
         // that reads presenter state (poll_x11_events, render loop).
-        self.presenter.drain(&self.command_rx, &mut self.dm);
+        self.presentation.presenter.drain(&self.command_rx, &mut self.presentation.dm);
 
         match poll_x11_events(
-            &self.dm.conn, &mut self.presenter.panels, &self.module_event_txs,
-            self.dm.dpr, self.dm.depth, self.dm.root, self.dm.xrootpmap_atom,
+            &self.presentation.dm.conn, &mut self.presentation.presenter.panels, &self.module_event_txs,
+            self.presentation.dm.dpr, self.presentation.dm.depth, self.presentation.dm.root, self.presentation.dm.xrootpmap_atom,
         ) {
             Ok(wallpaper_changed) => { if wallpaper_changed { needs_render = true; } }
             Err(e) => tracing::error!(error = %e, "X11 event error"),
@@ -757,8 +754,8 @@ impl App<X11PanelContext> {
 
         if needs_render {
             let key = serde_json::to_value(&self.stream_values).unwrap_or_default();
-            let dpr = self.dm.dpr;
-            for panel in self.presenter.panels.values_mut() {
+            let dpr = self.presentation.dm.dpr;
+            for panel in self.presentation.presenter.panels.values_mut() {
                 inject_root_bg(panel.root_bg_rgba.clone(), panel.phys_width, panel.phys_height);
                 panel.bgrx = panel.render_cache.get_or_render(&key, || {
                     let t = std::time::Instant::now();
@@ -777,8 +774,8 @@ impl App<X11PanelContext> {
                 });
             }
         }
-        self.presenter.drain(&self.command_rx, &mut self.dm);
-        self.presenter.flush_pixels(&mut self.dm);
+        self.presentation.presenter.drain(&self.command_rx, &mut self.presentation.dm);
+        self.presentation.presenter.flush_pixels(&mut self.presentation.dm);
     }
 
     fn handle_layout_reload(&mut self, mod_init_fn: &dyn Fn(&[costae::PanelSpecData]) -> serde_json::Value) -> bool {
@@ -815,9 +812,9 @@ impl App<X11PanelContext> {
 impl<DM: costae::display_manager::DisplayManager + 'static> Drop for App<DM> {
     fn drop(&mut self) {
         let panel_errors = self.panels.reconcile(vec![], &mut (), &mut self.command_tx);
-        self.presenter.drain(&self.command_rx, &mut self.dm);
+        self.presentation.presenter.drain(&self.command_rx, &mut self.presentation.dm);
         log_lifecycle_errors(panel_errors);
-        self.dm.flush();
+        self.presentation.dm.flush();
     }
 }
 
