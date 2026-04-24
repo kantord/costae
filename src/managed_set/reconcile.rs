@@ -52,7 +52,7 @@ mod tests {
                 Ok(())
             }
 
-            fn exit(_state: i32, ctx: &mut Ctx) -> Result<(), Infallible> {
+            fn exit(_state: i32, ctx: &mut Ctx, _output: &mut ()) -> Result<(), Infallible> {
                 ctx.lock().unwrap().push("exit".to_string());
                 Ok(())
             }

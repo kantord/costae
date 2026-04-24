@@ -24,7 +24,7 @@ impl PanelAnchor {
 
 /// Logical-pixel description of a `<panel>` node extracted from the JSX root.
 /// All dimensions are in logical pixels; the display backend scales to physical pixels.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PanelSpecData {
     pub id: String,
     pub anchor: Option<PanelAnchor>,

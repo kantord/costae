@@ -44,10 +44,10 @@ pub fn lifecycle_trace(_attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     let exiting: ImplItem = syn::parse_quote! {
-        fn wrap_exit(state: Self::State, ctx: &mut Self::Context) -> Result<(), Self::Error> {
+        fn wrap_exit(state: Self::State, ctx: &mut Self::Context, output: &mut Self::Output) -> Result<(), Self::Error> {
             let _lc = Self::lifecycle_state_context(&state);
             let _meta = serde_json::to_string(&_lc.metadata).unwrap_or_default();
-            let result = Self::exit(state, ctx);
+            let result = Self::exit(state, ctx, output);
             match &result {
                 Ok(_) => tracing::info!(display_name = %_lc.display_name, metadata = %_meta, "exiting"),
                 Err(e) => tracing::error!(display_name = %_lc.display_name, metadata = %_meta, error = %e, "exiting failed"),

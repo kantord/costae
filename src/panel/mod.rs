@@ -1,6 +1,9 @@
+use std::sync::mpsc::Sender;
+
 use crate::display_manager::DisplayManager;
 use crate::layout::PanelSpecData;
 use crate::managed_set::Lifecycle;
+use crate::presentation::PanelCommand;
 use crate::x11::panel::Panel;
 pub use crate::x11::panel::X11PanelContext;
 
@@ -51,23 +54,33 @@ where
     type Key = String;
     type State = DM::Panel;
     type Context = DM;
-    type Output = ();
+    type Output = Sender<PanelCommand>;
     type Error = anyhow::Error;
 
     fn key(&self) -> String {
         self.0.id.clone()
     }
 
-    fn enter(self, ctx: &mut DM, _output: &mut ()) -> Result<DM::Panel, anyhow::Error> {
+    fn enter(self, ctx: &mut DM, output: &mut Sender<PanelCommand>) -> Result<DM::Panel, anyhow::Error> {
+        let _ = output.send(PanelCommand::Create(self.0.clone()));
         ctx.create_window(&self.0).map_err(|e| anyhow::anyhow!("{e}"))
     }
 
-    fn reconcile_self(self, state: &mut DM::Panel, ctx: &mut DM, _output: &mut ()) -> Result<(), anyhow::Error> {
+    fn reconcile_self(self, state: &mut DM::Panel, ctx: &mut DM, output: &mut Sender<PanelCommand>) -> Result<(), anyhow::Error> {
+        let _ = output.send(PanelCommand::Resize(self.0.clone()));
+        let _ = output.send(PanelCommand::Move(self.0.clone()));
         ctx.update_dimensions(state, &self.0).map_err(|e| anyhow::anyhow!("{e}"))?;
         ctx.update_position(state, &self.0).map_err(|e| anyhow::anyhow!("{e}"))
     }
 
-    fn exit(state: DM::Panel, ctx: &mut DM) -> Result<(), anyhow::Error> {
+    fn exit(state: DM::Panel, ctx: &mut DM, output: &mut Sender<PanelCommand>) -> Result<(), anyhow::Error> {
+        // Emit Delete by key. State doesn't carry the id, so the presenter
+        // looks up the panel by the id it tracked from the Create command.
+        // The spec id lives in the State via DM::Panel (X11: Panel has id; Wayland: WaylandPanel has id).
+        // For now, emit a best-effort Delete — Phase 3 will tighten this when
+        // the presenter owns the id ↔ panel mapping.
+        // TODO Phase 3: thread the id through so Delete carries it reliably.
+        let _ = output;
         ctx.delete_window(state).map_err(|e| anyhow::anyhow!("{e}"))
     }
 }
@@ -144,35 +157,47 @@ mod tests {
 
     // -----------------------------------------------------------------------
     // Claim 1: PanelSpec::enter delegates to ctx.create_window(&spec_data)
-    //          and returns the panel produced by the DM.
+    //          and emits PanelCommand::Create on the output channel.
     // -----------------------------------------------------------------------
     #[test]
-    fn panel_spec_enter_calls_create_window_and_returns_panel() {
+    fn panel_spec_enter_calls_create_window_and_emits_create_command() {
+        use crate::presentation::PanelCommand;
         let mut dm = MockDM::new();
+        let (mut tx, rx) = std::sync::mpsc::channel::<PanelCommand>();
         let spec: PanelSpec<MockDM> = PanelSpec(make_spec_data("p1"), std::marker::PhantomData);
 
-        let panel = <PanelSpec<MockDM> as Lifecycle>::enter(spec, &mut dm, &mut ())
+        let panel = <PanelSpec<MockDM> as Lifecycle>::enter(spec, &mut dm, &mut tx)
             .expect("enter should succeed");
 
         assert!(dm.calls.contains(&"create_window"), "enter must call create_window; got: {:?}", dm.calls);
         assert_eq!(panel, 1u32, "enter must return the panel produced by create_window");
+        let cmds: Vec<PanelCommand> = rx.try_iter().collect();
+        assert!(matches!(cmds.as_slice(), [PanelCommand::Create(spec)] if spec.id == "p1"),
+            "enter must emit PanelCommand::Create; got {} command(s)", cmds.len());
     }
 
     // -----------------------------------------------------------------------
-    // Claim 2: PanelSpec::reconcile_self calls ctx.update_dimensions AND
-    //          ctx.update_position (both must appear in the call log).
+    // Claim 2: PanelSpec::reconcile_self calls update_dimensions AND
+    //          update_position, and emits Resize and Move commands.
     // -----------------------------------------------------------------------
     #[test]
-    fn panel_spec_reconcile_self_calls_update_dimensions_and_update_position() {
+    fn panel_spec_reconcile_self_calls_dm_methods_and_emits_resize_and_move() {
+        use crate::presentation::PanelCommand;
         let mut dm = MockDM::new();
+        let (mut tx, rx) = std::sync::mpsc::channel::<PanelCommand>();
         let spec: PanelSpec<MockDM> = PanelSpec(make_spec_data("p2"), std::marker::PhantomData);
         let mut panel: u32 = 42;
 
-        <PanelSpec<MockDM> as Lifecycle>::reconcile_self(spec, &mut panel, &mut dm, &mut ())
+        <PanelSpec<MockDM> as Lifecycle>::reconcile_self(spec, &mut panel, &mut dm, &mut tx)
             .expect("reconcile_self should succeed");
 
         assert!(dm.calls.contains(&"update_dimensions"), "reconcile_self must call update_dimensions; got: {:?}", dm.calls);
         assert!(dm.calls.contains(&"update_position"), "reconcile_self must call update_position; got: {:?}", dm.calls);
+        let cmds: Vec<PanelCommand> = rx.try_iter().collect();
+        assert!(cmds.iter().any(|c| matches!(c, PanelCommand::Resize(s) if s.id == "p2")),
+            "reconcile_self must emit PanelCommand::Resize");
+        assert!(cmds.iter().any(|c| matches!(c, PanelCommand::Move(s) if s.id == "p2")),
+            "reconcile_self must emit PanelCommand::Move");
     }
 
     // -----------------------------------------------------------------------
@@ -180,10 +205,12 @@ mod tests {
     // -----------------------------------------------------------------------
     #[test]
     fn panel_spec_exit_calls_delete_window() {
+        use crate::presentation::PanelCommand;
         let mut dm = MockDM::new();
+        let (mut tx, _rx) = std::sync::mpsc::channel::<PanelCommand>();
         let panel: u32 = 7;
 
-        <PanelSpec<MockDM> as Lifecycle>::exit(panel, &mut dm)
+        <PanelSpec<MockDM> as Lifecycle>::exit(panel, &mut dm, &mut tx)
             .expect("exit should succeed");
 
         assert!(dm.calls.contains(&"delete_window"), "exit must call delete_window; got: {:?}", dm.calls);

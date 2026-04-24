@@ -7,6 +7,7 @@ pub mod render;
 pub mod modules;
 pub mod x11;
 pub mod managed_set;
+pub mod presentation;
 pub mod windowing;
 
 pub use takumi::GlobalContext;

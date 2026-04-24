@@ -309,7 +309,7 @@ impl Lifecycle for PanelSpecData {
         Ok(())
     }
 
-    fn exit(state: Self::State, ctx: &mut Self::Context) -> Result<(), Self::Error> {
+    fn exit(state: Self::State, ctx: &mut Self::Context, _output: &mut Self::Output) -> Result<(), Self::Error> {
         tracing::info!(panel = %state.id, "panel destroyed");
         let _ = ctx.conn.free_gc(state.gc);
         let _ = ctx.conn.destroy_window(state.win_id);
@@ -551,7 +551,7 @@ mod tests {
         assert!(panel.phys_height > 0, "phys_height must be > 0");
 
         // Cleanup
-        let _ = <crate::layout::PanelSpecData as Lifecycle>::exit(panel, &mut ctx);
+        let _ = <crate::layout::PanelSpecData as Lifecycle>::exit(panel, &mut ctx, &mut ());
     }
 
     // ---------------------------------------------------------------------------
@@ -584,7 +584,7 @@ mod tests {
             .and_then(|c| c.reply().ok());
         assert!(before.is_some(), "window should exist before exit");
 
-        let _ = <crate::layout::PanelSpecData as Lifecycle>::exit(panel, &mut ctx);
+        let _ = <crate::layout::PanelSpecData as Lifecycle>::exit(panel, &mut ctx, &mut ());
         ctx.conn.flush().ok();
 
         // After exit the window must no longer exist.
@@ -637,7 +637,7 @@ mod tests {
         );
 
         // Cleanup
-        let _ = <crate::layout::PanelSpecData as Lifecycle>::exit(panel, &mut ctx);
+        let _ = <crate::layout::PanelSpecData as Lifecycle>::exit(panel, &mut ctx, &mut ());
     }
 
     // ---------------------------------------------------------------------------
@@ -689,7 +689,7 @@ mod tests {
         assert_eq!(geom.width, 300u16, "X11 window width should be updated to 300");
 
         // Cleanup
-        let _ = <crate::layout::PanelSpecData as Lifecycle>::exit(panel, &mut ctx);
+        let _ = <crate::layout::PanelSpecData as Lifecycle>::exit(panel, &mut ctx, &mut ());
     }
 
     // ---------------------------------------------------------------------------
@@ -718,7 +718,7 @@ mod tests {
         assert_eq!(panel.phys_width, 300, "phys_width in state should be updated to 300 after reconcile_self");
 
         // Cleanup
-        let _ = <crate::layout::PanelSpecData as Lifecycle>::exit(panel, &mut ctx);
+        let _ = <crate::layout::PanelSpecData as Lifecycle>::exit(panel, &mut ctx, &mut ());
     }
 
     // ---------------------------------------------------------------------------

@@ -32,7 +32,7 @@ pub trait Lifecycle: Display {
     fn reconcile_self(self, state: &mut Self::State, ctx: &mut Self::Context, output: &mut Self::Output) -> Result<(), Self::Error>;
 
     /// An `Err` return signals a zombie — cleanup did not complete cleanly.
-    fn exit(state: Self::State, ctx: &mut Self::Context) -> Result<(), Self::Error>;
+    fn exit(state: Self::State, ctx: &mut Self::Context, output: &mut Self::Output) -> Result<(), Self::Error>;
 
     fn enhance_lifecycle_context(&self, _ctx: &mut LifecycleContext) {}
 
@@ -69,8 +69,8 @@ pub trait Lifecycle: Display {
     }
 
     /// Override this wrapper to inject an observability hook around `exit`.
-    fn wrap_exit(state: Self::State, ctx: &mut Self::Context) -> Result<(), Self::Error> {
-        Self::exit(state, ctx)
+    fn wrap_exit(state: Self::State, ctx: &mut Self::Context, output: &mut Self::Output) -> Result<(), Self::Error> {
+        Self::exit(state, ctx, output)
     }
 }
 
@@ -100,14 +100,14 @@ where
         map
     }
 
-    fn exit_removed(&mut self, new_map: &HashMap<T::Key, T>, ctx: &mut T::Context, errors: &mut ReconcileErrors<T::Key, T::Error>) {
+    fn exit_removed(&mut self, new_map: &HashMap<T::Key, T>, ctx: &mut T::Context, output: &mut T::Output, errors: &mut ReconcileErrors<T::Key, T::Error>) {
         let exit_keys: Vec<T::Key> = self.store.keys()
             .filter(|k| !new_map.contains_key(*k))
             .cloned()
             .collect();
         for key in exit_keys {
             let state = self.store.remove(&key).unwrap();
-            if let Err(e) = T::wrap_exit(state, ctx) {
+            if let Err(e) = T::wrap_exit(state, ctx, output) {
                 errors.push((key, e));
             }
         }
@@ -123,7 +123,7 @@ where
             let state = self.store.get_mut(&key).unwrap();
             if let Err(e) = item.wrap_reconcile(state, ctx, output) {
                 let old_state = self.store.remove(&key).unwrap();
-                if let Err(exit_e) = T::wrap_exit(old_state, ctx) {
+                if let Err(exit_e) = T::wrap_exit(old_state, ctx, output) {
                     errors.push((key.clone(), exit_e));
                 }
                 errors.push((key, e));
@@ -171,7 +171,7 @@ where
     {
         let mut errors = ReconcileErrors::new();
         let mut new_map = Self::dedup_by_key(desired);
-        self.exit_removed(&new_map, ctx, &mut errors);
+        self.exit_removed(&new_map, ctx, output, &mut errors);
         self.update_existing(&mut new_map, ctx, output, &mut errors);
         self.enter_new(new_map, ctx, output, &mut errors);
         errors
@@ -215,7 +215,7 @@ mod tests {
             Ok(())
         }
 
-        fn exit(state: Self::State, ctx: &mut Self::Context) -> Result<(), Self::Error> {
+        fn exit(state: Self::State, ctx: &mut Self::Context, _output: &mut Self::Output) -> Result<(), Self::Error> {
             ctx.lock().unwrap().push(format!("exit:{}", state));
             Ok(())
         }
@@ -349,7 +349,7 @@ mod tests {
                 Ok(())
             }
 
-            fn exit(_state: String, _ctx: &mut ()) -> Result<(), FallibleError> {
+            fn exit(_state: String, _ctx: &mut (), _output: &mut Self::Output) -> Result<(), FallibleError> {
                 Ok(())
             }
         }
@@ -414,7 +414,7 @@ mod tests {
                 }
             }
 
-            fn exit(_state: String, _ctx: &mut ()) -> Result<(), UpdateError> {
+            fn exit(_state: String, _ctx: &mut (), _output: &mut Self::Output) -> Result<(), UpdateError> {
                 EXIT_CALLED.store(true, std::sync::atomic::Ordering::SeqCst);
                 Ok(())
             }
@@ -477,7 +477,7 @@ mod tests {
                 Ok(())
             }
 
-            fn exit(_state: (), _ctx: &mut ()) -> Result<(), Self::Error> {
+            fn exit(_state: (), _ctx: &mut (), _output: &mut Self::Output) -> Result<(), Self::Error> {
                 Ok(())
             }
         }
@@ -526,7 +526,7 @@ mod tests {
                 Ok(())
             }
 
-            fn exit(_state: (), _ctx: &mut ()) -> Result<(), Self::Error> {
+            fn exit(_state: (), _ctx: &mut (), _output: &mut Self::Output) -> Result<(), Self::Error> {
                 Ok(())
             }
         }

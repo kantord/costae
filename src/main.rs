@@ -55,6 +55,7 @@ fn apply_wayland_eval_result(
     handle: &DataLoopHandle,
     panels: &mut ManagedSet<PanelSpec<WaylandDisplayServer>>,
     server: &mut WaylandDisplayServer,
+    command_tx: &mut mpsc::Sender<costae::presentation::PanelCommand>,
 ) -> bool {
     let specs = match costae::parse_root_node(&out.layout) {
         Ok(s) => s,
@@ -75,7 +76,7 @@ fn apply_wayland_eval_result(
         })
         .collect::<Vec<_>>();
     handle.set_desired(stream_specs);
-    log_lifecycle_errors(panels.reconcile(specs.into_iter().map(|s| PanelSpec::<WaylandDisplayServer>(s, std::marker::PhantomData)), server, &mut ()));
+    log_lifecycle_errors(panels.reconcile(specs.into_iter().map(|s| PanelSpec::<WaylandDisplayServer>(s, std::marker::PhantomData)), server, command_tx));
     true
 }
 
@@ -93,6 +94,11 @@ struct App<DM: costae::display_manager::DisplayManager + 'static> {
     module_event_txs: ModuleEventTxs,
     stop: Arc<AtomicBool>,
     last_tick: Arc<std::sync::atomic::AtomicU64>,
+    // Phase 2: shadow channel. Lifecycle emissions go here alongside direct
+    // DM calls. Drained-and-discarded in tick() until Phase 3 wires a real
+    // presenter.
+    command_tx: mpsc::Sender<costae::presentation::PanelCommand>,
+    command_rx: mpsc::Receiver<costae::presentation::PanelCommand>,
 }
 
 impl App<WaylandDisplayServer> {
@@ -112,6 +118,7 @@ impl App<WaylandDisplayServer> {
             "screen_width": screen_width,
             "screen_height": screen_height,
         });
+        let (command_tx, command_rx) = mpsc::channel();
         let mut state = Self {
             dm: server,
             panels: ManagedSet::new(),
@@ -126,6 +133,8 @@ impl App<WaylandDisplayServer> {
             module_event_txs,
             stop,
             last_tick,
+            command_tx,
+            command_rx,
         };
         state.initial_load();
         state
@@ -144,7 +153,7 @@ impl App<WaylandDisplayServer> {
         };
         match evaluator.eval(&self.stream_values) {
             Ok(out) => {
-                apply_wayland_eval_result(&out, &self.handle, &mut self.panels, &mut self.dm);
+                apply_wayland_eval_result(&out, &self.handle, &mut self.panels, &mut self.dm, &mut self.command_tx);
                 self.jsx_evaluator = Some(evaluator);
             }
             Err(e) => tracing::error!(error = %e, "JSX eval error"),
@@ -186,7 +195,7 @@ impl App<WaylandDisplayServer> {
             if let Some(ref evaluator) = self.jsx_evaluator {
                 match evaluator.eval(&self.stream_values) {
                     Ok(out) => {
-                        apply_wayland_eval_result(&out, &self.handle, &mut self.panels, &mut self.dm);
+                        apply_wayland_eval_result(&out, &self.handle, &mut self.panels, &mut self.dm, &mut self.command_tx);
                         needs_render = true;
                     }
                     Err(e) => tracing::error!(error = %e, "JSX re-eval error"),
@@ -204,7 +213,7 @@ impl App<WaylandDisplayServer> {
             self.handle.set_desired(vec![]);
             self.stream_values.clear();
             self.jsx_evaluator = None;
-            log_lifecycle_errors(self.panels.reconcile(vec![], &mut self.dm, &mut ()));
+            log_lifecycle_errors(self.panels.reconcile(vec![], &mut self.dm, &mut self.command_tx));
             self.initial_load();
         }
 
@@ -220,7 +229,7 @@ impl App<WaylandDisplayServer> {
                                 if let Some(ref evaluator) = self.jsx_evaluator {
                                     match evaluator.eval(&self.stream_values) {
                                         Ok(out) => {
-                                            apply_wayland_eval_result(&out, &self.handle, &mut self.panels, &mut self.dm);
+                                            apply_wayland_eval_result(&out, &self.handle, &mut self.panels, &mut self.dm, &mut self.command_tx);
                                             needs_render = true;
                                         }
                                         Err(e) => tracing::error!(error = %e, "JSX re-eval error on output change"),
@@ -265,6 +274,8 @@ impl App<WaylandDisplayServer> {
         if needs_render {
             self.render_configured_panels();
         }
+        // Phase 2: drain and discard shadow commands until Phase 3 wires a presenter.
+        while self.command_rx.try_recv().is_ok() {}
     }
 }
 
@@ -329,6 +340,7 @@ fn apply_eval_result(
     handle: &DataLoopHandle,
     panel_set: &mut ManagedSet<PanelSpec<X11PanelContext>>,
     panel_ctx: &mut X11PanelContext,
+    command_tx: &mut mpsc::Sender<costae::presentation::PanelCommand>,
     mod_init_fn: &dyn Fn(&[costae::PanelSpecData]) -> serde_json::Value,
 ) -> bool {
     let specs = match costae::parse_root_node(&out.layout) {
@@ -364,7 +376,7 @@ fn apply_eval_result(
 
     let panel_errors = panel_set.reconcile(
         specs.into_iter().map(|s| PanelSpec::<X11PanelContext>(s, std::marker::PhantomData)),
-        panel_ctx, &mut (),
+        panel_ctx, command_tx,
     );
     log_lifecycle_errors(panel_errors);
     true
@@ -617,6 +629,7 @@ impl App<X11PanelContext> {
         last_tick: Arc<std::sync::atomic::AtomicU64>,
     ) -> Self {
         let X11Init { panel_ctx, jsx_ctx } = x11;
+        let (command_tx, command_rx) = mpsc::channel();
         let mut state = Self {
             dm: panel_ctx,
             panels: ManagedSet::new(),
@@ -631,6 +644,8 @@ impl App<X11PanelContext> {
             module_event_txs,
             stop,
             last_tick,
+            command_tx,
+            command_rx,
         };
         state.initial_load();
         state
@@ -661,7 +676,7 @@ impl App<X11PanelContext> {
             Ok(out) => {
                 tracing::debug!(elapsed_ms = t.elapsed().as_millis(), "jsx eval");
                 let make_mod_init = self.make_mod_init_fn();
-                apply_eval_result(&out, &self.handle, &mut self.panels, &mut self.dm, &make_mod_init);
+                apply_eval_result(&out, &self.handle, &mut self.panels, &mut self.dm, &mut self.command_tx, &make_mod_init);
                 self.jsx_evaluator = Some(evaluator);
             }
             Err(e) => tracing::error!(error = %e, "JSX eval error"),
@@ -695,7 +710,7 @@ impl App<X11PanelContext> {
                 match evaluator.eval(&self.stream_values) {
                     Ok(out) => {
                         tracing::debug!(elapsed_us = t.elapsed().as_micros(), "jsx re-eval");
-                        if apply_eval_result(&out, &self.handle, &mut self.panels, &mut self.dm, &make_mod_init) {
+                        if apply_eval_result(&out, &self.handle, &mut self.panels, &mut self.dm, &mut self.command_tx, &make_mod_init) {
                             needs_render = true;
                         }
                     }
@@ -742,6 +757,8 @@ impl App<X11PanelContext> {
             }
             tracing::debug!("flush ok");
         }
+        // Phase 2: drain and discard shadow commands until Phase 3 wires a presenter.
+        while self.command_rx.try_recv().is_ok() {}
     }
 
     fn handle_layout_reload(&mut self, mod_init_fn: &dyn Fn(&[costae::PanelSpecData]) -> serde_json::Value) -> bool {
@@ -759,7 +776,7 @@ impl App<X11PanelContext> {
                     match costae::jsx::JsxEvaluator::new(&source, self.jsx_ctx.clone(), Some(base_dir)) {
                         Ok(evaluator) => match evaluator.eval(&self.stream_values) {
                             Ok(out) => {
-                                apply_eval_result(&out, &self.handle, &mut self.panels, &mut self.dm, mod_init_fn);
+                                apply_eval_result(&out, &self.handle, &mut self.panels, &mut self.dm, &mut self.command_tx, mod_init_fn);
                                 self.jsx_evaluator = Some(evaluator);
                             }
                             Err(e) => tracing::error!(error = %e, "JSX eval error"),
@@ -777,7 +794,7 @@ impl App<X11PanelContext> {
 
 impl<DM: costae::display_manager::DisplayManager + 'static> Drop for App<DM> {
     fn drop(&mut self) {
-        let panel_errors = self.panels.reconcile(vec![], &mut self.dm, &mut ());
+        let panel_errors = self.panels.reconcile(vec![], &mut self.dm, &mut self.command_tx);
         log_lifecycle_errors(panel_errors);
         self.dm.flush();
     }
