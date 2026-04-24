@@ -24,12 +24,27 @@ pub struct PanelFrame {
 /// discrete; the presenter applies them immediately. `UpdatePicture` is
 /// latest-wins per panel id — the presenter coalesces multiple updates and
 /// commits only the most recent one when the backend is ready.
+/// `RenderAll` tells the presenter to render every live panel and flush.
+/// `UpdateOutputMap` delivers updated monitor geometry to the X11 backend.
+/// `Shutdown` cleanly stops the presenter thread.
 pub enum PanelCommand {
     Create(PanelSpecData),
     Move(PanelSpecData),
     Resize(PanelSpecData),
     Delete { id: String },
     UpdatePicture { id: String, frame: PanelFrame },
+    RenderAll { cache_key: serde_json::Value },
+    UpdateOutputMap { map: Arc<HashMap<String, (i16, i16, u32, u32)>> },
+    Shutdown,
+}
+
+/// Events the presenter thread sends back to the pipeline.
+pub enum PresenterEvent {
+    /// A wallpaper change, compositor configure, or other backend event means
+    /// the pipeline should dispatch a new `RenderAll`.
+    NeedsRender,
+    /// Wayland: the compositor's output geometry changed.
+    OutputsChanged { screen_width: u32, screen_height: u32 },
 }
 
 /// Owns the window state (one `DM::Panel` per live panel id) and pending
@@ -97,6 +112,10 @@ where DM::Error: std::fmt::Display
             PanelCommand::UpdatePicture { id, frame } => {
                 self.pending_pixels.insert(id, frame);
             }
+            // Thread-level commands handled by the presenter thread loop, not here.
+            PanelCommand::RenderAll { .. }
+            | PanelCommand::UpdateOutputMap { .. }
+            | PanelCommand::Shutdown => {}
         }
         Ok(())
     }
