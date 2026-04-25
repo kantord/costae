@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::mpsc::Receiver;
 
 use crate::display_manager::DisplayManager;
 use crate::layout::PanelSpecData;
@@ -49,19 +48,15 @@ pub enum PresenterEvent {
 
 /// Owns the window state (one `DM::Panel` per live panel id) and pending
 /// pixel updates. Does NOT own the `DisplayManager` — callers pass `&mut DM`
-/// into `apply`/`drain`, which keeps the App free to access other DM fields
-/// (render state, conn handles) alongside the presenter in the same tick.
+/// into `apply`/`flush_pixels`.
 pub struct Presenter<DM: DisplayManager> {
     pub panels: HashMap<String, DM::Panel>,
     pub pending_pixels: HashMap<String, PanelFrame>,
 }
 
 /// Bundles `dm: DM` and `presenter: Presenter<DM>` so they travel together
-/// as one owned unit. Phase 4a shape: still lives on the main thread, but
-/// the App accesses DM via `self.presentation.dm` and panel state via
-/// `self.presentation.presenter.panels`. Phase 4b will spawn this struct
-/// on a dedicated thread and route commands + window events across an mpsc
-/// boundary.
+/// as one owned unit. Lives on a dedicated thread; the main `App` interacts
+/// with it only through `PanelCommand` / `PresenterEvent` mpsc channels.
 pub struct PresentationThread<DM: DisplayManager> {
     pub dm: DM,
     pub presenter: Presenter<DM>,
@@ -114,16 +109,6 @@ impl<DM: DisplayManager> Presenter<DM> {
             | PanelCommand::Shutdown => {}
         }
         Ok(())
-    }
-
-    /// Drain all pending commands and apply them. Per-command errors are
-    /// logged so one bad command does not abort the rest.
-    pub fn drain(&mut self, rx: &Receiver<PanelCommand>, dm: &mut DM) {
-        while let Ok(cmd) = rx.try_recv() {
-            if let Err(e) = self.apply(cmd, dm) {
-                tracing::error!(error = %e, "presenter apply failed");
-            }
-        }
     }
 
     /// Commit all coalesced pixel updates to the backend. Each pending entry
