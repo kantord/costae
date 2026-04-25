@@ -28,7 +28,7 @@ pub use panel::PanelSpec;
 pub use managed_set::ManagedSet;
 
 // panel module — unified context and lifecycle
-pub use panel::{PanelContext, X11PanelContext, WaylandPanelContext, WaylandPanel};
+pub use panel::X11PanelContext;
 
 // render
 pub use render::{

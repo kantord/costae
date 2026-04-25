@@ -14,8 +14,6 @@ use crate::display_manager::DisplayManager;
 const XRESOURCES_PROP_MAX_LEN: u32 = 65536;
 const MM_PER_INCH: f32 = 25.4;
 const FALLBACK_DPI: f32 = 96.0;
-use crate::managed_set::Lifecycle;
-use costae_lifecycle_derive::lifecycle_trace;
 use crate::render::{render_frame, init_global_ctx};
 use crate::x11::strut_partial_values_for_anchor;
 
@@ -157,89 +155,6 @@ pub struct X11PanelContext {
 /// Backward-compatible alias so callers that import `x11::panel::PanelContext` still compile.
 pub type PanelContext = X11PanelContext;
 
-#[lifecycle_trace]
-impl Lifecycle for PanelSpecData {
-    type Key = String;
-    type State = Panel;
-    type Context = X11PanelContext;
-    type Output = ();
-    type Error = anyhow::Error;
-
-    fn key(&self) -> String {
-        self.id.clone()
-    }
-
-    fn enter(self, ctx: &mut Self::Context, _output: &mut ()) -> Result<Self::State, Self::Error> {
-        init_global_ctx();
-        let panel = create_panel(&self, ctx).map_err(|e| {
-            tracing::error!(panel = %self.id, error = %e, "panel create failed");
-            e
-        })?;
-        tracing::info!(panel = %self.id, "panel created");
-        Ok(panel)
-    }
-
-    fn reconcile_self(self, state: &mut Self::State, ctx: &mut Self::Context, _output: &mut ()) -> Result<(), Self::Error> {
-        let new_phys_width = (self.width as f32 * ctx.dpr).round() as u32;
-        let new_phys_height = (self.height as f32 * ctx.dpr).round() as u32;
-
-        if new_phys_width != state.phys_width || new_phys_height != state.phys_height {
-            ctx.conn.configure_window(
-                state.win_id,
-                &ConfigureWindowAux::new()
-                    .width(new_phys_width)
-                    .height(new_phys_height),
-            )?;
-            state.phys_width = new_phys_width;
-            state.phys_height = new_phys_height;
-
-            // Recompute position using the same anchor logic as create_panel.
-            let (mon_x, mon_y, mon_width, mon_height) = self.output.as_ref()
-                .and_then(|name| ctx.output_map.get(name).copied())
-                .unwrap_or((ctx.mon_x, ctx.mon_y, ctx.mon_width, ctx.mon_height));
-
-            let (win_x, win_y) = match &self.anchor {
-                Some(PanelAnchor::Left) | Some(PanelAnchor::Top) => (mon_x, mon_y),
-                Some(PanelAnchor::Right) => (mon_x + mon_width as i16 - new_phys_width as i16, mon_y),
-                Some(PanelAnchor::Bottom) => (mon_x, mon_y + mon_height as i16 - new_phys_height as i16),
-                None => (
-                    mon_x + (self.x as f32 * ctx.dpr).round() as i16,
-                    mon_y + (self.y as f32 * ctx.dpr).round() as i16,
-                ),
-            };
-
-            if win_x != state.win_x || win_y != state.win_y {
-                ctx.conn.configure_window(
-                    state.win_id,
-                    &ConfigureWindowAux::new().x(win_x as i32).y(win_y as i32),
-                )?;
-                state.win_x = win_x;
-                state.win_y = win_y;
-            }
-
-            // Re-set strut properties if anchor is Some.
-            if let Some(anchor) = self.anchor.clone() {
-                let strut_vals = strut_partial_values_for_anchor(
-                    anchor, mon_x, mon_y, mon_width, mon_height, new_phys_width, new_phys_height,
-                );
-                ctx.conn.change_property32(PropMode::REPLACE, state.win_id, ctx.strut_atom, AtomEnum::CARDINAL, &strut_vals)?;
-                ctx.conn.change_property32(PropMode::REPLACE, state.win_id, ctx.strut_legacy_atom, AtomEnum::CARDINAL, &strut_vals[..4])?;
-            }
-
-            ctx.conn.flush()?;
-        }
-
-        Ok(())
-    }
-
-    fn exit(state: Self::State, ctx: &mut Self::Context, _output: &mut Self::Output) -> Result<(), Self::Error> {
-        tracing::info!(panel = %state.id, "panel destroyed");
-        let _ = ctx.conn.free_gc(state.gc);
-        let _ = ctx.conn.destroy_window(state.win_id);
-        Ok(())
-    }
-}
-
 impl DisplayManager for X11PanelContext {
     type Panel = Panel;
 
@@ -339,46 +254,11 @@ impl DisplayManager for X11PanelContext {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Claim A: PanelContext struct shape check (compile-time)
-// ---------------------------------------------------------------------------
-// This function is never called at runtime; it exists only to assert that
-// `PanelContext` has exactly the fields listed in the spec.  The test module
-// below will fail to compile until `PanelContext` is defined with all fields.
-#[cfg(test)]
-#[allow(dead_code)]
-fn _check_panel_context_fields(ctx: PanelContext) {
-    let _ = ctx.conn;
-    let _ = ctx.root;
-    let _ = ctx.depth;
-    let _ = ctx.root_visual;
-    let _ = ctx.black_pixel;
-    let _ = ctx.dpr;
-    let _ = ctx.mon_x;
-    let _ = ctx.mon_y;
-    let _ = ctx.mon_width;
-    let _ = ctx.mon_height;
-    let _ = ctx.xrootpmap_atom;
-    let _ = ctx.strut_atom;
-    let _ = ctx.strut_legacy_atom;
-    let _ = ctx.output_map;
-    let _ = ctx.dpi;
-    let _ = ctx.output_name;
-    let _ = ctx.screen_width_logical;
-    let _ = ctx.screen_height_logical;
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    // ---------------------------------------------------------------------------
-    // X11 Lifecycle helpers (Claim A / B / C)
-    // ---------------------------------------------------------------------------
-
-    /// Build a minimal PanelContext by connecting to X11.
-    /// Returns `None` if no display is available.
     fn make_panel_ctx() -> Option<super::PanelContext> {
         use x11rb::rust_connection::RustConnection;
         use x11rb::connection::Connection as _;
@@ -439,153 +319,6 @@ mod tests {
             above: false,
             content: serde_json::Value::Null,
         }
-    }
-
-    // ---------------------------------------------------------------------------
-    // Claim A: enter creates an X11 window (phys_width > 0 and phys_height > 0).
-    // ---------------------------------------------------------------------------
-    #[test]
-    fn lifecycle_enter_creates_x11_window() {
-        use crate::managed_set::Lifecycle;
-
-        let mut ctx = match make_panel_ctx() {
-            Some(c) => c,
-            None => {
-                println!("SKIP: no X11 display available");
-                return;
-            }
-        };
-
-        let spec = make_spec("test-enter", 200, 30);
-        let panel = <crate::layout::PanelSpecData as Lifecycle>::enter(spec, &mut ctx, &mut ())
-            .expect("enter should succeed when X11 is available");
-
-        assert!(panel.phys_width > 0, "phys_width must be > 0");
-        assert!(panel.phys_height > 0, "phys_height must be > 0");
-
-        // Cleanup
-        let _ = <crate::layout::PanelSpecData as Lifecycle>::exit(panel, &mut ctx, &mut ());
-    }
-
-    // ---------------------------------------------------------------------------
-    // Claim B: exit destroys the X11 window (get_geometry returns an error).
-    // ---------------------------------------------------------------------------
-    #[test]
-    fn lifecycle_exit_destroys_x11_window() {
-        use crate::managed_set::Lifecycle;
-        use x11rb::connection::Connection as _;
-        use x11rb::protocol::xproto::ConnectionExt as XprotoExt;
-
-        let mut ctx = match make_panel_ctx() {
-            Some(c) => c,
-            None => {
-                println!("SKIP: no X11 display available");
-                return;
-            }
-        };
-
-        let spec = make_spec("test-exit", 200, 30);
-        let panel = <crate::layout::PanelSpecData as Lifecycle>::enter(spec, &mut ctx, &mut ())
-            .expect("enter must succeed for exit test");
-
-        let win_id = panel.win_id;
-
-        // Sanity: window should exist before exit.
-        ctx.conn.flush().ok();
-        let before = XprotoExt::get_geometry(&*ctx.conn, win_id)
-            .ok()
-            .and_then(|c| c.reply().ok());
-        assert!(before.is_some(), "window should exist before exit");
-
-        let _ = <crate::layout::PanelSpecData as Lifecycle>::exit(panel, &mut ctx, &mut ());
-        ctx.conn.flush().ok();
-
-        // After exit the window must no longer exist.
-        let after = XprotoExt::get_geometry(&*ctx.conn, win_id)
-            .ok()
-            .and_then(|c| c.reply().ok());
-        assert!(after.is_none(), "get_geometry should fail after exit (window destroyed)");
-    }
-
-    // ---------------------------------------------------------------------------
-    // Claim A (compile-time): PanelContext has all required fields.
-    // The helper function `_check_panel_context_fields` above the module will
-    // cause a compile error until `PanelContext` is defined with every field.
-    // This test is a placeholder that passes once the struct compiles.
-    // ---------------------------------------------------------------------------
-    #[test]
-    fn panel_context_struct_fields_exist() {
-        // Compile-time check: the free function `_check_panel_context_fields`
-        // references every required field of PanelContext.  If any field is
-        // missing the crate will not compile and this test will not run.
-        // We just need one statement here so the test is not empty.
-        let _ = std::marker::PhantomData::<super::PanelContext>::default;
-    }
-
-    // ---------------------------------------------------------------------------
-    // Claim D: reconcile_self resizes the X11 window when width changes.
-    // ---------------------------------------------------------------------------
-    #[test]
-    fn reconcile_self_resizes_window_when_width_changes() {
-        use crate::managed_set::Lifecycle;
-        use x11rb::connection::Connection as _;
-        use x11rb::protocol::xproto::ConnectionExt as XprotoExt;
-
-        let mut ctx = match make_panel_ctx() {
-            Some(c) => c,
-            None => {
-                println!("SKIP: no X11 display available");
-                return;
-            }
-        };
-
-        let spec = make_spec("test-resize-window", 200, 30);
-        let mut panel = <crate::layout::PanelSpecData as Lifecycle>::enter(spec, &mut ctx, &mut ())
-            .expect("enter must succeed for reconcile_self resize test");
-
-        let new_spec = make_spec("test-resize-window", 300, 30);
-        <crate::layout::PanelSpecData as Lifecycle>::reconcile_self(new_spec, &mut panel, &mut ctx, &mut ())
-            .expect("reconcile_self must succeed");
-
-        ctx.conn.flush().ok();
-        let geom = XprotoExt::get_geometry(&*ctx.conn, panel.win_id)
-            .ok()
-            .and_then(|c| c.reply().ok())
-            .expect("get_geometry should succeed after reconcile_self");
-
-        assert_eq!(geom.width, 300u16, "X11 window width should be updated to 300");
-
-        // Cleanup
-        let _ = <crate::layout::PanelSpecData as Lifecycle>::exit(panel, &mut ctx, &mut ());
-    }
-
-    // ---------------------------------------------------------------------------
-    // Claim E: reconcile_self updates phys_width in state when width changes.
-    // ---------------------------------------------------------------------------
-    #[test]
-    fn reconcile_self_updates_phys_width_in_state() {
-        use crate::managed_set::Lifecycle;
-
-        let mut ctx = match make_panel_ctx() {
-            Some(c) => c,
-            None => {
-                println!("SKIP: no X11 display available");
-                return;
-            }
-        };
-
-        let spec = make_spec("test-resize-state", 200, 30);
-        let mut panel = <crate::layout::PanelSpecData as Lifecycle>::enter(spec, &mut ctx, &mut ())
-            .expect("enter must succeed for reconcile_self state test");
-
-        let new_spec = make_spec("test-resize-state", 300, 30);
-        <crate::layout::PanelSpecData as Lifecycle>::reconcile_self(new_spec, &mut panel, &mut ctx, &mut ())
-            .expect("reconcile_self must succeed");
-
-        assert_eq!(panel.phys_width, 300, "phys_width in state should be updated to 300 after reconcile_self");
-
-        // Cleanup
-        let _ = <crate::layout::PanelSpecData as Lifecycle>::exit(panel, &mut ctx, &mut ());
     }
 
     // ---------------------------------------------------------------------------
@@ -774,27 +507,4 @@ mod tests {
         let _ = <super::X11PanelContext as DisplayManager>::delete_window(&mut ctx, panel);
     }
 
-    // ---------------------------------------------------------------------------
-    // Claim B: PanelSpec implements Lifecycle with Key = String and
-    // fn key(&self) -> String returning self.id.clone().
-    // ---------------------------------------------------------------------------
-    #[test]
-    fn panel_spec_lifecycle_key_returns_id() {
-        use crate::layout::PanelSpecData;
-        use crate::managed_set::Lifecycle;
-
-        let spec = PanelSpecData {
-            id: "my-panel".to_string(),
-            anchor: None,
-            width: 100,
-            height: 30,
-            x: 0,
-            y: 0,
-            outer_gap: 0,
-            output: None,
-            above: false,
-            content: serde_json::Value::Null,
-        };
-        assert_eq!(spec.key(), "my-panel".to_string());
-    }
 }

@@ -3,31 +3,7 @@ use std::sync::mpsc::Sender;
 use crate::layout::PanelSpecData;
 use crate::managed_set::Lifecycle;
 use crate::presentation::PanelCommand;
-use crate::x11::panel::Panel;
 pub use crate::x11::panel::X11PanelContext;
-
-// ---------------------------------------------------------------------------
-// Stub Wayland types — kept public for downstream code that still references
-// them. The real Wayland panel state lives in windowing::wayland.
-// ---------------------------------------------------------------------------
-
-pub struct WaylandPanelContext;
-
-impl WaylandPanelContext {
-    pub fn test_stub() -> Self { WaylandPanelContext }
-}
-
-pub struct WaylandPanel;
-
-pub enum PanelContext {
-    X11(X11PanelContext),
-    Wayland(WaylandPanelContext),
-}
-
-pub enum PanelState {
-    X11(Panel),
-    Wayland(WaylandPanel),
-}
 
 // ---------------------------------------------------------------------------
 // PanelSpec — pipeline-side tracker of desired panels. Emits typed
@@ -182,37 +158,3 @@ mod tests {
     }
 }
 
-impl X11PanelContext {
-    pub fn test_stub() -> Self {
-        use std::collections::HashMap;
-        let (conn, screen_num) = x11rb::rust_connection::RustConnection::connect(None)
-            .expect("X11PanelContext::test_stub requires an X11 display");
-        let screen = conn.setup().roots[screen_num].clone();
-        use x11rb::connection::Connection as _;
-        use x11rb::protocol::xproto::ConnectionExt as XprotoConnExt;
-        let strut_atom = XprotoConnExt::intern_atom(&conn, false, b"_NET_WM_STRUT_PARTIAL")
-            .expect("intern_atom").reply().expect("intern_atom reply").atom;
-        let strut_legacy_atom = XprotoConnExt::intern_atom(&conn, false, b"_NET_WM_STRUT")
-            .expect("intern_atom").reply().expect("intern_atom reply").atom;
-        X11PanelContext {
-            conn: std::sync::Arc::new(conn),
-            root: screen.root,
-            depth: screen.root_depth,
-            root_visual: screen.root_visual,
-            black_pixel: screen.black_pixel,
-            dpr: 1.0,
-            mon_x: 0,
-            mon_y: 0,
-            mon_width: screen.width_in_pixels as u32,
-            mon_height: screen.height_in_pixels as u32,
-            xrootpmap_atom: None,
-            strut_atom,
-            strut_legacy_atom,
-            output_map: std::sync::Arc::new(HashMap::new()),
-            dpi: 96.0,
-            output_name: String::new(),
-            screen_width_logical: 1920,
-            screen_height_logical: 1080,
-        }
-    }
-}
