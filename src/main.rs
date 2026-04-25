@@ -283,6 +283,7 @@ fn run_wayland_presenter_thread(
 
         let PresentationThread { ref mut dm, ref mut presenter } = pt;
         presenter.flush_pixels(dm);
+        dm.flush();
     }
 }
 
