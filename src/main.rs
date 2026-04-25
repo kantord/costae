@@ -455,7 +455,6 @@ impl App {
         self.handle.set_desired(vec![]);
         self.stream_values.clear();
         self.jsx_evaluator = None;
-        log_lifecycle_errors(self.panels.reconcile(vec![], &mut (), &mut self.command_tx));
 
         if self.layout_jsx_path.exists() {
             match std::fs::read_to_string(&self.layout_jsx_path) {
