@@ -219,6 +219,7 @@ impl App {
         last_tick: Arc<std::sync::atomic::AtomicU64>,
     ) -> Self {
         let (screen_width, screen_height) = server.primary_output_size().unwrap_or((1920, 1080));
+        let initial_dpr = server.primary_output_scale();
         let jsx_ctx = serde_json::json!({
             "output": "wayland",
             "dpi": 96.0,
@@ -232,7 +233,7 @@ impl App {
             run_wayland_presenter_thread(pt, command_rx, event_tx);
         });
         let mut state = Self {
-            dpr: 1.0,
+            dpr: initial_dpr,
             dpi: 96.0,
             output_name: String::new(),
             screen_width_logical: screen_width,
@@ -360,10 +361,11 @@ impl App {
         while let Ok(event) = self.event_rx.try_recv() {
             match event {
                 PresenterEvent::NeedsRender => needs_render = true,
-                PresenterEvent::OutputsChanged { screen_width, screen_height } => {
+                PresenterEvent::OutputsChanged { screen_width, screen_height, dpr } => {
                     self.jsx_ctx["screen_width"] = serde_json::json!(screen_width);
                     self.jsx_ctx["screen_height"] = serde_json::json!(screen_height);
-                    tracing::info!(screen_width, screen_height, "Wayland output changed");
+                    self.dpr = dpr;
+                    tracing::info!(screen_width, screen_height, dpr, "Wayland output changed");
                     let eval_out = self.jsx_evaluator.as_ref().map(|e| e.eval(&self.stream_values));
                     if let Some(eval_result) = eval_out {
                         match eval_result {

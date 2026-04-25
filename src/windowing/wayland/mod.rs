@@ -59,6 +59,7 @@ pub struct WaylandPanel {
     pub width: u32,
     pub height: u32,
     pub anchor: Option<PanelAnchor>,
+    pub dpr: f32,
 }
 
 impl WaylandPanel {
@@ -195,6 +196,16 @@ impl WaylandDisplayServer {
             .map(|m| (m.dimensions.0 as u32, m.dimensions.1 as u32))
     }
 
+    /// Returns the device pixel ratio of the primary output.
+    /// Uses physical/logical width ratio if logical size is available, otherwise falls back to scale_factor.
+    pub fn primary_output_scale(&self) -> f32 {
+        let Some(output) = self.state.output_state.outputs().next() else { return 1.0; };
+        let Some(info) = self.state.output_state.info(&output) else { return 1.0; };
+        let physical_w = info.modes.iter().find(|m| m.current).map(|m| m.dimensions.0 as u32).unwrap_or(0);
+        let logical_w = info.logical_size.map(|(w, _)| w as u32).unwrap_or(0);
+        compute_output_scale(logical_w, physical_w, info.scale_factor)
+    }
+
     /// Create a Wayland layer-shell panel for the given spec.
     /// The surface won't render until the compositor sends a configure and
     /// `WaylandPanel::render` is called with pixel data.
@@ -243,6 +254,8 @@ impl WaylandDisplayServer {
 
         self.conn.flush().map_err(|e| anyhow::anyhow!("flush after create_panel: {e}"))?;
 
+        let dpr = self.primary_output_scale();
+
         Ok(WaylandPanel {
             layer_surface,
             pool,
@@ -251,6 +264,7 @@ impl WaylandDisplayServer {
             width: data.width,
             height: data.height,
             anchor: data.anchor.clone(),
+            dpr,
         })
     }
 
@@ -588,13 +602,23 @@ pub(crate) fn fixed_axis_changed(
     }
 }
 
+/// Computes the device pixel ratio from output info.
+/// If `logical_w > 0`, returns `physical_w / logical_w`; otherwise falls back to `scale_factor`.
+pub(crate) fn compute_output_scale(logical_w: u32, physical_w: u32, scale_factor: i32) -> f32 {
+    if logical_w > 0 {
+        physical_w as f32 / logical_w as f32
+    } else {
+        scale_factor as f32
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
-    use super::{anchor_for_panel, compute_set_size, fixed_axis_changed, WaylandDisplayServer};
+    use super::{anchor_for_panel, compute_output_scale, compute_set_size, fixed_axis_changed, WaylandDisplayServer};
     use crate::display_manager::DisplayManager;
     use crate::layout::{PanelAnchor, PanelSpecData};
     use smithay_client_toolkit::shell::wlr_layer::Anchor;
@@ -965,5 +989,35 @@ mod tests {
             anchor_for_panel(Some(&PanelAnchor::Bottom)),
             Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT,
         );
+    }
+
+    // ---------------------------------------------------------------------------
+    // compute_output_scale — DPR computation from physical/logical/scale_factor
+    // ---------------------------------------------------------------------------
+
+    // When logical_w > 0, the ratio physical_w / logical_w is returned as f32.
+    // logical=1920, physical=3840, scale=2 → 3840/1920 = 2.0
+    #[test]
+    fn compute_output_scale_uses_physical_over_logical_when_available() {
+        assert_eq!(compute_output_scale(1920, 3840, 2), 2.0_f32);
+    }
+
+    // Fractional DPR: logical=2560, physical=3840, scale=1 → 3840/2560 = 1.5
+    #[test]
+    fn compute_output_scale_fractional_when_logical_available() {
+        assert_eq!(compute_output_scale(2560, 3840, 1), 1.5_f32);
+    }
+
+    // When logical_w == 0, falls back to scale_factor as f32.
+    // logical=0, physical=3840, scale=2 → 2.0
+    #[test]
+    fn compute_output_scale_falls_back_to_scale_factor_when_logical_zero() {
+        assert_eq!(compute_output_scale(0, 3840, 2), 2.0_f32);
+    }
+
+    // No scaling: logical=1920, physical=1920, scale=1 → 1920/1920 = 1.0
+    #[test]
+    fn compute_output_scale_returns_one_when_no_scaling() {
+        assert_eq!(compute_output_scale(1920, 1920, 1), 1.0_f32);
     }
 }

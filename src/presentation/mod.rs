@@ -37,7 +37,7 @@ pub enum PresenterEvent {
     /// The pipeline should re-render all panels and flush.
     NeedsRender,
     /// Wayland: the compositor's output geometry changed.
-    OutputsChanged { screen_width: u32, screen_height: u32 },
+    OutputsChanged { screen_width: u32, screen_height: u32, dpr: f32 },
     /// A click event, routed back for hit-testing in the pipeline.
     Click { panel_id: String, x: f32, y: f32, phys_width: u32, phys_height: u32, dpr: f32 },
 }

@@ -43,6 +43,7 @@ pub(crate) fn run_wayland_presenter_thread(
                                 let _ = event_tx.send(PresenterEvent::OutputsChanged {
                                     screen_width: w,
                                     screen_height: h,
+                                    dpr: pt.dm.primary_output_scale(),
                                 });
                             }
                         }
@@ -56,7 +57,7 @@ pub(crate) fn run_wayland_presenter_thread(
                                     y: y_logical,
                                     phys_width: panel.width,
                                     phys_height: panel.height,
-                                    dpr: 1.0,
+                                    dpr: panel.dpr,
                                 });
                             }
                         }
