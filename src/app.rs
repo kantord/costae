@@ -398,8 +398,8 @@ impl App {
         let dpr = self.dpr;
         for (_, spec) in self.panels.iter() {
             if spec.content.is_null() { continue; }
-            let phys_width = (spec.width as f32 * dpr) as u32;
-            let phys_height = (spec.height as f32 * dpr) as u32;
+            let phys_width = (spec.width as f32 * dpr).round() as u32;
+            let phys_height = (spec.height as f32 * dpr).round() as u32;
             let layout = resolve_layout(&Some(spec.content.clone()));
             let pixels = render_frame(layout, phys_width, phys_height, dpr);
             let frame = PanelFrame { pixels: Arc::new(pixels), width: phys_width, height: phys_height };
