@@ -20,19 +20,15 @@ pub struct PanelFrame {
 /// The typed vocabulary the pipeline speaks to the presenter.
 ///
 /// Lifecycle variants (`Create`, `Move`, `Resize`, `Delete`) are ordered and
-/// discrete; the presenter applies them immediately. `UpdatePicture` is
-/// latest-wins per panel id — the presenter coalesces multiple updates and
-/// commits only the most recent one when the backend is ready.
-/// `RenderAll` tells the presenter to render every live panel and flush.
-/// `UpdateOutputMap` delivers updated monitor geometry to the X11 backend.
-/// `Shutdown` cleanly stops the presenter thread.
+/// discrete; the presenter applies them immediately. `UpdatePicture` calls
+/// `DM::update_image` directly — each update is committed to the backend as
+/// it arrives. `Shutdown` cleanly stops the presenter thread.
 pub enum PanelCommand {
     Create(PanelSpecData),
     Move(PanelSpecData),
     Resize(PanelSpecData),
     Delete { id: String },
     UpdatePicture { id: String, frame: PanelFrame },
-    RenderAll,
     Shutdown,
 }
 
@@ -46,12 +42,10 @@ pub enum PresenterEvent {
     Click { panel_id: String, x: f32, y: f32, phys_width: u32, phys_height: u32, dpr: f32 },
 }
 
-/// Owns the window state (one `DM::Panel` per live panel id) and pending
-/// pixel updates. Does NOT own the `DisplayManager` — callers pass `&mut DM`
-/// into `apply`/`flush_pixels`.
+/// Owns the window state (one `DM::Panel` per live panel id). Does NOT own
+/// the `DisplayManager` — callers pass `&mut DM` into `apply`.
 pub struct Presenter<DM: DisplayManager> {
     pub panels: HashMap<String, DM::Panel>,
-    pub pending_pixels: HashMap<String, PanelFrame>,
 }
 
 /// Bundles `dm: DM` and `presenter: Presenter<DM>` so they travel together
@@ -70,7 +64,7 @@ impl<DM: DisplayManager> PresentationThread<DM> {
 
 impl<DM: DisplayManager> Default for Presenter<DM> {
     fn default() -> Self {
-        Self { panels: HashMap::new(), pending_pixels: HashMap::new() }
+        Self { panels: HashMap::new() }
     }
 }
 
@@ -95,32 +89,20 @@ impl<DM: DisplayManager> Presenter<DM> {
                 }
             }
             PanelCommand::Delete { id } => {
-                self.pending_pixels.remove(&id);
                 if let Some(panel) = self.panels.remove(&id) {
                     dm.delete_window(panel)?;
                 }
             }
             PanelCommand::UpdatePicture { id, frame } => {
-                self.pending_pixels.insert(id, frame);
+                if let Some(panel) = self.panels.get_mut(&id) {
+                    if let Err(e) = dm.update_image(panel, &frame.pixels[..]) {
+                        tracing::error!(panel = %id, error = %e, "presenter update_image failed");
+                    }
+                }
             }
-            // Thread-level commands handled by the presenter thread loop, not here.
-            PanelCommand::RenderAll
-            | PanelCommand::Shutdown => {}
+            PanelCommand::Shutdown => {}
         }
         Ok(())
-    }
-
-    /// Commit all coalesced pixel updates to the backend. Each pending entry
-    /// is fed to `DM::update_image` for the matching panel; entries for
-    /// unknown panel ids are dropped silently (likely a Delete arrived
-    /// between the UpdatePicture and this flush).
-    pub fn flush_pixels(&mut self, dm: &mut DM) {
-        for (id, frame) in self.pending_pixels.drain() {
-            let Some(panel) = self.panels.get_mut(&id) else { continue; };
-            if let Err(e) = dm.update_image(panel, &frame.pixels[..]) {
-                tracing::error!(panel = %id, error = %e, "presenter flush_pixels failed");
-            }
-        }
     }
 }
 
@@ -191,47 +173,24 @@ mod tests {
     }
 
     #[test]
-    fn presenter_update_picture_coalesces_per_panel_id() {
-        let mut p: Presenter<MockDM> = Presenter::new();
-        let mut dm = MockDM::new();
-        p.apply(PanelCommand::Create(spec("p1")), &mut dm).unwrap();
-        let f1 = PanelFrame { pixels: Arc::new(vec![0u8; 4]), width: 1, height: 1 };
-        let f2 = PanelFrame { pixels: Arc::new(vec![1u8; 4]), width: 1, height: 1 };
-        p.apply(PanelCommand::UpdatePicture { id: "p1".to_string(), frame: f1 }, &mut dm).unwrap();
-        p.apply(PanelCommand::UpdatePicture { id: "p1".to_string(), frame: f2 }, &mut dm).unwrap();
-        assert_eq!(p.pending_pixels.len(), 1, "second UpdatePicture must replace first for same id");
-    }
-
-    #[test]
-    fn presenter_flush_pixels_calls_update_image_and_clears_pending() {
+    fn presenter_update_picture_calls_update_image_immediately() {
         let mut p: Presenter<MockDM> = Presenter::new();
         let mut dm = MockDM::new();
         p.apply(PanelCommand::Create(spec("p1")), &mut dm).unwrap();
         let frame = PanelFrame { pixels: Arc::new(vec![42u8; 4]), width: 1, height: 1 };
         p.apply(PanelCommand::UpdatePicture { id: "p1".to_string(), frame }, &mut dm).unwrap();
-        assert_eq!(p.pending_pixels.len(), 1, "UpdatePicture must populate pending_pixels");
-
-        p.flush_pixels(&mut dm);
-        assert!(p.pending_pixels.is_empty(), "flush_pixels must drain pending_pixels");
         assert!(dm.calls.iter().any(|c| c.starts_with("image:")),
-            "flush_pixels must call dm.update_image; got {:?}", dm.calls);
+            "UpdatePicture must call dm.update_image immediately; got {:?}", dm.calls);
     }
 
     #[test]
-    fn presenter_flush_pixels_drops_entries_for_deleted_panels() {
+    fn presenter_update_picture_for_unknown_panel_is_noop() {
         let mut p: Presenter<MockDM> = Presenter::new();
         let mut dm = MockDM::new();
-        p.apply(PanelCommand::Create(spec("p1")), &mut dm).unwrap();
         let frame = PanelFrame { pixels: Arc::new(vec![42u8; 4]), width: 1, height: 1 };
-        // UpdatePicture first, then Delete — pending entry should be gone after Delete.
-        p.apply(PanelCommand::UpdatePicture { id: "p1".to_string(), frame }, &mut dm).unwrap();
-        p.apply(PanelCommand::Delete { id: "p1".to_string() }, &mut dm).unwrap();
-        assert!(p.pending_pixels.is_empty(), "Delete must invalidate pending pixel entry for that id");
-
-        // flush_pixels is a no-op on the update_image path now.
-        let calls_before = dm.calls.len();
-        p.flush_pixels(&mut dm);
-        assert_eq!(dm.calls.len(), calls_before, "flush_pixels must not call update_image for a deleted panel");
+        p.apply(PanelCommand::UpdatePicture { id: "ghost".to_string(), frame }, &mut dm).unwrap();
+        assert!(!dm.calls.iter().any(|c| c.starts_with("image:")),
+            "UpdatePicture for unknown panel must not call update_image; got {:?}", dm.calls);
     }
 
     #[test]

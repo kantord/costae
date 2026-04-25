@@ -13,18 +13,9 @@ fn apply_x11_cmd(
     pt: &mut PresentationThread<X11PanelContext>,
     cmd: PanelCommand,
 ) {
-    match cmd {
-        PanelCommand::RenderAll => {
-            let PresentationThread { ref mut dm, ref mut presenter } = pt;
-            presenter.flush_pixels(dm);
-        }
-        PanelCommand::Shutdown => {}
-        cmd => {
-            let PresentationThread { ref mut dm, ref mut presenter } = pt;
-            if let Err(e) = presenter.apply(cmd, dm) {
-                tracing::error!(error = %e, "x11 presenter apply failed");
-            }
-        }
+    let PresentationThread { ref mut dm, ref mut presenter } = pt;
+    if let Err(e) = presenter.apply(cmd, dm) {
+        tracing::error!(error = %e, "x11 presenter apply failed");
     }
 }
 

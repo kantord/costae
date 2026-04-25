@@ -405,7 +405,6 @@ impl App {
             let frame = PanelFrame { pixels: Arc::new(pixels), width: phys_width, height: phys_height };
             let _ = self.command_tx.send(PanelCommand::UpdatePicture { id: spec.id.clone(), frame });
         }
-        let _ = self.command_tx.send(PanelCommand::RenderAll);
     }
 }
 

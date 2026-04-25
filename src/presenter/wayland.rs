@@ -3,27 +3,15 @@ use std::sync::mpsc;
 use costae::presentation::{PanelCommand, PresentationThread, PresenterEvent};
 use costae::windowing::wayland::WaylandDisplayServer;
 use costae::windowing::{DisplayServer, WindowEvent};
-use costae::display_manager::DisplayManager;
-
 use super::drain_commands;
 
 fn apply_wayland_cmd(
     pt: &mut PresentationThread<WaylandDisplayServer>,
     cmd: PanelCommand,
 ) {
-    match cmd {
-        PanelCommand::RenderAll => {
-            let PresentationThread { ref mut dm, ref mut presenter } = pt;
-            presenter.flush_pixels(dm);
-            dm.flush();
-        }
-        PanelCommand::Shutdown => {}
-        cmd => {
-            let PresentationThread { ref mut dm, ref mut presenter } = pt;
-            if let Err(e) = presenter.apply(cmd, dm) {
-                tracing::error!(error = %e, "wayland presenter apply failed");
-            }
-        }
+    let PresentationThread { ref mut dm, ref mut presenter } = pt;
+    if let Err(e) = presenter.apply(cmd, dm) {
+        tracing::error!(error = %e, "wayland presenter apply failed");
     }
 }
 
@@ -34,6 +22,7 @@ pub(crate) fn run_wayland_presenter_thread(
 ) {
     loop {
         if drain_commands(&command_rx, |cmd| apply_wayland_cmd(&mut pt, cmd)) { return; }
+        pt.dm.flush();
 
         for (surface_id, new_size) in pt.dm.take_pending_configures() {
             for panel in pt.presenter.panels.values_mut() {
