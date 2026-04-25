@@ -64,12 +64,13 @@ impl Lifecycle for PanelSpec {
 
     fn reconcile_self(self, state: &mut PanelSpecData, _ctx: &mut (), output: &mut Sender<PanelCommand>) -> Result<(), anyhow::Error> {
         let resized = state.width != self.0.width || state.height != self.0.height;
+        let content_changed = state.content != self.0.content;
         let moved = state.x != self.0.x
             || state.y != self.0.y
             || state.anchor != self.0.anchor
             || state.output != self.0.output
             || state.outer_gap != self.0.outer_gap;
-        if resized {
+        if resized || content_changed {
             let _ = output.send(PanelCommand::Resize(self.0.clone()));
         }
         if moved {
