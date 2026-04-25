@@ -277,7 +277,7 @@ fn run_wayland_presenter_thread(
             }
             Err(_) => {
                 tracing::info!("Wayland compositor disconnected, exiting");
-                std::process::exit(0);
+                return;
             }
         }
 
