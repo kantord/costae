@@ -23,49 +23,6 @@ fn log_lifecycle_errors<K: std::fmt::Debug, E: std::fmt::Debug>(errors: costae::
     }
 }
 
-pub(crate) fn make_wayland_mod_init(specs: &[costae::PanelSpecData]) -> serde_json::Value {
-    let spec = specs.iter()
-        .find(|p| p.anchor == Some(costae::PanelAnchor::Left))
-        .or_else(|| specs.first());
-    let (bar_w, og) = spec
-        .map(|p| (p.width, p.outer_gap))
-        .unwrap_or((250, 0));
-    serde_json::json!({
-        "type": "init",
-        "config": {"width": bar_w, "outer_gap": og},
-        "output": "",
-        "dpi": 96.0,
-    })
-}
-
-fn apply_wayland_eval_result(
-    out: &costae::jsx::EvalOutput,
-    handle: &DataLoopHandle,
-    panels: &mut ManagedSet<PanelSpec>,
-    command_tx: &mut mpsc::Sender<PanelCommand>,
-) -> bool {
-    let specs = match costae::parse_root_node(&out.layout) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!(error = %e, "root node parse error");
-            return false;
-        }
-    };
-    let mod_init = make_wayland_mod_init(&specs);
-    let stream_specs = stream_calls_to_specs(&out.stream_calls)
-        .into_iter()
-        .map(|source| match source {
-            StreamSource::Process(mut p) => {
-                p.props = Some(mod_init.clone());
-                StreamSource::Process(p)
-            }
-            other => other,
-        })
-        .collect::<Vec<_>>();
-    handle.set_desired(stream_specs);
-    log_lifecycle_errors(panels.reconcile(specs.into_iter().map(PanelSpec), &mut (), command_tx));
-    true
-}
 
 
 fn resolve_layout(raw_layout: &Option<serde_json::Value>) -> Option<takumi::layout::node::Node> {
@@ -177,9 +134,6 @@ fn make_mod_init_value(
 // App — non-generic, DM lives on the presenter thread
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum AppBackend { X11, Wayland }
-
 pub(crate) struct TickReceivers {
     pub(crate) item_rx: mpsc::Receiver<((String, Option<String>), String)>,
     pub(crate) bin_reload_rx: mpsc::Receiver<()>,
@@ -192,7 +146,6 @@ pub(crate) struct X11Init {
 }
 
 pub(crate) struct App {
-    backend: AppBackend,
     dpr: f32,
     dpi: f32,
     output_name: String,
@@ -238,7 +191,6 @@ impl App {
             run_x11_presenter_thread(pt, command_rx, event_tx);
         });
         let mut state = Self {
-            backend: AppBackend::X11,
             dpr,
             dpi,
             output_name,
@@ -287,7 +239,6 @@ impl App {
             run_wayland_presenter_thread(pt, command_rx, event_tx);
         });
         let mut state = Self {
-            backend: AppBackend::Wayland,
             dpr: 1.0,
             dpi: 96.0,
             output_name: String::new(),
@@ -315,16 +266,10 @@ impl App {
     }
 
     fn apply_eval_result_dispatch(&mut self, out: &costae::jsx::EvalOutput) -> bool {
-        match self.backend {
-            AppBackend::Wayland =>
-                apply_wayland_eval_result(out, &self.handle, &mut self.panels, &mut self.command_tx),
-            AppBackend::X11 => {
-                let (dpr, dpi, sw, sh) = (self.dpr, self.dpi, self.screen_width_logical, self.screen_height_logical);
-                let output_name = self.output_name.clone();
-                apply_eval_result(out, &self.handle, &mut self.panels, &mut self.command_tx,
-                    &move |specs| make_mod_init_value(specs, dpr, &output_name, dpi, sw, sh))
-            }
-        }
+        let (dpr, dpi, sw, sh) = (self.dpr, self.dpi, self.screen_width_logical, self.screen_height_logical);
+        let output_name = self.output_name.clone();
+        apply_eval_result(out, &self.handle, &mut self.panels, &mut self.command_tx,
+            &move |specs| make_mod_init_value(specs, dpr, &output_name, dpi, sw, sh))
     }
 
     fn initial_load(&mut self) {
@@ -476,8 +421,7 @@ impl Drop for App {
 
 #[cfg(test)]
 mod tests {
-    use super::stream_calls_to_specs;
-    use super::make_wayland_mod_init;
+    use super::{make_mod_init_value, stream_calls_to_specs};
     use costae::data::data_loop::StreamSource;
 
     fn left_spec(width: u32) -> costae::PanelSpecData {
@@ -495,41 +439,31 @@ mod tests {
         }
     }
 
+    fn wayland_mod_init(specs: &[costae::PanelSpecData]) -> serde_json::Value {
+        make_mod_init_value(specs, 1.0, "", 96.0, 0, 0)
+    }
+
     /// Claim: output field must be "" (empty string), NOT "wayland" or any compositor name.
-    /// This test would fail with the buggy implementation that returned "wayland".
+    /// fetch_workspaces in costae-i3 filters all workspaces when output is non-empty.
     #[test]
-    fn make_wayland_mod_init_output_is_empty_string() {
-        let specs = vec![left_spec(250)];
-        let result = make_wayland_mod_init(&specs);
-        assert_eq!(
-            result["output"].as_str(),
-            Some(""),
-            "output must be empty string — if it is \"wayland\", fetch_workspaces filters all workspaces",
-        );
+    fn mod_init_wayland_output_is_empty_string() {
+        let result = wayland_mod_init(&[left_spec(250)]);
+        assert_eq!(result["output"].as_str(), Some(""),
+            "output must be empty string — if it is \"wayland\", fetch_workspaces filters all workspaces");
     }
 
-    /// Claim: type field must be "init".
     #[test]
-    fn make_wayland_mod_init_type_is_init() {
-        let specs = vec![left_spec(250)];
-        let result = make_wayland_mod_init(&specs);
-        assert_eq!(
-            result["type"].as_str(),
-            Some("init"),
-            "type must be \"init\"",
-        );
+    fn mod_init_type_is_init() {
+        let result = wayland_mod_init(&[left_spec(250)]);
+        assert_eq!(result["type"].as_str(), Some("init"));
     }
 
-    /// Claim: config.width must match the width of the left-anchored spec.
+    /// Claim: config.width must match the width of the left-anchored spec (no dpr scaling at 1.0).
     #[test]
-    fn make_wayland_mod_init_config_width_matches_left_anchor_spec() {
-        let specs = vec![left_spec(320)];
-        let result = make_wayland_mod_init(&specs);
-        assert_eq!(
-            result["config"]["width"].as_u64(),
-            Some(320),
-            "config.width must match the left-anchored spec width",
-        );
+    fn mod_init_config_width_matches_left_anchor_spec() {
+        let result = wayland_mod_init(&[left_spec(320)]);
+        assert_eq!(result["config"]["width"].as_u64(), Some(320),
+            "config.width must match the left-anchored spec width");
     }
 
     #[test]
