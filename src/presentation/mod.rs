@@ -19,10 +19,11 @@ pub struct PanelFrame {
 
 /// The typed vocabulary the pipeline speaks to the presenter.
 ///
-/// Lifecycle variants (`Create`, `Move`, `Resize`, `Delete`) are ordered and
-/// discrete; the presenter applies them immediately. `UpdatePicture` calls
-/// `DM::update_image` directly — each update is committed to the backend as
-/// it arrives. `Shutdown` cleanly stops the presenter thread.
+/// Lifecycle variants (`Create`, `Move`, `Resize`, `Delete`) are applied
+/// immediately by the presenter thread. `UpdatePicture` triggers a
+/// `DM::update_image` call on the presenter thread as soon as it is drained
+/// from the command channel. `Shutdown` is intercepted by `drain_commands`
+/// before reaching `Presenter::apply` — it is never passed to `apply`.
 pub enum PanelCommand {
     Create(PanelSpecData),
     Move(PanelSpecData),
@@ -100,7 +101,7 @@ impl<DM: DisplayManager> Presenter<DM> {
                     }
                 }
             }
-            PanelCommand::Shutdown => {}
+            PanelCommand::Shutdown => unreachable!("Shutdown is intercepted by drain_commands before apply is called"),
         }
         Ok(())
     }

@@ -109,7 +109,6 @@ impl WaylandPanel {
 // Internal sctk dispatch state
 // ---------------------------------------------------------------------------
 
-#[allow(dead_code)]
 pub(crate) struct WaylandState {
     pub(crate) registry_state: RegistryState,
     pub(crate) compositor_state: CompositorState,
@@ -128,7 +127,6 @@ pub(crate) struct WaylandState {
 // Public struct
 // ---------------------------------------------------------------------------
 
-#[allow(dead_code)]
 pub struct WaylandDisplayServer {
     conn: Arc<Connection>,
     event_queue: EventQueue<WaylandState>,
