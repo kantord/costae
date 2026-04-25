@@ -4,16 +4,16 @@ use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::Duration;
 
-use costae::{RenderCache, inject_root_bg, init_global_ctx, parse_layout, render_frame};
+use costae::{init_global_ctx, parse_layout, render_frame};
 use costae::data::data_loop::{DataLoop, DataLoopHandle, BuiltInSource, ProcessIdentity, ProcessSource, StreamItem, StreamSource};
 use costae::display_manager::DisplayManager;
 use costae::x11::click::do_hit_test;
-use costae::x11::panel::{sample_root_bg, i3_dpi, X11PanelContext, PanelContext};
+use costae::x11::panel::{i3_dpi, X11PanelContext, PanelContext};
 use costae::managed_set::{ManagedSet, Reconcile};
 use costae::windowing::wayland::WaylandDisplayServer;
 use costae::panel::PanelSpec;
 use costae::windowing::{DisplayServer, WindowEvent};
-use costae::presentation::{PanelCommand, PresentationThread, Presenter, PresenterEvent};
+use costae::presentation::{PanelCommand, PanelFrame, PresentationThread, PresenterEvent};
 
 
 type ModuleEventTxs = Arc<std::sync::Mutex<HashMap<String, mpsc::Sender<serde_json::Value>>>>;
@@ -84,40 +84,19 @@ fn apply_wayland_eval_result(
 // X11 presenter thread
 // ---------------------------------------------------------------------------
 
-fn x11_render_all(
-    presenter: &mut Presenter<X11PanelContext>,
-    dm: &mut X11PanelContext,
-    cache_key: &serde_json::Value,
-) {
-    let dpr = dm.dpr;
-    let ids: Vec<String> = presenter.panels.keys().cloned().collect();
-    for id in &ids {
-        let Some(panel) = presenter.panels.get_mut(id) else { continue; };
-        inject_root_bg(panel.root_bg_rgba.clone(), panel.phys_width, panel.phys_height);
-        panel.bgrx = panel.render_cache.get_or_render(cache_key, || {
-            let layout = resolve_layout(&panel.raw_layout);
-            render_frame(layout, panel.phys_width, panel.phys_height, dpr)
-        });
-        let bgrx = Arc::clone(&panel.bgrx);
-        if let Err(e) = dm.update_image(panel, &bgrx[..]) {
-            tracing::error!(panel = %id, error = %e, "x11 render_all update_image failed");
-        }
-    }
-}
-
 fn apply_x11_cmd(
     pt: &mut PresentationThread<X11PanelContext>,
     cmd: PanelCommand,
 ) {
     match cmd {
-        PanelCommand::RenderAll { ref cache_key } => {
+        PanelCommand::RenderAll => {
             let PresentationThread { ref mut dm, ref mut presenter } = pt;
-            x11_render_all(presenter, dm, cache_key);
+            presenter.flush_pixels(dm);
         }
         PanelCommand::UpdateOutputMap { map } => {
             pt.dm.output_map = map;
         }
-        PanelCommand::Shutdown => {} // handled by caller
+        PanelCommand::Shutdown => {}
         cmd => {
             let PresentationThread { ref mut dm, ref mut presenter } = pt;
             if let Err(e) = presenter.apply(cmd, dm) {
@@ -131,9 +110,9 @@ fn run_x11_presenter_thread(
     mut pt: PresentationThread<X11PanelContext>,
     command_rx: mpsc::Receiver<PanelCommand>,
     event_tx: mpsc::Sender<PresenterEvent>,
-    module_event_txs: ModuleEventTxs,
 ) {
     use std::sync::mpsc::RecvTimeoutError;
+    use x11rb::protocol::xproto::ImageFormat;
 
     'outer: loop {
         match command_rx.recv_timeout(Duration::from_millis(8)) {
@@ -150,21 +129,33 @@ fn run_x11_presenter_thread(
             }
         }
 
-        let wallpaper_changed = poll_x11_events(
-            &pt.dm.conn,
-            &mut pt.presenter.panels,
-            &module_event_txs,
-            pt.dm.dpr,
-            pt.dm.depth,
-            pt.dm.root,
-            pt.dm.xrootpmap_atom,
-        ).unwrap_or(false);
-        if wallpaper_changed {
-            let _ = event_tx.send(PresenterEvent::NeedsRender);
+        while let Some(event) = pt.dm.conn.poll_for_event().unwrap_or(None) {
+            match event {
+                x11rb::protocol::Event::Expose(e) => {
+                    if let Some(panel) = pt.presenter.panels.values().find(|p| p.win_id == e.window) {
+                        let _ = pt.dm.conn.put_image(ImageFormat::Z_PIXMAP, panel.win_id, panel.gc,
+                            panel.phys_width as u16, panel.phys_height as u16, 0, 0, 0, pt.dm.depth, &panel.bgrx[..]);
+                        let _ = pt.dm.conn.flush();
+                    }
+                }
+                x11rb::protocol::Event::ButtonPress(e) => {
+                    if let Some(panel) = pt.presenter.panels.values().find(|p| p.win_id == e.event) {
+                        let _ = event_tx.send(PresenterEvent::Click {
+                            panel_id: panel.id.clone(),
+                            x: e.event_x as f32,
+                            y: e.event_y as f32,
+                            phys_width: panel.phys_width,
+                            phys_height: panel.phys_height,
+                            dpr: pt.dm.dpr,
+                        });
+                    }
+                }
+                x11rb::protocol::Event::Error(e) => {
+                    tracing::error!(error = ?e, "X11 async error");
+                }
+                _ => {}
+            }
         }
-
-        let PresentationThread { ref mut dm, ref mut presenter } = pt;
-        presenter.flush_pixels(dm);
     }
 }
 
@@ -172,39 +163,18 @@ fn run_x11_presenter_thread(
 // Wayland presenter thread
 // ---------------------------------------------------------------------------
 
-fn wayland_render_all(
-    presenter: &mut Presenter<WaylandDisplayServer>,
-    dm: &mut WaylandDisplayServer,
-    _cache_key: &serde_json::Value,
-) {
-    let ids: Vec<String> = presenter.panels.iter()
-        .filter(|(_, p)| p.configured)
-        .map(|(id, _)| id.clone())
-        .collect();
-    for id in &ids {
-        let Some(panel) = presenter.panels.get_mut(id) else { continue; };
-        let layout = panel.raw_layout.as_ref().and_then(|l| {
-            parse_layout(l).map_err(|e| tracing::error!(error = %e, "layout parse error")).ok()
-        });
-        let bgrx = render_frame(layout, panel.width, panel.height, 1.0);
-        if let Err(e) = dm.update_image(panel, &bgrx[..]) {
-            tracing::error!(panel = %id, error = %e, "wayland render_all update_image failed");
-        }
-    }
-    dm.flush();
-}
-
 fn apply_wayland_cmd(
     pt: &mut PresentationThread<WaylandDisplayServer>,
     cmd: PanelCommand,
 ) {
     match cmd {
-        PanelCommand::RenderAll { ref cache_key } => {
+        PanelCommand::RenderAll => {
             let PresentationThread { ref mut dm, ref mut presenter } = pt;
-            wayland_render_all(presenter, dm, cache_key);
+            presenter.flush_pixels(dm);
+            dm.flush();
         }
-        PanelCommand::UpdateOutputMap { .. } => {} // X11-only
-        PanelCommand::Shutdown => {}               // handled by caller
+        PanelCommand::UpdateOutputMap { .. } => {}
+        PanelCommand::Shutdown => {}
         cmd => {
             let PresentationThread { ref mut dm, ref mut presenter } = pt;
             if let Err(e) = presenter.apply(cmd, dm) {
@@ -218,7 +188,6 @@ fn run_wayland_presenter_thread(
     mut pt: PresentationThread<WaylandDisplayServer>,
     command_rx: mpsc::Receiver<PanelCommand>,
     event_tx: mpsc::Sender<PresenterEvent>,
-    module_event_txs: ModuleEventTxs,
 ) {
     use std::sync::mpsc::RecvTimeoutError;
 
@@ -237,7 +206,6 @@ fn run_wayland_presenter_thread(
             }
         }
 
-        // Apply compositor configure events (size negotiation)
         for (surface_id, new_size) in pt.dm.take_pending_configures() {
             for panel in pt.presenter.panels.values_mut() {
                 if panel.surface_id != surface_id { continue; }
@@ -261,15 +229,17 @@ fn run_wayland_presenter_thread(
                             }
                         }
                         WindowEvent::Click { panel_id, x_logical, y_logical, .. } => {
-                            if let Some(panel) = pt.presenter.panels.values()
-                                .find(|p| p.surface_id.to_string() == panel_id)
+                            if let Some((id, panel)) = pt.presenter.panels.iter()
+                                .find(|(_, p)| p.surface_id.to_string() == panel_id)
                             {
-                                let txs = module_event_txs.lock().unwrap();
-                                do_hit_test(
-                                    &panel.raw_layout, &txs,
-                                    panel.width, panel.height, 1.0,
-                                    x_logical, y_logical,
-                                );
+                                let _ = event_tx.send(PresenterEvent::Click {
+                                    panel_id: id.clone(),
+                                    x: x_logical,
+                                    y: y_logical,
+                                    phys_width: panel.width,
+                                    phys_height: panel.height,
+                                    dpr: 1.0,
+                                });
                             }
                         }
                     }
@@ -280,10 +250,6 @@ fn run_wayland_presenter_thread(
                 return;
             }
         }
-
-        let PresentationThread { ref mut dm, ref mut presenter } = pt;
-        presenter.flush_pixels(dm);
-        dm.flush();
     }
 }
 
@@ -317,6 +283,7 @@ struct App {
     last_tick: Arc<std::sync::atomic::AtomicU64>,
     command_tx: mpsc::Sender<PanelCommand>,
     event_rx: mpsc::Receiver<PresenterEvent>,
+    module_event_txs: ModuleEventTxs,
     presenter_thread: Option<thread::JoinHandle<()>>,
 }
 
@@ -341,9 +308,8 @@ impl App {
             screen_height_logical: panel_ctx.screen_height_logical,
         };
         let pt = PresentationThread::new(panel_ctx);
-        let module_event_txs_clone = Arc::clone(&module_event_txs);
         let presenter_thread = thread::spawn(move || {
-            run_x11_presenter_thread(pt, command_rx, event_tx, module_event_txs_clone);
+            run_x11_presenter_thread(pt, command_rx, event_tx);
         });
         let mut state = Self {
             backend,
@@ -360,6 +326,7 @@ impl App {
             last_tick,
             command_tx,
             event_rx,
+            module_event_txs,
             presenter_thread: Some(presenter_thread),
         };
         state.initial_load();
@@ -385,9 +352,8 @@ impl App {
         let (command_tx, command_rx) = mpsc::channel();
         let (event_tx, event_rx) = mpsc::channel();
         let pt = PresentationThread::new(server);
-        let module_event_txs_clone = Arc::clone(&module_event_txs);
         let presenter_thread = thread::spawn(move || {
-            run_wayland_presenter_thread(pt, command_rx, event_tx, module_event_txs_clone);
+            run_wayland_presenter_thread(pt, command_rx, event_tx);
         });
         let mut state = Self {
             backend: AppBackend::Wayland,
@@ -404,6 +370,7 @@ impl App {
             last_tick,
             command_tx,
             event_rx,
+            module_event_txs,
             presenter_thread: Some(presenter_thread),
         };
         init_global_ctx();
@@ -444,6 +411,7 @@ impl App {
                 tracing::debug!(elapsed_ms = t.elapsed().as_millis(), "jsx eval");
                 self.apply_eval_result_dispatch(&out);
                 self.jsx_evaluator = Some(evaluator);
+                self.render_panels();
             }
             Err(e) => tracing::error!(error = %e, "JSX eval error"),
         }
@@ -537,13 +505,36 @@ impl App {
                         }
                     }
                 }
+                PresenterEvent::Click { panel_id, x, y, phys_width, phys_height, dpr } => {
+                    if let Some(spec) = self.panels.get(&panel_id) {
+                        let raw_layout = if spec.content.is_null() { None } else { Some(spec.content.clone()) };
+                        let txs = self.module_event_txs.lock().unwrap();
+                        do_hit_test(&raw_layout, &txs, phys_width, phys_height, dpr, x, y);
+                    }
+                }
             }
         }
 
         if needs_render {
-            let cache_key = serde_json::to_value(&self.stream_values).unwrap_or_default();
-            let _ = self.command_tx.send(PanelCommand::RenderAll { cache_key });
+            self.render_panels();
         }
+    }
+
+    fn render_panels(&self) {
+        let dpr = match &self.backend {
+            AppBackend::X11 { dpr, .. } => *dpr,
+            AppBackend::Wayland => 1.0,
+        };
+        for (_, spec) in self.panels.iter() {
+            if spec.content.is_null() { continue; }
+            let phys_width = (spec.width as f32 * dpr) as u32;
+            let phys_height = (spec.height as f32 * dpr) as u32;
+            let layout = resolve_layout(&Some(spec.content.clone()));
+            let pixels = render_frame(layout, phys_width, phys_height, dpr);
+            let frame = PanelFrame { pixels: Arc::new(pixels), width: phys_width, height: phys_height };
+            let _ = self.command_tx.send(PanelCommand::UpdatePicture { id: spec.id.clone(), frame });
+        }
+        let _ = self.command_tx.send(PanelCommand::RenderAll);
     }
 }
 
@@ -661,58 +652,6 @@ fn apply_eval_result(
     );
     log_lifecycle_errors(panel_errors);
     true
-}
-
-fn poll_x11_events(
-    conn: &RustConnection,
-    presenter_panels: &mut HashMap<String, costae::x11::panel::Panel>,
-    module_event_txs: &std::sync::Mutex<HashMap<String, mpsc::Sender<serde_json::Value>>>,
-    dpr: f32,
-    depth: u8,
-    root: u32,
-    xrootpmap_atom: Option<u32>,
-) -> Result<bool, Box<dyn std::error::Error>> {
-    let mut wallpaper_changed = false;
-    while let Some(event) = conn.poll_for_event()? {
-        match event {
-            x11rb::protocol::Event::Expose(e) => {
-                if let Some(panel) = presenter_panels.values().find(|p| p.win_id == e.window) {
-                    tracing::debug!(panel = %panel.id, win_id = panel.win_id, "expose repaint");
-                    conn.put_image(ImageFormat::Z_PIXMAP, panel.win_id, panel.gc, panel.phys_width as u16, panel.phys_height as u16, 0, 0, 0, depth, &panel.bgrx[..])?;
-                    conn.flush()?;
-                }
-            }
-            x11rb::protocol::Event::ButtonPress(e) => {
-                let panel_ids: Vec<u32> = presenter_panels.values().map(|p| p.win_id).collect();
-                tracing::debug!(event_win = e.event, x = e.event_x, y = e.event_y, known_wins = ?panel_ids, "ButtonPress");
-                if let Some(panel) = presenter_panels.values().find(|p| p.win_id == e.event) {
-                    let txs = module_event_txs.lock().unwrap();
-                    do_hit_test(
-                        &panel.raw_layout, &txs,
-                        panel.phys_width, panel.phys_height, dpr,
-                        e.event_x as f32, e.event_y as f32,
-                    );
-                }
-            }
-            x11rb::protocol::Event::PropertyNotify(e) => {
-                if xrootpmap_atom == Some(e.atom) {
-                    for panel in presenter_panels.values_mut() {
-                        if let Some(rgba) = sample_root_bg(conn, root, panel.win_x, panel.win_y, panel.phys_width, panel.phys_height, xrootpmap_atom) {
-                            panel.root_bg_rgba = rgba;
-                            tracing::debug!(panel = %panel.id, "root bg updated");
-                        }
-                        panel.render_cache = RenderCache::new(30);
-                    }
-                    wallpaper_changed = true;
-                }
-            }
-            x11rb::protocol::Event::Error(e) => {
-                tracing::error!(error = ?e, "X11 async error");
-            }
-            _ => {}
-        }
-    }
-    Ok(wallpaper_changed)
 }
 
 

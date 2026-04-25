@@ -32,18 +32,19 @@ pub enum PanelCommand {
     Resize(PanelSpecData),
     Delete { id: String },
     UpdatePicture { id: String, frame: PanelFrame },
-    RenderAll { cache_key: serde_json::Value },
+    RenderAll,
     UpdateOutputMap { map: Arc<HashMap<String, (i16, i16, u32, u32)>> },
     Shutdown,
 }
 
 /// Events the presenter thread sends back to the pipeline.
 pub enum PresenterEvent {
-    /// A wallpaper change, compositor configure, or other backend event means
-    /// the pipeline should dispatch a new `RenderAll`.
+    /// The pipeline should re-render all panels and flush.
     NeedsRender,
     /// Wayland: the compositor's output geometry changed.
     OutputsChanged { screen_width: u32, screen_height: u32 },
+    /// A click event, routed back for hit-testing in the pipeline.
+    Click { panel_id: String, x: f32, y: f32, phys_width: u32, phys_height: u32, dpr: f32 },
 }
 
 /// Owns the window state (one `DM::Panel` per live panel id) and pending
@@ -104,7 +105,7 @@ impl<DM: DisplayManager> Presenter<DM> {
                 self.pending_pixels.insert(id, frame);
             }
             // Thread-level commands handled by the presenter thread loop, not here.
-            PanelCommand::RenderAll { .. }
+            PanelCommand::RenderAll
             | PanelCommand::UpdateOutputMap { .. }
             | PanelCommand::Shutdown => {}
         }

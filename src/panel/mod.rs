@@ -64,13 +64,12 @@ impl Lifecycle for PanelSpec {
 
     fn reconcile_self(self, state: &mut PanelSpecData, _ctx: &mut (), output: &mut Sender<PanelCommand>) -> Result<(), anyhow::Error> {
         let resized = state.width != self.0.width || state.height != self.0.height;
-        let content_changed = state.content != self.0.content;
         let moved = state.x != self.0.x
             || state.y != self.0.y
             || state.anchor != self.0.anchor
             || state.output != self.0.output
             || state.outer_gap != self.0.outer_gap;
-        if resized || content_changed {
+        if resized {
             let _ = output.send(PanelCommand::Resize(self.0.clone()));
         }
         if moved {
@@ -157,6 +156,19 @@ mod tests {
             "reconcile_self must emit Move when position changes");
         assert!(!cmds.iter().any(|c| matches!(c, PanelCommand::Resize(_))),
             "reconcile_self must NOT emit Resize when only position changes");
+    }
+
+    #[test]
+    fn panel_spec_reconcile_self_emits_nothing_when_only_content_changes() {
+        let (mut tx, rx) = std::sync::mpsc::channel::<PanelCommand>();
+        let mut state = make_spec_data("p1");
+        let mut next = make_spec_data("p1");
+        next.content = serde_json::json!({"type": "text", "text": "hello"});
+        let spec = PanelSpec(next);
+        <PanelSpec as Lifecycle>::reconcile_self(spec, &mut state, &mut (), &mut tx).unwrap();
+        let cmds: Vec<PanelCommand> = rx.try_iter().collect();
+        assert!(cmds.is_empty(),
+            "reconcile_self must emit no commands on content-only change — pipeline re-renders all panels after every reconcile");
     }
 
     #[test]

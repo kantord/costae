@@ -59,14 +59,12 @@ pub struct WaylandPanel {
     pub width: u32,
     pub height: u32,
     pub anchor: Option<PanelAnchor>,
-    pub raw_layout: Option<serde_json::Value>,
 }
 
 impl WaylandPanel {
     /// Update the panel from a new spec. Resizes the layer surface if the fixed dimension changed,
     /// which will cause the compositor to send a new configure before the next render.
     pub fn update_spec(&mut self, data: &PanelSpecData) {
-        self.raw_layout = Some(data.content.clone());
         if fixed_axis_changed(self.anchor.as_ref(), self.width, self.height, data.width, data.height) {
             self.width = data.width;
             self.height = data.height;
@@ -248,7 +246,6 @@ impl WaylandDisplayServer {
             width: data.width,
             height: data.height,
             anchor: data.anchor.clone(),
-            raw_layout: Some(data.content.clone()),
         })
     }
 

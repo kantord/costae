@@ -16,8 +16,8 @@ const MM_PER_INCH: f32 = 25.4;
 const FALLBACK_DPI: f32 = 96.0;
 use crate::managed_set::Lifecycle;
 use costae_lifecycle_derive::lifecycle_trace;
-use crate::render::{RenderCache, render_frame, preload_layout_images, init_global_ctx};
-use crate::x11::{x11_bgrx_to_rgba, inject_root_bg, solid_color_rgba, strut_partial_values_for_anchor};
+use crate::render::{render_frame, init_global_ctx};
+use crate::x11::strut_partial_values_for_anchor;
 
 /// A live X11 panel window, created from a `PanelSpec` at runtime.
 pub struct Panel {
@@ -28,69 +28,9 @@ pub struct Panel {
     pub win_y: i16,
     pub phys_width: u32,
     pub phys_height: u32,
-    /// Per-panel wallpaper snapshot (RGBA). Re-injected as "root-bg" before each render
-    /// so every panel sees the correct region of the wallpaper behind it.
-    pub root_bg_rgba: Vec<u8>,
-    pub raw_layout: Option<serde_json::Value>,
-    pub render_cache: RenderCache,
     pub bgrx: Arc<Vec<u8>>,
 }
 
-pub fn sample_root_bg(
-    conn: &RustConnection,
-    root: Window,
-    win_x: i16,
-    win_y: i16,
-    width: u32,
-    height: u32,
-    xrootpmap_atom: Option<u32>,
-) -> Option<Vec<u8>> {
-    let t = std::time::Instant::now();
-
-    // Tier 1: _XROOTPMAP_ID pixmap (set by feh/nitrogen for wallpapers).
-    if let Some(atom) = xrootpmap_atom {
-        let pixmap = conn
-            .get_property(false, root, atom, AtomEnum::ANY, 0, 1).ok()
-            .and_then(|c| c.reply().ok())
-            .filter(|p| p.value.len() >= 4)
-            .and_then(|p| p.value[..4].try_into().ok().map(u32::from_ne_bytes));
-        if let Some(pixmap_id) = pixmap {
-            if let Some(img) = conn.get_image(ImageFormat::Z_PIXMAP, pixmap_id, win_x, win_y, width as u16, height as u16, !0)
-                .ok().and_then(|c| c.reply().ok())
-            {
-                tracing::debug!(elapsed_ms = t.elapsed().as_millis(), "root bg from _XROOTPMAP_ID pixmap");
-                return Some(x11_bgrx_to_rgba(&img.data));
-            }
-        }
-    }
-
-    // Tier 2: solid color from the pixel just to the right of the panel.
-    if let Some(img) = conn.get_image(
-        ImageFormat::Z_PIXMAP, root,
-        win_x + width as i16, win_y,
-        1, 1, !0,
-    ).ok().and_then(|c| c.reply().ok()) {
-        if img.data.len() >= 4 {
-            let pixel = ((img.data[2] as u32) << 16)
-                | ((img.data[1] as u32) << 8)
-                | (img.data[0] as u32);
-            tracing::debug!(pixel = format!("{:#06x}", pixel), elapsed_ms = t.elapsed().as_millis(), "root bg from adjacent pixel");
-            return Some(solid_color_rgba(pixel, width, height));
-        }
-    }
-
-    // Tier 3: GetImage on root window — last resort.
-    match conn.get_image(ImageFormat::Z_PIXMAP, root, win_x, win_y, width as u16, height as u16, !0) {
-        Err(e) => { tracing::warn!(error = ?e, "root bg send error"); None }
-        Ok(cookie) => match cookie.reply() {
-            Err(e) => { tracing::warn!(error = ?e, "root bg reply error"); None }
-            Ok(img) => {
-                tracing::debug!(elapsed_ms = t.elapsed().as_millis(), "root bg from root window (fallback)");
-                Some(x11_bgrx_to_rgba(&img.data))
-            }
-        }
-    }
-}
 
 pub fn i3_dpi(conn: &RustConnection, root: Window, screen: &Screen) -> f32 {
     let from_xresources = (|| -> Option<f32> {
@@ -160,10 +100,6 @@ fn create_panel(
             .event_mask(EventMask::EXPOSURE | EventMask::BUTTON_PRESS),
     )?;
 
-    let root_bg_rgba = sample_root_bg(&ctx.conn, ctx.root, win_x, win_y, phys_width, phys_height, ctx.xrootpmap_atom)
-        .unwrap_or_default();
-    inject_root_bg(root_bg_rgba.clone(), phys_width, phys_height);
-
     ctx.conn.map_window(win_id)?;
     let stack_mode = if spec.above { StackMode::ABOVE } else { StackMode::BELOW };
     ctx.conn.configure_window(win_id, &ConfigureWindowAux::new().stack_mode(stack_mode))?;
@@ -193,9 +129,6 @@ fn create_panel(
         win_y,
         phys_width,
         phys_height,
-        root_bg_rgba,
-        raw_layout: None,
-        render_cache: RenderCache::new(30),
         bgrx,
     })
 }
@@ -238,25 +171,15 @@ impl Lifecycle for PanelSpecData {
 
     fn enter(self, ctx: &mut Self::Context, _output: &mut ()) -> Result<Self::State, Self::Error> {
         init_global_ctx();
-        let mut panel = create_panel(&self, ctx).map_err(|e| {
+        let panel = create_panel(&self, ctx).map_err(|e| {
             tracing::error!(panel = %self.id, error = %e, "panel create failed");
             e
         })?;
         tracing::info!(panel = %self.id, "panel created");
-        if !self.content.is_null() {
-            preload_layout_images(&self.content);
-            panel.raw_layout = Some(self.content);
-        }
         Ok(panel)
     }
 
     fn reconcile_self(self, state: &mut Self::State, ctx: &mut Self::Context, _output: &mut ()) -> Result<(), Self::Error> {
-        if !self.content.is_null() {
-            preload_layout_images(&self.content);
-            state.raw_layout = Some(self.content.clone());
-            state.render_cache = RenderCache::new(30);
-        }
-
         let new_phys_width = (self.width as f32 * ctx.dpr).round() as u32;
         let new_phys_height = (self.height as f32 * ctx.dpr).round() as u32;
 
@@ -322,11 +245,7 @@ impl DisplayManager for X11PanelContext {
 
     fn create_window(&mut self, spec: &PanelSpecData) -> Result<Panel, anyhow::Error> {
         init_global_ctx();
-        let mut panel = create_panel(spec, self)?;
-        if !spec.content.is_null() {
-            preload_layout_images(&spec.content);
-            panel.raw_layout = Some(spec.content.clone());
-        }
+        let panel = create_panel(spec, self)?;
         Ok(panel)
     }
 
@@ -337,6 +256,7 @@ impl DisplayManager for X11PanelContext {
     }
 
     fn update_image(&mut self, panel: &mut Panel, bgrx: &[u8]) -> Result<(), anyhow::Error> {
+        panel.bgrx = Arc::new(bgrx.to_vec());
         self.conn.put_image(
             ImageFormat::Z_PIXMAP,
             panel.win_id,
@@ -381,12 +301,6 @@ impl DisplayManager for X11PanelContext {
     }
 
     fn update_dimensions(&mut self, panel: &mut Panel, spec: &PanelSpecData) -> Result<(), anyhow::Error> {
-        if !spec.content.is_null() {
-            preload_layout_images(&spec.content);
-            panel.raw_layout = Some(spec.content.clone());
-            panel.render_cache = RenderCache::new(30);
-        }
-
         let new_phys_width = (spec.width as f32 * self.dpr).round() as u32;
         let new_phys_height = (spec.height as f32 * self.dpr).round() as u32;
 
@@ -591,52 +505,6 @@ mod tests {
             .ok()
             .and_then(|c| c.reply().ok());
         assert!(after.is_none(), "get_geometry should fail after exit (window destroyed)");
-    }
-
-    // ---------------------------------------------------------------------------
-    // Claim C: update sets raw_layout when content changes.
-    // ---------------------------------------------------------------------------
-    #[test]
-    fn lifecycle_update_sets_raw_layout_when_content_changes() {
-        use crate::managed_set::Lifecycle;
-
-        let mut ctx = match make_panel_ctx() {
-            Some(c) => c,
-            None => {
-                println!("SKIP: no X11 display available");
-                return;
-            }
-        };
-
-        let spec = make_spec("test-update", 200, 30);
-        let mut panel = <crate::layout::PanelSpecData as Lifecycle>::enter(spec, &mut ctx, &mut ())
-            .expect("enter must succeed for update test");
-
-        let new_content = serde_json::json!({"type": "text", "text": "hello"});
-        let new_spec = crate::layout::PanelSpecData {
-            id: "test-update".to_string(),
-            anchor: None,
-            width: 200,
-            height: 30,
-            x: 0,
-            y: 0,
-            outer_gap: 0,
-            output: None,
-            above: false,
-            content: new_content.clone(),
-        };
-
-        <crate::layout::PanelSpecData as Lifecycle>::reconcile_self(new_spec, &mut panel, &mut ctx, &mut ())
-            .expect("reconcile_self must succeed");
-
-        assert_eq!(
-            panel.raw_layout,
-            Some(new_content),
-            "raw_layout should be set to the new content after update"
-        );
-
-        // Cleanup
-        let _ = <crate::layout::PanelSpecData as Lifecycle>::exit(panel, &mut ctx, &mut ());
     }
 
     // ---------------------------------------------------------------------------
@@ -862,62 +730,6 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // R1b: DisplayManager::update_dimensions sets raw_layout when content is
-    // not null JSON.
-    // ---------------------------------------------------------------------------
-    #[test]
-    fn display_manager_update_dimensions_sets_raw_layout_when_content_is_not_null() {
-        use crate::display_manager::DisplayManager;
-
-        let mut ctx = match make_panel_ctx() {
-            Some(c) => c,
-            None => {
-                println!("SKIP: no X11 display available");
-                return;
-            }
-        };
-
-        // Create the window with null content so raw_layout starts as None.
-        let spec_no_content = make_spec("dm-upd-raw-layout", 200, 30);
-        let mut panel = <super::X11PanelContext as DisplayManager>::create_window(
-            &mut ctx,
-            &spec_no_content,
-        )
-        .expect("create_window should succeed when X11 is available");
-
-        // Build a spec with non-null content.
-        let expected_content = serde_json::json!({"type": "container"});
-        let spec_with_content = crate::layout::PanelSpecData {
-            id: "dm-upd-raw-layout".to_string(),
-            anchor: None,
-            width: 200,
-            height: 30,
-            x: 0,
-            y: 0,
-            outer_gap: 0,
-            output: None,
-            above: false,
-            content: expected_content.clone(),
-        };
-
-        <super::X11PanelContext as DisplayManager>::update_dimensions(
-            &mut ctx,
-            &mut panel,
-            &spec_with_content,
-        )
-        .expect("update_dimensions should succeed");
-
-        assert_eq!(
-            panel.raw_layout,
-            Some(expected_content),
-            "update_dimensions should set raw_layout to Some(spec.content) when content is not null"
-        );
-
-        // Cleanup
-        let _ = <super::X11PanelContext as DisplayManager>::delete_window(&mut ctx, panel);
-    }
-
-    // ---------------------------------------------------------------------------
     // R2: DisplayManager::update_position moves the window and updates state.
     // ---------------------------------------------------------------------------
     #[test]
@@ -957,49 +769,6 @@ mod tests {
         // With dpr=1.0, mon_x=0, mon_y=0: win_x = 0 + (50 * 1.0) = 50, win_y = 0 + (20 * 1.0) = 20
         assert_eq!(panel.win_x, 50, "win_x should be updated to 50 after update_position");
         assert_eq!(panel.win_y, 20, "win_y should be updated to 20 after update_position");
-
-        // Cleanup
-        let _ = <super::X11PanelContext as DisplayManager>::delete_window(&mut ctx, panel);
-    }
-
-    // ---------------------------------------------------------------------------
-    // Claim H: create_window sets raw_layout to Some(spec.content) when
-    // spec.content is not null JSON.
-    // ---------------------------------------------------------------------------
-    #[test]
-    fn create_window_sets_raw_layout_when_content_is_not_null() {
-        use crate::display_manager::DisplayManager;
-
-        let mut ctx = match make_panel_ctx() {
-            Some(c) => c,
-            None => {
-                println!("SKIP: no X11 display available");
-                return;
-            }
-        };
-
-        let expected_content = serde_json::json!({"type": "container"});
-        let spec = crate::layout::PanelSpecData {
-            id: "dm-create-raw-layout".to_string(),
-            anchor: None,
-            width: 200,
-            height: 30,
-            x: 0,
-            y: 0,
-            outer_gap: 0,
-            output: None,
-            above: false,
-            content: expected_content.clone(),
-        };
-
-        let panel = <super::X11PanelContext as DisplayManager>::create_window(&mut ctx, &spec)
-            .expect("create_window should succeed when X11 is available");
-
-        assert_eq!(
-            panel.raw_layout,
-            Some(expected_content),
-            "raw_layout should be set to Some(spec.content) after create_window"
-        );
 
         // Cleanup
         let _ = <super::X11PanelContext as DisplayManager>::delete_window(&mut ctx, panel);
