@@ -78,9 +78,11 @@ impl WaylandPanel {
     /// Paint a BGRX frame onto this panel's layer surface.
     pub fn render(&mut self, bgrx: &[u8]) {
         let stride = self.width as i32 * 4;
+        let actual_height = (bgrx.len() / 4).saturating_div(self.width as usize) as i32;
+        if actual_height == 0 { return; }
         let Ok((buffer, canvas)) = self.pool.create_buffer(
             self.width as i32,
-            self.height as i32,
+            actual_height,
             stride,
             wl_shm::Format::Xrgb8888,
         ) else {
@@ -94,7 +96,7 @@ impl WaylandPanel {
             tracing::error!("failed to attach buffer to surface");
             return;
         }
-        wl_surf.damage_buffer(0, 0, self.width as i32, self.height as i32);
+        wl_surf.damage_buffer(0, 0, self.width as i32, actual_height);
         wl_surf.commit();
     }
 }
