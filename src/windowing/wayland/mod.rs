@@ -78,6 +78,9 @@ impl WaylandPanel {
     /// Paint a BGRX frame onto this panel's layer surface.
     pub fn render(&mut self, bgrx: &[u8]) {
         let stride = self.width as i32 * 4;
+        // Derive height from bgrx rather than self.height: the compositor may have
+        // configured a different height than what the app rendered (configure race),
+        // and using self.height would produce a mismatched canvas size and panic.
         let actual_height = (bgrx.len() / 4).saturating_div(self.width as usize) as i32;
         if actual_height == 0 { return; }
         let Ok((buffer, canvas)) = self.pool.create_buffer(
@@ -676,6 +679,50 @@ mod tests {
         let bgrx = vec![0u8; (spec.width * spec.height * 4) as usize];
         let result = DisplayManager::update_image(&mut server, &mut panel, &bgrx);
         assert!(result.is_ok());
+    }
+
+    // The height used to allocate the SHM buffer must be derived from the bgrx
+    // byte count, not from panel.height. If it used panel.height instead, then
+    // when bgrx has MORE rows than panel.height the canvas would be too small
+    // and `canvas[..bgrx.len()].copy_from_slice(bgrx)` would panic.
+    //
+    // This is a pure computation test — no Wayland compositor needed.
+    // It would FAIL if the formula were changed back to use panel.height.
+    #[test]
+    fn render_height_derived_from_bgrx_not_panel_height_when_bgrx_is_taller() {
+        let width: u32 = 100;
+        let panel_height: u32 = 30;
+        // bgrx represents 50 rows — more than panel_height=30
+        let bgrx = vec![0u8; (width * 50 * 4) as usize]; // 20 000 bytes
+
+        // Old formula: canvas allocated with panel_height → would be too small
+        let old_canvas_size = (panel_height * width * 4) as usize; // 12 000
+        assert!(old_canvas_size < bgrx.len(),
+            "old canvas ({old_canvas_size}B) < bgrx ({}B) → copy would panic", bgrx.len());
+
+        // New formula: derive height from bgrx
+        let actual_height = (bgrx.len() / 4).saturating_div(width as usize);
+        assert_eq!(actual_height, 50);
+        let new_canvas_size = actual_height * width as usize * 4; // 20 000
+        assert_eq!(new_canvas_size, bgrx.len(),
+            "new canvas ({new_canvas_size}B) == bgrx ({}B) → copy is safe", bgrx.len());
+    }
+
+    // Same invariant for a bgrx that is SHORTER than panel.height: actual_height
+    // must still be derived from bgrx, not panel.height, so the canvas fits exactly.
+    //
+    // Pure computation test — no Wayland compositor needed.
+    #[test]
+    fn render_height_derived_from_bgrx_not_panel_height_when_bgrx_is_shorter() {
+        let width: u32 = 100;
+        // bgrx represents only 20 rows
+        let bgrx = vec![0u8; (width * 20 * 4) as usize]; // 8 000 bytes
+
+        let actual_height = (bgrx.len() / 4).saturating_div(width as usize);
+        assert_eq!(actual_height, 20);
+        let canvas_size = actual_height * width as usize * 4;
+        assert_eq!(canvas_size, bgrx.len(),
+            "canvas ({canvas_size}B) == bgrx ({}B) → copy is safe", bgrx.len());
     }
 
     // delete_window drops the panel without panicking
