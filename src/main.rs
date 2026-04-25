@@ -106,28 +106,39 @@ fn apply_x11_cmd(
     }
 }
 
+/// Drains the command channel for one presenter-thread iteration.
+/// Blocks up to 8 ms waiting for the first command, then drains non-blocking.
+/// Returns `true` when the thread should stop (Shutdown received or sender dropped).
+fn drain_commands(
+    command_rx: &mpsc::Receiver<PanelCommand>,
+    mut apply: impl FnMut(PanelCommand),
+) -> bool {
+    use std::sync::mpsc::RecvTimeoutError;
+    match command_rx.recv_timeout(Duration::from_millis(8)) {
+        Ok(PanelCommand::Shutdown) => return true,
+        Ok(cmd) => apply(cmd),
+        Err(RecvTimeoutError::Timeout) => {}
+        Err(RecvTimeoutError::Disconnected) => return true,
+    }
+    loop {
+        match command_rx.try_recv() {
+            Ok(PanelCommand::Shutdown) => return true,
+            Ok(cmd) => apply(cmd),
+            Err(_) => break,
+        }
+    }
+    false
+}
+
 fn run_x11_presenter_thread(
     mut pt: PresentationThread<X11PanelContext>,
     command_rx: mpsc::Receiver<PanelCommand>,
     event_tx: mpsc::Sender<PresenterEvent>,
 ) {
-    use std::sync::mpsc::RecvTimeoutError;
     use x11rb::protocol::xproto::ImageFormat;
 
-    'outer: loop {
-        match command_rx.recv_timeout(Duration::from_millis(8)) {
-            Ok(PanelCommand::Shutdown) => break 'outer,
-            Ok(cmd) => apply_x11_cmd(&mut pt, cmd),
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => break 'outer,
-        }
-        loop {
-            match command_rx.try_recv() {
-                Ok(PanelCommand::Shutdown) => break 'outer,
-                Ok(cmd) => apply_x11_cmd(&mut pt, cmd),
-                Err(_) => break,
-            }
-        }
+    loop {
+        if drain_commands(&command_rx, |cmd| apply_x11_cmd(&mut pt, cmd)) { return; }
 
         while let Some(event) = pt.dm.conn.poll_for_event().unwrap_or(None) {
             match event {
@@ -189,22 +200,8 @@ fn run_wayland_presenter_thread(
     command_rx: mpsc::Receiver<PanelCommand>,
     event_tx: mpsc::Sender<PresenterEvent>,
 ) {
-    use std::sync::mpsc::RecvTimeoutError;
-
-    'outer: loop {
-        match command_rx.recv_timeout(Duration::from_millis(8)) {
-            Ok(PanelCommand::Shutdown) => break 'outer,
-            Ok(cmd) => apply_wayland_cmd(&mut pt, cmd),
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => break 'outer,
-        }
-        loop {
-            match command_rx.try_recv() {
-                Ok(PanelCommand::Shutdown) => break 'outer,
-                Ok(cmd) => apply_wayland_cmd(&mut pt, cmd),
-                Err(_) => break,
-            }
-        }
+    loop {
+        if drain_commands(&command_rx, |cmd| apply_wayland_cmd(&mut pt, cmd)) { return; }
 
         for (surface_id, new_size) in pt.dm.take_pending_configures() {
             for panel in pt.presenter.panels.values_mut() {

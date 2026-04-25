@@ -45,7 +45,6 @@ pub use modules::hit_test;
 // x11
 pub use x11::{
     x11_bgrx_to_rgba,
-    inject_root_bg,
     solid_color_rgba,
     strut_partial_values_for_anchor,
 };
