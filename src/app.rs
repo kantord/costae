@@ -67,20 +67,6 @@ fn apply_wayland_eval_result(
     true
 }
 
-fn rebuild_output_map_from_stream(
-    stream_values: &HashMap<(String, Option<String>), String>,
-) -> Option<HashMap<String, (i16, i16, u32, u32)>> {
-    let json_str = stream_values.get(&("costae:outputs".to_string(), None))?;
-    let outputs: Vec<serde_json::Value> = serde_json::from_str(json_str).ok()?;
-    Some(outputs.iter().filter_map(|o| {
-        let name = o["name"].as_str()?.to_string();
-        let x = o["x"].as_i64()? as i16;
-        let y = o["y"].as_i64()? as i16;
-        let w = o["width"].as_u64()? as u32;
-        let h = o["height"].as_u64()? as u32;
-        Some((name, (x, y, w, h)))
-    }).collect())
-}
 
 fn resolve_layout(raw_layout: &Option<serde_json::Value>) -> Option<takumi::layout::node::Node> {
     raw_layout.as_ref().and_then(|layout| {
@@ -411,11 +397,6 @@ impl App {
         }
 
         if changed {
-            if matches!(self.backend, AppBackend::X11) {
-                if let Some(new_map) = rebuild_output_map_from_stream(&self.stream_values) {
-                    let _ = self.command_tx.send(PanelCommand::UpdateOutputMap { map: Arc::new(new_map) });
-                }
-            }
             let eval_out = self.jsx_evaluator.as_ref().map(|e| {
                 let t = std::time::Instant::now();
                 let r = e.eval(&self.stream_values);

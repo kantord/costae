@@ -17,7 +17,6 @@ fn apply_wayland_cmd(
             presenter.flush_pixels(dm);
             dm.flush();
         }
-        PanelCommand::UpdateOutputMap { .. } => {}
         PanelCommand::Shutdown => {}
         cmd => {
             let PresentationThread { ref mut dm, ref mut presenter } = pt;

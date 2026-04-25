@@ -33,7 +33,6 @@ pub enum PanelCommand {
     Delete { id: String },
     UpdatePicture { id: String, frame: PanelFrame },
     RenderAll,
-    UpdateOutputMap { map: Arc<HashMap<String, (i16, i16, u32, u32)>> },
     Shutdown,
 }
 
@@ -106,7 +105,6 @@ impl<DM: DisplayManager> Presenter<DM> {
             }
             // Thread-level commands handled by the presenter thread loop, not here.
             PanelCommand::RenderAll
-            | PanelCommand::UpdateOutputMap { .. }
             | PanelCommand::Shutdown => {}
         }
         Ok(())

@@ -1,8 +1,10 @@
 use std::sync::mpsc;
 
 use costae::presentation::{PanelCommand, PresentationThread, PresenterEvent};
+use costae::x11::outputs::build_output_map;
 use costae::x11::panel::X11PanelContext;
 use x11rb::connection::Connection as _;
+use x11rb::protocol::randr::{ConnectionExt as RandrExt, NotifyMask};
 use x11rb::protocol::xproto::{ConnectionExt as _, ImageFormat};
 
 use super::drain_commands;
@@ -15,9 +17,6 @@ fn apply_x11_cmd(
         PanelCommand::RenderAll => {
             let PresentationThread { ref mut dm, ref mut presenter } = pt;
             presenter.flush_pixels(dm);
-        }
-        PanelCommand::UpdateOutputMap { map } => {
-            pt.dm.output_map = map;
         }
         PanelCommand::Shutdown => {}
         cmd => {
@@ -34,11 +33,18 @@ pub(crate) fn run_x11_presenter_thread(
     command_rx: mpsc::Receiver<PanelCommand>,
     event_tx: mpsc::Sender<PresenterEvent>,
 ) {
+    let _ = pt.dm.conn.randr_select_input(pt.dm.root, NotifyMask::SCREEN_CHANGE);
+    let _ = pt.dm.conn.flush();
+
     loop {
         if drain_commands(&command_rx, |cmd| apply_x11_cmd(&mut pt, cmd)) { return; }
 
         while let Some(event) = pt.dm.conn.poll_for_event().unwrap_or(None) {
             match event {
+                x11rb::protocol::Event::RandrScreenChangeNotify(_) => {
+                    use std::sync::Arc;
+                    pt.dm.output_map = Arc::new(build_output_map(&pt.dm.conn, pt.dm.root));
+                }
                 x11rb::protocol::Event::Expose(e) => {
                     if let Some(panel) = pt.presenter.panels.values().find(|p| p.win_id == e.window) {
                         let _ = pt.dm.conn.put_image(ImageFormat::Z_PIXMAP, panel.win_id, panel.gc,
