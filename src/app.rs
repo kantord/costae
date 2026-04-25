@@ -191,16 +191,8 @@ fn make_mod_init_value(
 // App — non-generic, DM lives on the presenter thread
 // ---------------------------------------------------------------------------
 
-enum AppBackend {
-    X11 {
-        dpr: f32,
-        dpi: f32,
-        output_name: String,
-        screen_width_logical: u32,
-        screen_height_logical: u32,
-    },
-    Wayland,
-}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AppBackend { X11, Wayland }
 
 pub(crate) struct TickReceivers {
     pub(crate) item_rx: mpsc::Receiver<((String, Option<String>), String)>,
@@ -215,6 +207,11 @@ pub(crate) struct X11Init {
 
 pub(crate) struct App {
     backend: AppBackend,
+    dpr: f32,
+    dpi: f32,
+    output_name: String,
+    screen_width_logical: u32,
+    screen_height_logical: u32,
     panels: ManagedSet<PanelSpec>,
     stream_values: HashMap<(String, Option<String>), String>,
     jsx_evaluator: Option<costae::jsx::JsxEvaluator>,
@@ -243,21 +240,24 @@ impl App {
         last_tick: Arc<std::sync::atomic::AtomicU64>,
     ) -> Self {
         let X11Init { panel_ctx, jsx_ctx } = x11;
+        let dpr = panel_ctx.dpr;
+        let dpi = panel_ctx.dpi;
+        let output_name = panel_ctx.output_name.clone();
+        let screen_width_logical = panel_ctx.screen_width_logical;
+        let screen_height_logical = panel_ctx.screen_height_logical;
         let (command_tx, command_rx) = mpsc::channel();
         let (event_tx, event_rx) = mpsc::channel();
-        let backend = AppBackend::X11 {
-            dpr: panel_ctx.dpr,
-            dpi: panel_ctx.dpi,
-            output_name: panel_ctx.output_name.clone(),
-            screen_width_logical: panel_ctx.screen_width_logical,
-            screen_height_logical: panel_ctx.screen_height_logical,
-        };
         let pt = PresentationThread::new(panel_ctx);
         let presenter_thread = thread::spawn(move || {
             run_x11_presenter_thread(pt, command_rx, event_tx);
         });
         let mut state = Self {
-            backend,
+            backend: AppBackend::X11,
+            dpr,
+            dpi,
+            output_name,
+            screen_width_logical,
+            screen_height_logical,
             panels: ManagedSet::new(),
             stream_values: HashMap::new(),
             jsx_evaluator: None,
@@ -302,6 +302,11 @@ impl App {
         });
         let mut state = Self {
             backend: AppBackend::Wayland,
+            dpr: 1.0,
+            dpi: 96.0,
+            output_name: String::new(),
+            screen_width_logical: screen_width,
+            screen_height_logical: screen_height,
             panels: ManagedSet::new(),
             stream_values: HashMap::new(),
             jsx_evaluator: None,
@@ -324,18 +329,16 @@ impl App {
     }
 
     fn apply_eval_result_dispatch(&mut self, out: &costae::jsx::EvalOutput) -> bool {
-        if matches!(self.backend, AppBackend::Wayland) {
-            return apply_wayland_eval_result(out, &self.handle, &mut self.panels, &mut self.command_tx);
-        }
-        // Extract X11 values as owned copies so the borrow of self.backend ends.
-        let (dpr, dpi, output_name, sw, sh) = match &self.backend {
-            AppBackend::X11 { dpr, dpi, output_name, screen_width_logical, screen_height_logical } => {
-                (*dpr, *dpi, output_name.clone(), *screen_width_logical, *screen_height_logical)
+        match self.backend {
+            AppBackend::Wayland =>
+                apply_wayland_eval_result(out, &self.handle, &mut self.panels, &mut self.command_tx),
+            AppBackend::X11 => {
+                let (dpr, dpi, sw, sh) = (self.dpr, self.dpi, self.screen_width_logical, self.screen_height_logical);
+                let output_name = self.output_name.clone();
+                apply_eval_result(out, &self.handle, &mut self.panels, &mut self.command_tx,
+                    &move |specs| make_mod_init_value(specs, dpr, &output_name, dpi, sw, sh))
             }
-            AppBackend::Wayland => unreachable!(),
-        };
-        apply_eval_result(out, &self.handle, &mut self.panels, &mut self.command_tx,
-            &move |specs| make_mod_init_value(specs, dpr, &output_name, dpi, sw, sh))
+        }
     }
 
     fn initial_load(&mut self) {
@@ -408,7 +411,7 @@ impl App {
         }
 
         if changed {
-            if matches!(self.backend, AppBackend::X11 { .. }) {
+            if matches!(self.backend, AppBackend::X11) {
                 if let Some(new_map) = rebuild_output_map_from_stream(&self.stream_values) {
                     let _ = self.command_tx.send(PanelCommand::UpdateOutputMap { map: Arc::new(new_map) });
                 }
@@ -466,10 +469,7 @@ impl App {
     }
 
     fn render_panels(&self) {
-        let dpr = match &self.backend {
-            AppBackend::X11 { dpr, .. } => *dpr,
-            AppBackend::Wayland => 1.0,
-        };
+        let dpr = self.dpr;
         for (_, spec) in self.panels.iter() {
             if spec.content.is_null() { continue; }
             let phys_width = (spec.width as f32 * dpr) as u32;
