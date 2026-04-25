@@ -319,7 +319,6 @@ impl Lifecycle for PanelSpecData {
 
 impl DisplayManager for X11PanelContext {
     type Panel = Panel;
-    type Error = anyhow::Error;
 
     fn create_window(&mut self, spec: &PanelSpecData) -> Result<Panel, anyhow::Error> {
         init_global_ctx();

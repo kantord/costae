@@ -67,9 +67,7 @@ pub struct PresentationThread<DM: DisplayManager> {
     pub presenter: Presenter<DM>,
 }
 
-impl<DM: DisplayManager> PresentationThread<DM>
-where DM::Error: std::fmt::Display
-{
+impl<DM: DisplayManager> PresentationThread<DM> {
     pub fn new(dm: DM) -> Self {
         Self { dm, presenter: Presenter::new() }
     }
@@ -81,32 +79,30 @@ impl<DM: DisplayManager> Default for Presenter<DM> {
     }
 }
 
-impl<DM: DisplayManager> Presenter<DM>
-where DM::Error: std::fmt::Display
-{
+impl<DM: DisplayManager> Presenter<DM> {
     pub fn new() -> Self { Self::default() }
 
     pub fn apply(&mut self, cmd: PanelCommand, dm: &mut DM) -> anyhow::Result<()> {
         match cmd {
             PanelCommand::Create(spec) => {
                 let id = spec.id.clone();
-                let panel = dm.create_window(&spec).map_err(|e| anyhow::anyhow!("{e}"))?;
+                let panel = dm.create_window(&spec)?;
                 self.panels.insert(id, panel);
             }
             PanelCommand::Move(spec) => {
                 if let Some(panel) = self.panels.get_mut(&spec.id) {
-                    dm.update_position(panel, &spec).map_err(|e| anyhow::anyhow!("{e}"))?;
+                    dm.update_position(panel, &spec)?;
                 }
             }
             PanelCommand::Resize(spec) => {
                 if let Some(panel) = self.panels.get_mut(&spec.id) {
-                    dm.update_dimensions(panel, &spec).map_err(|e| anyhow::anyhow!("{e}"))?;
+                    dm.update_dimensions(panel, &spec)?;
                 }
             }
             PanelCommand::Delete { id } => {
                 self.pending_pixels.remove(&id);
                 if let Some(panel) = self.panels.remove(&id) {
-                    dm.delete_window(panel).map_err(|e| anyhow::anyhow!("{e}"))?;
+                    dm.delete_window(panel)?;
                 }
             }
             PanelCommand::UpdatePicture { id, frame } => {
@@ -159,22 +155,21 @@ mod tests {
 
     impl DisplayManager for MockDM {
         type Panel = u32;
-        type Error = String;
-        fn create_window(&mut self, spec: &PanelSpecData) -> Result<u32, String> {
+        fn create_window(&mut self, spec: &PanelSpecData) -> anyhow::Result<u32> {
             self.next_id += 1;
             self.calls.push(format!("create:{}:{}", spec.id, self.next_id));
             Ok(self.next_id)
         }
-        fn update_position(&mut self, panel: &mut u32, spec: &PanelSpecData) -> Result<(), String> {
+        fn update_position(&mut self, panel: &mut u32, spec: &PanelSpecData) -> anyhow::Result<()> {
             self.calls.push(format!("move:{}:{}", spec.id, panel)); Ok(())
         }
-        fn update_dimensions(&mut self, panel: &mut u32, spec: &PanelSpecData) -> Result<(), String> {
+        fn update_dimensions(&mut self, panel: &mut u32, spec: &PanelSpecData) -> anyhow::Result<()> {
             self.calls.push(format!("resize:{}:{}", spec.id, panel)); Ok(())
         }
-        fn update_image(&mut self, panel: &mut u32, _bgrx: &[u8]) -> Result<(), String> {
+        fn update_image(&mut self, panel: &mut u32, _bgrx: &[u8]) -> anyhow::Result<()> {
             self.calls.push(format!("image:{}", panel)); Ok(())
         }
-        fn delete_window(&mut self, panel: u32) -> Result<(), String> {
+        fn delete_window(&mut self, panel: u32) -> anyhow::Result<()> {
             self.calls.push(format!("delete:{}", panel)); Ok(())
         }
     }

@@ -319,7 +319,6 @@ impl DisplayServer for WaylandDisplayServer {
 
 impl DisplayManager for WaylandDisplayServer {
     type Panel = WaylandPanel;
-    type Error = anyhow::Error;
 
     fn create_window(&mut self, spec: &PanelSpecData) -> Result<WaylandPanel, anyhow::Error> {
         self.create_panel(spec)
