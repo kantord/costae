@@ -32,7 +32,6 @@ pub use panel::X11PanelContext;
 
 // render
 pub use render::{
-    RenderCache,
     render_frame,
     init_global_ctx,
     preload_layout_images,

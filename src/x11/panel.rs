@@ -115,7 +115,7 @@ fn create_panel(
 
     ctx.conn.flush()?;
 
-    let bgrx = Arc::new(render_frame(None, phys_width, phys_height, ctx.dpr));
+    let bgrx = render_frame(&serde_json::Value::Null, phys_width, phys_height, ctx.dpr);
     ctx.conn.put_image(ImageFormat::Z_PIXMAP, win_id, gc, phys_width as u16, phys_height as u16, 0, 0, 0, ctx.depth, &bgrx[..])?;
     ctx.conn.flush()?;
 

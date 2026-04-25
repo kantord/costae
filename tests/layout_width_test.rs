@@ -67,7 +67,7 @@ fn padded_root_children_with_w_full_fill_content_box() {
 #[test]
 fn rendered_child_width_matches_layout_at_dpr_1_46() {
     init_global_ctx();
-    let layout = parse_layout(&serde_json::json!({
+    let content = serde_json::json!({
         "type": "container",
         "tw": "flex flex-col h-full w-full",
         "style": {"backgroundColor": "red"},
@@ -77,10 +77,8 @@ fn rendered_child_width_matches_layout_at_dpr_1_46() {
             "style": {"backgroundColor": "blue"},
             "children": []
         }]
-    }))
-    .unwrap();
-
-    let bgrx = render_frame(Some(layout), 146, 50, 1.458);
+    });
+    let bgrx = render_frame(&content, 146, 50, 1.458);
 
     let row0 = &bgrx[..146 * 4];
     let mut first_blue = None;

@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread;
 
-use costae::{init_global_ctx, parse_layout, render_frame};
+use costae::{init_global_ctx, render_frame};
 use costae::data::data_loop::{DataLoopHandle, BuiltInSource, ProcessIdentity, ProcessSource, StreamSource};
 use costae::x11::click::do_hit_test;
 use costae::x11::panel::PanelContext;
@@ -25,13 +25,6 @@ fn log_lifecycle_errors<K: std::fmt::Debug, E: std::fmt::Debug>(errors: costae::
 
 
 
-fn resolve_layout(raw_layout: &Option<serde_json::Value>) -> Option<takumi::layout::node::Node> {
-    raw_layout.as_ref().and_then(|layout| {
-        parse_layout(layout)
-            .map_err(|e| tracing::error!(error = %e, "layout parse error"))
-            .ok()
-    })
-}
 
 fn make_builtin(key: &str) -> Option<BuiltInSource> {
     use costae::x11::outputs::outputs_thread;
@@ -400,9 +393,8 @@ impl App {
             if spec.content.is_null() { continue; }
             let phys_width = (spec.width as f32 * dpr).round() as u32;
             let phys_height = (spec.height as f32 * dpr).round() as u32;
-            let layout = resolve_layout(&Some(spec.content.clone()));
-            let pixels = render_frame(layout, phys_width, phys_height, dpr);
-            let frame = PanelFrame { pixels: Arc::new(pixels), width: phys_width, height: phys_height };
+            let pixels = render_frame(&spec.content, phys_width, phys_height, dpr);
+            let frame = PanelFrame { pixels, width: phys_width, height: phys_height };
             let _ = self.command_tx.send(PanelCommand::UpdatePicture { id: spec.id.clone(), frame });
         }
     }
