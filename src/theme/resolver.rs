@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use super::{Theme, ThemeMode};
 
 pub fn resolve_tw_in_json(value: &mut serde_json::Value, theme: &Theme, mode: ThemeMode) {
@@ -27,55 +28,50 @@ pub fn resolve_tw(classes: &str, theme: &Theme, mode: ThemeMode) -> String {
     classes
         .split_whitespace()
         .filter_map(|token| {
-            let (modifier, inner) = if let Some(pos) = token.find(':') {
-                let (m, rest) = token.split_at(pos);
-                (Some(m), &rest[1..])
-            } else {
-                (None, token)
-            };
-
-            let resolved = {
-                let mut result = None;
-                for prefix in &["bg-", "text-", "border-"] {
-                    if let Some(key) = inner.strip_prefix(prefix) {
-                        if let Some(value) = colors.get(key) {
-                            let encoded = value.replace(' ', "_");
-                            result = Some(format!("{}[{}]", prefix, encoded));
-                            break;
-                        }
-                    }
-                }
-                if result.is_none() {
-                    if let Some(key) = inner.strip_prefix("rounded-") {
-                        if let Some(value) = theme.radius.get(key) {
-                            result = Some(format!("rounded-[{}]", value));
-                        }
-                    }
-                }
-                result.unwrap_or_else(|| inner.to_string())
-            };
-
-            match modifier {
-                Some("dark") => {
-                    if mode == ThemeMode::Dark {
-                        Some(resolved)
-                    } else {
-                        None
-                    }
-                }
-                Some("light") => {
-                    if mode == ThemeMode::Light {
-                        Some(resolved)
-                    } else {
-                        None
-                    }
-                }
-                Some(m) => Some(format!("{}:{}", m, resolved)),
-                None => Some(resolved),
-            }
+            let (modifier, inner) = split_modifier(token);
+            let resolved = resolve_inner(inner, colors, &theme.radius);
+            apply_modifier(modifier, resolved, mode)
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn split_modifier(token: &str) -> (Option<&str>, &str) {
+    if let Some(pos) = token.find(':') {
+        let (m, rest) = token.split_at(pos);
+        (Some(m), &rest[1..])
+    } else {
+        (None, token)
+    }
+}
+
+fn try_color(prefix: &str, input: &str, colors: &HashMap<String, String>) -> Option<String> {
+    let key = input.strip_prefix(prefix)?;
+    let value = colors.get(key)?;
+    Some(format!("{}[{}]", prefix, value.replace(' ', "_")))
+}
+
+fn try_radius(input: &str, radius: &HashMap<String, String>) -> Option<String> {
+    let key = input.strip_prefix("rounded-")?;
+    let value = radius.get(key)?;
+    Some(format!("rounded-[{}]", value))
+}
+
+fn resolve_inner(inner: &str, colors: &HashMap<String, String>, radius: &HashMap<String, String>) -> String {
+    try_color("bg-", inner, colors)
+        .or_else(|| try_color("text-", inner, colors))
+        .or_else(|| try_color("border-", inner, colors))
+        .or_else(|| try_radius(inner, radius))
+        .unwrap_or_else(|| inner.to_string())
+}
+
+fn apply_modifier(modifier: Option<&str>, resolved: String, mode: ThemeMode) -> Option<String> {
+    match modifier {
+        Some("dark") => (mode == ThemeMode::Dark).then_some(resolved),
+        Some("light") => (mode == ThemeMode::Light).then_some(resolved),
+        Some(m) => Some(format!("{}:{}", m, resolved)),
+        None => Some(resolved),
+    }
 }
 
 #[cfg(test)]
