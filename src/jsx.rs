@@ -117,13 +117,23 @@ impl Resolver for CostaeResolver {
 }
 
 /// Loads JS/JSX modules from disk, running `transform_jsx` on each file before
-/// handing the source to QuickJS.
-struct CostaeLoader;
+/// handing the source to QuickJS. Records each successfully-loaded path into
+/// the shared `loaded_paths` vec.
+struct CostaeLoader {
+    loaded_paths: Arc<Mutex<Vec<PathBuf>>>,
+}
+
+impl CostaeLoader {
+    fn new(loaded_paths: Arc<Mutex<Vec<PathBuf>>>) -> Self {
+        Self { loaded_paths }
+    }
+}
 
 impl Loader for CostaeLoader {
     fn load<'js>(&mut self, ctx: &rquickjs::Ctx<'js>, name: &str) -> rquickjs::Result<rquickjs::Module<'js>> {
         let source = std::fs::read_to_string(name)
             .map_err(|_| rquickjs::Error::new_loading(name))?;
+        self.loaded_paths.lock().unwrap().push(PathBuf::from(name));
         let transformed = transform_jsx(&source);
         rquickjs::Module::declare(ctx.clone(), name, transformed)
     }
@@ -140,6 +150,7 @@ pub struct JsxEvaluator {
     global_state: Arc<Mutex<serde_json::Map<String, serde_json::Value>>>,
     /// Always `Some` after construction; `None` only transiently during `drop`.
     render_fn: Option<Persistent<Function<'static>>>,
+    loaded_paths: Arc<Mutex<Vec<PathBuf>>>,
 }
 
 impl Drop for JsxEvaluator {
@@ -157,9 +168,10 @@ impl Drop for JsxEvaluator {
 impl JsxEvaluator {
     pub fn new(source: &str, ctx: serde_json::Value, base_dir: Option<&Path>) -> rquickjs::Result<Self> {
         let runtime = rquickjs::Runtime::new()?;
+        let loaded_paths: Arc<Mutex<Vec<PathBuf>>> = Arc::new(Mutex::new(Vec::new()));
 
         if let Some(dir) = base_dir {
-            runtime.set_loader(CostaeResolver::new(dir.to_path_buf()), CostaeLoader);
+            runtime.set_loader(CostaeResolver::new(dir.to_path_buf()), CostaeLoader::new(Arc::clone(&loaded_paths)));
         }
 
         let context = rquickjs::Context::full(&runtime)?;
@@ -215,6 +227,7 @@ impl JsxEvaluator {
             module_calls,
             global_state,
             render_fn: stored_render_fn,
+            loaded_paths,
         })
     }
 
@@ -252,6 +265,12 @@ impl JsxEvaluator {
                 module_calls: self.module_calls.lock().unwrap().clone(),
             })
         })
+    }
+
+    /// Returns the canonicalized paths of all files loaded via import statements
+    /// during `new()`. Does not include the inline layout source itself.
+    pub fn loaded_paths(&self) -> Vec<PathBuf> {
+        self.loaded_paths.lock().unwrap().clone()
     }
 }
 
@@ -462,6 +481,54 @@ export default function render() { return <text tw="text-white">{String(Foo())}<
 
         assert_eq!(result["text"], "42", "expected text=42 from imported Foo, got: {:?}", result);
         let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn loaded_paths_includes_imported_sibling() {
+        let tmp_dir = std::env::temp_dir()
+            .join(format!("costae_loaded_paths_{}", std::process::id()));
+        std::fs::create_dir_all(&tmp_dir).expect("failed to create temp dir");
+        std::fs::write(tmp_dir.join("Comp.jsx"), "export default function Comp() { return 1; }")
+            .expect("failed to write Comp.jsx");
+
+        let layout_source = r#"import Comp from './Comp.jsx';
+export default function render() { return <text tw="text-white">{String(Comp())}</text>; }"#;
+
+        let evaluator = JsxEvaluator::new(
+            layout_source,
+            serde_json::Value::Null,
+            Some(tmp_dir.as_path()),
+        )
+        .expect("JsxEvaluator::new failed");
+
+        let canonical_comp = tmp_dir.join("Comp.jsx").canonicalize()
+            .expect("canonicalize failed");
+
+        let paths = evaluator.loaded_paths();
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+
+        assert!(
+            paths.contains(&canonical_comp),
+            "loaded_paths() must include the canonicalized path of Comp.jsx; got: {:?}",
+            paths
+        );
+    }
+
+    #[test]
+    fn loaded_paths_is_empty_when_no_imports() {
+        let evaluator = JsxEvaluator::new(
+            r#"export default function render() { return <text tw="text-white">hi</text>; }"#,
+            serde_json::Value::Null,
+            None,
+        )
+        .expect("JsxEvaluator::new failed");
+
+        let paths = evaluator.loaded_paths();
+        assert!(
+            paths.is_empty(),
+            "loaded_paths() must be empty when there are no imports; got: {:?}",
+            paths
+        );
     }
 
     #[test]
