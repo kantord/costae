@@ -74,9 +74,20 @@ fn try_color(prefix: &str, input: &str, colors: &HashMap<String, String>) -> Opt
 }
 
 fn try_radius(input: &str, radius: &HashMap<String, String>) -> Option<String> {
-    let key = input.strip_prefix("rounded-")?;
-    let value = radius.get(key)?;
-    Some(format!("rounded-[{}]", value))
+    let suffix = input.strip_prefix("rounded-")?;
+    if let Some(value) = radius.get(suffix) {
+        return Some(format!("rounded-[{}]", value));
+    }
+    // directional: rounded-{dir}-{key}
+    const DIRS: &[&str] = &["t", "r", "b", "l", "tl", "tr", "br", "bl", "ss", "se", "es", "ee"];
+    for dir in DIRS {
+        if let Some(key) = suffix.strip_prefix(&format!("{}-", dir)) {
+            if let Some(value) = radius.get(key) {
+                return Some(format!("rounded-{}-[{}]", dir, value));
+            }
+        }
+    }
+    None
 }
 
 fn resolve_inner(inner: &str, colors: &HashMap<String, String>, radius: &HashMap<String, String>) -> String {
@@ -127,6 +138,7 @@ radius:
     #[case::text_muted_foreground_matches_longest_key("text-muted-foreground", ThemeMode::Dark, "text-[oklch(0.708_0_0)]")]
     #[case::border_border_dark_uses_dark_color_value("border-border", ThemeMode::Dark, "border-[oklch(1_0_0_/_10%)]")]
     #[case::rounded_lg_substitutes_radius_value("rounded-lg", ThemeMode::Dark, "rounded-[0.625rem]")]
+    #[case::rounded_t_lg("rounded-t-lg", ThemeMode::Dark, "rounded-t-[0.625rem]")]
     #[case::breakpoint_prefix_stripped_resolved_and_reattached("md:bg-primary", ThemeMode::Dark, "md:bg-[oklch(0.922_0_0)]")]
     #[case::dark_modifier_dark_mode_emits_resolved_inner_token("dark:bg-primary", ThemeMode::Dark, "bg-[oklch(0.922_0_0)]")]
     #[case::dark_modifier_light_mode_drops_token("dark:bg-primary", ThemeMode::Light, "")]
