@@ -59,8 +59,12 @@ fn log_lifecycle_errors<K: std::fmt::Debug, E: std::fmt::Debug>(errors: costae::
     }
 }
 
-
-
+fn theme_file_watch_desired(path: Option<std::path::PathBuf>) -> Vec<WatchedPath> {
+    match path {
+        Some(p) => vec![WatchedPath(p)],
+        None => vec![],
+    }
+}
 
 fn make_builtin(key: &str) -> Option<BuiltInSource> {
     use costae::x11::outputs::outputs_thread;
@@ -185,6 +189,7 @@ pub(crate) struct App {
     screen_height_logical: u32,
     panels: ManagedSet<PanelSpec>,
     import_watches: ManagedSet<WatchedPath>,
+    theme_file_watch: ManagedSet<WatchedPath>,
     watcher: SharedWatcher,
     stream_values: HashMap<(String, Option<String>), String>,
     jsx_evaluator: Option<costae::jsx::JsxEvaluator>,
@@ -211,16 +216,17 @@ fn expand_tilde(path: &str) -> std::path::PathBuf {
     }
 }
 
-fn load_theme_from_config(config_path: &std::path::Path) -> (Theme, ThemeMode) {
+fn load_theme_from_config(config_path: &std::path::Path) -> (Theme, ThemeMode, Option<std::path::PathBuf>) {
     let config = std::fs::read_to_string(config_path)
         .ok()
         .and_then(|s| CostaeConfig::from_yaml(&s).ok())
         .unwrap_or_default();
-    let theme = config.theme.file.as_deref()
-        .and_then(|f| std::fs::read_to_string(expand_tilde(f)).ok())
+    let theme_file_path = config.theme.file.as_deref().map(expand_tilde);
+    let theme = theme_file_path.as_ref()
+        .and_then(|p| std::fs::read_to_string(p).ok())
         .and_then(|s| Theme::from_yaml(&s).ok())
         .unwrap_or_else(Theme::default_theme);
-    (theme, config.theme.mode)
+    (theme, config.theme.mode, theme_file_path)
 }
 
 impl App {
@@ -247,7 +253,7 @@ impl App {
         let presenter_thread = thread::spawn(move || {
             run_x11_presenter_thread(pt, command_rx, event_tx);
         });
-        let (theme, theme_mode) = load_theme_from_config(&config_path);
+        let (theme, theme_mode, theme_file_path) = load_theme_from_config(&config_path);
         let mut state = Self {
             theme,
             theme_mode,
@@ -259,6 +265,7 @@ impl App {
             screen_height_logical,
             panels: ManagedSet::new(),
             import_watches: ManagedSet::new(),
+            theme_file_watch: ManagedSet::new(),
             watcher,
             stream_values: HashMap::new(),
             jsx_evaluator: None,
@@ -276,6 +283,7 @@ impl App {
             presenter_thread: Some(presenter_thread),
         };
         state.initial_load();
+        state.reconcile_theme_file_watch(theme_file_path);
         state
     }
 
@@ -304,7 +312,7 @@ impl App {
         let presenter_thread = thread::spawn(move || {
             run_wayland_presenter_thread(pt, command_rx, event_tx);
         });
-        let (theme, theme_mode) = load_theme_from_config(&config_path);
+        let (theme, theme_mode, theme_file_path) = load_theme_from_config(&config_path);
         let mut state = Self {
             theme,
             theme_mode,
@@ -316,6 +324,7 @@ impl App {
             screen_height_logical: screen_height,
             panels: ManagedSet::new(),
             import_watches: ManagedSet::new(),
+            theme_file_watch: ManagedSet::new(),
             watcher,
             stream_values: HashMap::new(),
             jsx_evaluator: None,
@@ -334,6 +343,7 @@ impl App {
         };
         init_global_ctx();
         state.initial_load();
+        state.reconcile_theme_file_watch(theme_file_path);
         state
     }
 
@@ -351,13 +361,28 @@ impl App {
             &move |specs| make_mod_init_value(specs, dpr, &output_name, dpi, sw, sh))
     }
 
+    fn reconcile_watch_set(
+        set: &mut ManagedSet<WatchedPath>,
+        desired: impl IntoIterator<Item = WatchedPath>,
+        watcher: &mut SharedWatcher,
+    ) {
+        log_lifecycle_errors(set.reconcile(desired, watcher, &mut ()));
+    }
+
     fn reconcile_import_watches(&mut self, paths: Vec<std::path::PathBuf>) {
-        let errors = self.import_watches.reconcile(
+        Self::reconcile_watch_set(
+            &mut self.import_watches,
             paths.into_iter().map(WatchedPath),
             &mut self.watcher,
-            &mut (),
         );
-        log_lifecycle_errors(errors);
+    }
+
+    fn reconcile_theme_file_watch(&mut self, path: Option<std::path::PathBuf>) {
+        Self::reconcile_watch_set(
+            &mut self.theme_file_watch,
+            theme_file_watch_desired(path),
+            &mut self.watcher,
+        );
     }
 
     fn initial_load(&mut self) {
@@ -388,7 +413,7 @@ impl App {
 
     fn handle_layout_reload(&mut self) -> bool {
         if self.reload_rx.try_recv().is_err() { return false; }
-        let (theme, mode) = load_theme_from_config(&self.config_path);
+        let (theme, mode, theme_file_path) = load_theme_from_config(&self.config_path);
         self.theme = theme;
         self.theme_mode = mode;
 
@@ -418,6 +443,7 @@ impl App {
                 Err(e) => tracing::error!(error = %e, "JSX file error"),
             }
         }
+        self.reconcile_theme_file_watch(theme_file_path);
         tracing::info!("layout reloaded");
         true
     }
@@ -517,8 +543,9 @@ impl Drop for App {
 
 #[cfg(test)]
 mod tests {
-    use super::{make_mod_init_value, stream_calls_to_specs};
+    use super::{load_theme_from_config, make_mod_init_value, stream_calls_to_specs, theme_file_watch_desired};
     use costae::data::data_loop::StreamSource;
+    use std::path::PathBuf;
 
     fn left_spec(width: u32) -> costae::PanelSpecData {
         costae::PanelSpecData {
@@ -584,5 +611,61 @@ mod tests {
         let specs = stream_calls_to_specs(&calls);
         assert_eq!(specs.len(), 1);
         assert!(matches!(specs[0], StreamSource::BuiltIn(_)), "costae: prefix must map to BuiltIn");
+    }
+
+    /// Claim: when theme.file is set to a tilde path in config, load_theme_from_config returns the
+    /// tilde-expanded absolute path as the third tuple element.
+    #[test]
+    fn load_theme_from_config_returns_expanded_path_when_file_is_configured() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.yaml");
+        std::fs::write(&config_path, "theme:\n  file: ~/some/theme.yaml\n")
+            .expect("write config");
+
+        let (_theme, _mode, path) = load_theme_from_config(&config_path);
+
+        let home = std::env::var("HOME").expect("HOME must be set");
+        let expected = PathBuf::from(&home).join("some/theme.yaml");
+        assert_eq!(path, Some(expected),
+            "tilde in theme.file must be expanded to the real HOME directory");
+    }
+
+    /// Claim: when no theme.file is configured, load_theme_from_config returns None as the third
+    /// tuple element so the caller knows there is no file to watch.
+    #[test]
+    fn load_theme_from_config_returns_none_when_no_file_configured() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.yaml");
+        std::fs::write(&config_path, "theme:\n  mode: dark\n")
+            .expect("write config");
+
+        let (_theme, _mode, path) = load_theme_from_config(&config_path);
+
+        assert_eq!(path, None,
+            "when no theme.file is set, the returned path must be None");
+    }
+
+    /// Claim: when a theme file path is provided, `theme_file_watch_desired` returns a
+    /// single-element Vec whose entry has the given path as its key — so the caller can
+    /// reconcile a ManagedSet<WatchedPath> to watch that file.
+    #[test]
+    fn theme_file_watch_desired_with_some_path_returns_single_entry_with_that_path() {
+        let path = PathBuf::from("/tmp/my-theme.yaml");
+        let desired = theme_file_watch_desired(Some(path.clone()));
+        assert_eq!(desired.len(), 1,
+            "Some(path) must produce exactly one desired watch entry");
+        use costae::managed_set::Lifecycle;
+        assert_eq!(desired[0].key(), path,
+            "the entry's key must be the supplied path");
+    }
+
+    /// Claim: when no theme file path is present, `theme_file_watch_desired` returns an
+    /// empty Vec — so the caller can reconcile a ManagedSet<WatchedPath> to remove any
+    /// previously-registered theme watch.
+    #[test]
+    fn theme_file_watch_desired_with_none_returns_empty_vec() {
+        let desired = theme_file_watch_desired(None);
+        assert!(desired.is_empty(),
+            "None must produce an empty desired set so the old watch is removed");
     }
 }

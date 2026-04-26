@@ -47,3 +47,4 @@ cached = { version = "0.59.0", features = ["proc_macro"] }
 image = "0.25"
 tracing-test = "0.2"
 rstest = "0.23"
+tempfile = "3"
