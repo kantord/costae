@@ -1,31 +1,25 @@
-use std::collections::HashMap;
-use std::fmt::Debug;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::Duration;
 
-use costae::{RenderCache, inject_root_bg, init_global_ctx, parse_layout, render_frame};
-use costae::data::data_loop::{DataLoop, DataLoopHandle, BuiltInSource, ProcessIdentity, ProcessSource, StreamItem, StreamSource};
-use costae::x11::click::do_hit_test;
-use costae::x11::panel::{sample_root_bg, i3_dpi, X11PanelContext, PanelContext};
-use costae::managed_set::{ManagedSet, Reconcile};
+use costae::data::data_loop::{DataLoop, StreamItem};
 use costae::windowing::wayland::WaylandDisplayServer;
-use costae::panel::PanelSpec;
-use costae::windowing::{DisplayServer, WindowEvent};
+use costae::x11::panel::{i3_dpi, PanelContext};
+use costae::init_global_ctx;
+use x11rb::{
+    connection::Connection,
+    protocol::{randr::ConnectionExt as RandrExt, xproto::*},
+    rust_connection::RustConnection,
+};
 
-
-type ModuleEventTxs = Arc<std::sync::Mutex<HashMap<String, mpsc::Sender<serde_json::Value>>>>;
+mod presenter;
+mod app;
+use app::{App, TickReceivers, X11Init};
 
 const FREEZE_WATCHDOG_POLL_SECS: u64 = 10;
 const FREEZE_STALE_THRESHOLD_SECS: u64 = 10;
 const FILE_WATCHER_POLL_MS: u64 = 500;
-
-fn log_lifecycle_errors<K: Debug, E: Debug>(errors: costae::managed_set::ReconcileErrors<K, E>) {
-    for (key, err) in errors {
-        tracing::error!(key = ?key, error = ?err, "lifecycle error");
-    }
-}
 
 fn detect_backend() -> &'static str {
     if let Ok(b) = std::env::var("COSTAE_BACKEND") {
@@ -34,394 +28,6 @@ fn detect_backend() -> &'static str {
     }
     if std::env::var("WAYLAND_DISPLAY").is_ok() { "wayland" } else { "x11" }
 }
-
-pub(crate) fn make_wayland_mod_init(specs: &[costae::PanelSpecData]) -> serde_json::Value {
-    let spec = specs.iter()
-        .find(|p| p.anchor == Some(costae::PanelAnchor::Left))
-        .or_else(|| specs.first());
-    let (bar_w, og) = spec
-        .map(|p| (p.width, p.outer_gap))
-        .unwrap_or((250, 0));
-    serde_json::json!({
-        "type": "init",
-        "config": {"width": bar_w, "outer_gap": og},
-        "output": "",
-        "dpi": 96.0,
-    })
-}
-
-fn apply_wayland_eval_result(
-    out: &costae::jsx::EvalOutput,
-    handle: &DataLoopHandle,
-    panels: &mut ManagedSet<PanelSpec<WaylandDisplayServer>>,
-    server: &mut WaylandDisplayServer,
-) -> bool {
-    let specs = match costae::parse_root_node(&out.layout) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!(error = %e, "root node parse error");
-            return false;
-        }
-    };
-    let mod_init = make_wayland_mod_init(&specs);
-    let stream_specs = stream_calls_to_specs(&out.stream_calls)
-        .into_iter()
-        .map(|source| match source {
-            StreamSource::Process(mut p) => {
-                p.props = Some(mod_init.clone());
-                StreamSource::Process(p)
-            }
-            other => other,
-        })
-        .collect::<Vec<_>>();
-    handle.set_desired(stream_specs);
-    log_lifecycle_errors(panels.reconcile(specs.into_iter().map(|s| PanelSpec::<WaylandDisplayServer>(s, std::marker::PhantomData)), server, &mut ()));
-    true
-}
-
-struct App<DM: costae::display_manager::DisplayManager + 'static> {
-    dm: DM,
-    panels: ManagedSet<PanelSpec<DM>>,
-    stream_values: HashMap<(String, Option<String>), String>,
-    jsx_evaluator: Option<costae::jsx::JsxEvaluator>,
-    handle: DataLoopHandle,
-    jsx_ctx: serde_json::Value,
-    item_rx: mpsc::Receiver<((String, Option<String>), String)>,
-    bin_reload_rx: mpsc::Receiver<()>,
-    reload_rx: mpsc::Receiver<()>,
-    layout_jsx_path: std::path::PathBuf,
-    module_event_txs: ModuleEventTxs,
-    stop: Arc<AtomicBool>,
-    last_tick: Arc<std::sync::atomic::AtomicU64>,
-}
-
-impl App<WaylandDisplayServer> {
-    fn new(
-        server: WaylandDisplayServer,
-        handle: DataLoopHandle,
-        rx: TickReceivers,
-        layout_jsx_path: std::path::PathBuf,
-        module_event_txs: ModuleEventTxs,
-        stop: Arc<AtomicBool>,
-        last_tick: Arc<std::sync::atomic::AtomicU64>,
-    ) -> Self {
-        let (screen_width, screen_height) = server.primary_output_size().unwrap_or((1920, 1080));
-        let jsx_ctx = serde_json::json!({
-            "output": "wayland",
-            "dpi": 96.0,
-            "screen_width": screen_width,
-            "screen_height": screen_height,
-        });
-        let mut state = Self {
-            dm: server,
-            panels: ManagedSet::new(),
-            stream_values: HashMap::new(),
-            jsx_evaluator: None,
-            handle,
-            jsx_ctx,
-            item_rx: rx.item_rx,
-            bin_reload_rx: rx.bin_reload_rx,
-            reload_rx: rx.reload_rx,
-            layout_jsx_path,
-            module_event_txs,
-            stop,
-            last_tick,
-        };
-        state.initial_load();
-        state
-    }
-
-    fn initial_load(&mut self) {
-        if !self.layout_jsx_path.exists() { return; }
-        let source = match std::fs::read_to_string(&self.layout_jsx_path) {
-            Ok(s) => s,
-            Err(e) => { tracing::error!(error = %e, "JSX file error"); return; }
-        };
-        let base_dir = self.layout_jsx_path.parent().unwrap_or(&self.layout_jsx_path);
-        let evaluator = match costae::jsx::JsxEvaluator::new(&source, self.jsx_ctx.clone(), Some(base_dir)) {
-            Ok(e) => e,
-            Err(e) => { tracing::error!(error = %e, "JSX compile error"); return; }
-        };
-        match evaluator.eval(&self.stream_values) {
-            Ok(out) => {
-                apply_wayland_eval_result(&out, &self.handle, &mut self.panels, &mut self.dm);
-                self.jsx_evaluator = Some(evaluator);
-            }
-            Err(e) => tracing::error!(error = %e, "JSX eval error"),
-        }
-    }
-
-    fn render_configured_panels(&mut self) {
-        let dpr = 1.0_f32;
-        let key = serde_json::to_value(&self.stream_values).unwrap_or_default();
-        for panel in self.panels.iter_mut().map(|(_, p)| p) {
-            if !panel.configured { continue; }
-            let layout = panel.raw_layout.as_ref().and_then(|l| {
-                parse_layout(l).map_err(|e| tracing::error!(error = %e, "layout parse error")).ok()
-            });
-            let bgrx = render_frame(layout, panel.width, panel.height, dpr);
-            let _ = key; // cache key unused for now
-            panel.render(&bgrx);
-        }
-        self.dm.flush();
-    }
-
-    fn tick(&mut self) {
-        self.last_tick.store(
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
-            Ordering::Relaxed,
-        );
-
-        let mut needs_render = false;
-
-        let mut changed = false;
-        while let Ok((key, value)) = self.item_rx.try_recv() {
-            if self.stream_values.get(&key).map(|s| s.as_str()) != Some(value.as_str()) {
-                self.stream_values.insert(key, value);
-                changed = true;
-            }
-        }
-
-        if changed {
-            if let Some(ref evaluator) = self.jsx_evaluator {
-                match evaluator.eval(&self.stream_values) {
-                    Ok(out) => {
-                        apply_wayland_eval_result(&out, &self.handle, &mut self.panels, &mut self.dm);
-                        needs_render = true;
-                    }
-                    Err(e) => tracing::error!(error = %e, "JSX re-eval error"),
-                }
-            }
-        }
-
-        if self.bin_reload_rx.try_recv().is_ok() {
-            tracing::info!("binary changed, restarting...");
-            self.stop.store(true, Ordering::Relaxed);
-            return;
-        }
-
-        if self.reload_rx.try_recv().is_ok() {
-            self.handle.set_desired(vec![]);
-            self.stream_values.clear();
-            self.jsx_evaluator = None;
-            log_lifecycle_errors(self.panels.reconcile(vec![], &mut self.dm, &mut ()));
-            self.initial_load();
-        }
-
-        match self.dm.dispatch() {
-            Ok(events) => {
-                for event in events {
-                    match event {
-                        WindowEvent::OutputsChanged => {
-                            if let Some((w, h)) = self.dm.primary_output_size() {
-                                self.jsx_ctx["screen_width"] = serde_json::json!(w);
-                                self.jsx_ctx["screen_height"] = serde_json::json!(h);
-                                tracing::info!(screen_width = w, screen_height = h, "Wayland output changed");
-                                if let Some(ref evaluator) = self.jsx_evaluator {
-                                    match evaluator.eval(&self.stream_values) {
-                                        Ok(out) => {
-                                            apply_wayland_eval_result(&out, &self.handle, &mut self.panels, &mut self.dm);
-                                            needs_render = true;
-                                        }
-                                        Err(e) => tracing::error!(error = %e, "JSX re-eval error on output change"),
-                                    }
-                                }
-                            }
-                        }
-                        WindowEvent::Click { panel_id, x_logical, y_logical, .. } => {
-                            // panel_id is surface_id.to_string(); find matching panel by surface_id
-                            if let Some(panel) = self.panels.iter().map(|(_, p)| p)
-                                .find(|p| p.surface_id.to_string() == panel_id)
-                            {
-                                let txs = self.module_event_txs.lock().unwrap();
-                                do_hit_test(
-                                    &panel.raw_layout, &txs,
-                                    panel.width, panel.height, 1.0,
-                                    x_logical, y_logical,
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-            Err(_) => {
-                tracing::info!("Wayland compositor disconnected, exiting");
-                std::process::exit(0);
-            }
-        }
-
-        for (surface_id, new_size) in self.dm.take_pending_configures() {
-            for panel in self.panels.iter_mut().map(|(_, p)| p) {
-                if panel.surface_id != surface_id { continue; }
-                // If the compositor sent a nonzero size, use it for rendering so the buffer
-                // matches the allocated surface dimensions exactly.
-                if new_size.0 > 0 { panel.width = new_size.0; }
-                if new_size.1 > 0 { panel.height = new_size.1; }
-                panel.configured = true;
-                needs_render = true;
-            }
-        }
-
-        if needs_render {
-            self.render_configured_panels();
-        }
-    }
-}
-
-use x11rb::{
-    connection::Connection,
-    protocol::{randr::ConnectionExt as RandrExt, xproto::*},
-    rust_connection::RustConnection,
-};
-
-fn rebuild_output_map_from_stream(
-    stream_values: &HashMap<(String, Option<String>), String>,
-) -> Option<HashMap<String, (i16, i16, u32, u32)>> {
-    let json_str = stream_values.get(&("costae:outputs".to_string(), None))?;
-    let outputs: Vec<serde_json::Value> = serde_json::from_str(json_str).ok()?;
-    Some(outputs.iter().filter_map(|o| {
-        let name = o["name"].as_str()?.to_string();
-        let x = o["x"].as_i64()? as i16;
-        let y = o["y"].as_i64()? as i16;
-        let w = o["width"].as_u64()? as u32;
-        let h = o["height"].as_u64()? as u32;
-        Some((name, (x, y, w, h)))
-    }).collect())
-}
-
-fn resolve_layout(raw_layout: &Option<serde_json::Value>) -> Option<takumi::layout::node::Node> {
-    raw_layout.as_ref().and_then(|layout| {
-        parse_layout(layout)
-            .map_err(|e| tracing::error!(error = %e, "layout parse error"))
-            .ok()
-    })
-}
-
-fn make_builtin(key: &str) -> Option<BuiltInSource> {
-    use costae::x11::outputs::outputs_thread;
-    match key {
-        "costae:outputs" => Some(BuiltInSource { key: key.to_string(), func: outputs_thread }),
-        _ => None,
-    }
-}
-
-fn stream_calls_to_specs(calls: &[(String, Option<String>)]) -> Vec<StreamSource> {
-    calls.iter().map(|(bin, script)| {
-        if let Some(builtin) = make_builtin(bin) {
-            return StreamSource::BuiltIn(builtin);
-        }
-        StreamSource::Process(ProcessSource {
-            identity: ProcessIdentity {
-                bin: bin.clone(),
-                key: format!("{}:{}", bin, script.as_deref().unwrap_or("")),
-            },
-            script: script.clone(),
-            args: vec![],
-            env: std::collections::BTreeMap::new(),
-            current_dir: None,
-            props: None,
-        })
-    }).collect()
-}
-
-fn apply_eval_result(
-    out: &costae::jsx::EvalOutput,
-    handle: &DataLoopHandle,
-    panel_set: &mut ManagedSet<PanelSpec<X11PanelContext>>,
-    panel_ctx: &mut X11PanelContext,
-    mod_init_fn: &dyn Fn(&[costae::PanelSpecData]) -> serde_json::Value,
-) -> bool {
-    let specs = match costae::parse_root_node(&out.layout) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!(error = %e, "root node parse error");
-            return false;
-        }
-    };
-    let mod_init = mod_init_fn(&specs);
-
-    let module_bins: std::collections::HashSet<String> =
-        out.module_calls.iter().map(|(b, _)| b.clone()).collect();
-    let stream_specs = stream_calls_to_specs(&out.stream_calls)
-        .into_iter()
-        .filter(|s| match s {
-            StreamSource::Process(p) => !module_bins.contains(&p.identity.bin),
-            StreamSource::BuiltIn(_) => true,
-        })
-        .collect::<Vec<_>>();
-    let module_specs: Vec<StreamSource> = out.module_calls.iter().map(|(bin, _)| {
-        StreamSource::Process(ProcessSource {
-            identity: ProcessIdentity { bin: bin.clone(), key: bin.clone() },
-            script: None,
-            args: vec![],
-            env: std::collections::BTreeMap::new(),
-            current_dir: None,
-            props: Some(mod_init.clone()),
-        })
-    }).collect();
-    let combined: Vec<StreamSource> = stream_specs.into_iter().chain(module_specs).collect();
-    handle.set_desired(combined);
-
-    let panel_errors = panel_set.reconcile(
-        specs.into_iter().map(|s| PanelSpec::<X11PanelContext>(s, std::marker::PhantomData)),
-        panel_ctx, &mut (),
-    );
-    log_lifecycle_errors(panel_errors);
-    true
-}
-
-fn poll_x11_events(
-    conn: &RustConnection,
-    panel_set: &mut ManagedSet<PanelSpec<X11PanelContext>>,
-    module_event_txs: &std::sync::Mutex<HashMap<String, mpsc::Sender<serde_json::Value>>>,
-    dpr: f32,
-    depth: u8,
-    root: u32,
-    xrootpmap_atom: Option<u32>,
-) -> Result<bool, Box<dyn std::error::Error>> {
-    let mut wallpaper_changed = false;
-    while let Some(event) = conn.poll_for_event()? {
-        match event {
-            x11rb::protocol::Event::Expose(e) => {
-                if let Some(panel) = panel_set.iter().find(|(_, p)| p.win_id == e.window).map(|(_, p)| p) {
-                    tracing::debug!(panel = %panel.id, win_id = panel.win_id, "expose repaint");
-                    conn.put_image(ImageFormat::Z_PIXMAP, panel.win_id, panel.gc, panel.phys_width as u16, panel.phys_height as u16, 0, 0, 0, depth, &panel.bgrx[..])?;
-                    conn.flush()?;
-                }
-            }
-            x11rb::protocol::Event::ButtonPress(e) => {
-                let panel_ids: Vec<u32> = panel_set.iter().map(|(_, p)| p.win_id).collect();
-                tracing::debug!(event_win = e.event, x = e.event_x, y = e.event_y, known_wins = ?panel_ids, "ButtonPress");
-                if let Some(panel) = panel_set.iter().find(|(_, p)| p.win_id == e.event).map(|(_, p)| p) {
-                    let txs = module_event_txs.lock().unwrap();
-                    do_hit_test(
-                        &panel.raw_layout, &txs,
-                        panel.phys_width, panel.phys_height, dpr,
-                        e.event_x as f32, e.event_y as f32,
-                    );
-                }
-            }
-            x11rb::protocol::Event::PropertyNotify(e) => {
-                if xrootpmap_atom == Some(e.atom) {
-                    for (_, panel) in panel_set.iter_mut() {
-                        if let Some(rgba) = sample_root_bg(conn, root, panel.win_x, panel.win_y, panel.phys_width, panel.phys_height, xrootpmap_atom) {
-                            panel.root_bg_rgba = rgba;
-                            tracing::debug!(panel = %panel.id, "root bg updated");
-                        }
-                        panel.render_cache = RenderCache::new(30);
-                    }
-                    wallpaper_changed = true;
-                }
-            }
-            x11rb::protocol::Event::Error(e) => {
-                tracing::error!(error = ?e, "X11 async error");
-            }
-            _ => {}
-        }
-    }
-    Ok(wallpaper_changed)
-}
-
 
 fn init_logging() {
     tracing_subscriber::fmt()
@@ -504,11 +110,6 @@ fn spawn_binary_watcher(
     spawn_file_watcher(path, baseline, bin_reload_tx, dl_wake_tx);
 }
 
-struct X11Init {
-    panel_ctx: PanelContext,
-    jsx_ctx: serde_json::Value,
-}
-
 fn init_x11() -> Result<X11Init, Box<dyn std::error::Error>> {
     let (conn, screen_num) = RustConnection::connect(None)?;
     let conn = Arc::new(conn);
@@ -575,214 +176,6 @@ fn init_x11() -> Result<X11Init, Box<dyn std::error::Error>> {
     Ok(X11Init { panel_ctx, jsx_ctx })
 }
 
-fn make_mod_init_value(
-    specs: &[costae::PanelSpecData],
-    dpr: f32,
-    output_name: &str,
-    dpi: f32,
-    screen_width_logical: u32,
-    screen_height_logical: u32,
-) -> serde_json::Value {
-    let spec = specs.iter()
-        .find(|p| p.anchor == Some(costae::PanelAnchor::Left))
-        .or_else(|| specs.first());
-    let (bar_w, og) = spec
-        .map(|p| ((p.width as f32 * dpr).round() as u32, (p.outer_gap as f32 * dpr).round() as u32))
-        .unwrap_or((250, 0));
-    serde_json::json!({
-        "type": "init",
-        "config": {"width": bar_w, "outer_gap": og},
-        "output": output_name,
-        "dpi": dpi,
-        "screen_width": screen_width_logical,
-        "screen_height": screen_height_logical,
-    })
-}
-
-struct TickReceivers {
-    item_rx: mpsc::Receiver<((String, Option<String>), String)>,
-    bin_reload_rx: mpsc::Receiver<()>,
-    reload_rx: mpsc::Receiver<()>,
-}
-
-
-impl App<X11PanelContext> {
-    fn new(
-        x11: X11Init,
-        handle: DataLoopHandle,
-        rx: TickReceivers,
-        layout_jsx_path: std::path::PathBuf,
-        module_event_txs: ModuleEventTxs,
-        stop: Arc<AtomicBool>,
-        last_tick: Arc<std::sync::atomic::AtomicU64>,
-    ) -> Self {
-        let X11Init { panel_ctx, jsx_ctx } = x11;
-        let mut state = Self {
-            dm: panel_ctx,
-            panels: ManagedSet::new(),
-            stream_values: HashMap::new(),
-            jsx_evaluator: None,
-            handle,
-            jsx_ctx,
-            item_rx: rx.item_rx,
-            bin_reload_rx: rx.bin_reload_rx,
-            reload_rx: rx.reload_rx,
-            layout_jsx_path,
-            module_event_txs,
-            stop,
-            last_tick,
-        };
-        state.initial_load();
-        state
-    }
-
-    fn make_mod_init_fn(&self) -> impl Fn(&[costae::PanelSpecData]) -> serde_json::Value {
-        let dpr = self.dm.dpr;
-        let dpi = self.dm.dpi;
-        let sw = self.dm.screen_width_logical;
-        let sh = self.dm.screen_height_logical;
-        let output_name = self.dm.output_name.clone();
-        move |specs| make_mod_init_value(specs, dpr, &output_name, dpi, sw, sh)
-    }
-
-    fn initial_load(&mut self) {
-        if !self.layout_jsx_path.exists() { return; }
-        let source = match std::fs::read_to_string(&self.layout_jsx_path) {
-            Ok(s) => s,
-            Err(e) => { tracing::error!(error = %e, "JSX file error"); return; }
-        };
-        let t = std::time::Instant::now();
-        let base_dir = self.layout_jsx_path.parent().unwrap_or(&self.layout_jsx_path);
-        let evaluator = match costae::jsx::JsxEvaluator::new(&source, self.jsx_ctx.clone(), Some(base_dir)) {
-            Ok(e) => e,
-            Err(e) => { tracing::error!(error = %e, "JSX compile error"); return; }
-        };
-        match evaluator.eval(&self.stream_values) {
-            Ok(out) => {
-                tracing::debug!(elapsed_ms = t.elapsed().as_millis(), "jsx eval");
-                let make_mod_init = self.make_mod_init_fn();
-                apply_eval_result(&out, &self.handle, &mut self.panels, &mut self.dm, &make_mod_init);
-                self.jsx_evaluator = Some(evaluator);
-            }
-            Err(e) => tracing::error!(error = %e, "JSX eval error"),
-        }
-    }
-
-    fn tick(&mut self) {
-        self.last_tick.store(
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
-            Ordering::Relaxed,
-        );
-
-        let mut needs_render = false;
-
-        let mut changed = false;
-        while let Ok((key, value)) = self.item_rx.try_recv() {
-            if self.stream_values.get(&key).map(|s| s.as_str()) != Some(value.as_str()) {
-                self.stream_values.insert(key, value);
-                changed = true;
-            }
-        }
-
-        let make_mod_init = self.make_mod_init_fn();
-
-        if changed {
-            if let Some(new_map) = rebuild_output_map_from_stream(&self.stream_values) {
-                self.dm.output_map = Arc::new(new_map);
-            }
-            if let Some(ref evaluator) = self.jsx_evaluator {
-                let t = std::time::Instant::now();
-                match evaluator.eval(&self.stream_values) {
-                    Ok(out) => {
-                        tracing::debug!(elapsed_us = t.elapsed().as_micros(), "jsx re-eval");
-                        if apply_eval_result(&out, &self.handle, &mut self.panels, &mut self.dm, &make_mod_init) {
-                            needs_render = true;
-                        }
-                    }
-                    Err(e) => tracing::error!(error = %e, "JSX re-eval error"),
-                }
-            }
-        }
-
-        if self.bin_reload_rx.try_recv().is_ok() {
-            tracing::info!("binary changed, restarting...");
-            self.stop.store(true, Ordering::Relaxed);
-            return;
-        }
-
-        if self.handle_layout_reload(&make_mod_init) {
-            needs_render = true;
-        }
-
-        match poll_x11_events(
-            &self.dm.conn, &mut self.panels, &self.module_event_txs,
-            self.dm.dpr, self.dm.depth, self.dm.root, self.dm.xrootpmap_atom,
-        ) {
-            Ok(wallpaper_changed) => { if wallpaper_changed { needs_render = true; } }
-            Err(e) => tracing::error!(error = %e, "X11 event error"),
-        }
-
-        if needs_render {
-            let key = serde_json::to_value(&self.stream_values).unwrap_or_default();
-            for (_, panel) in self.panels.iter_mut() {
-                inject_root_bg(panel.root_bg_rgba.clone(), panel.phys_width, panel.phys_height);
-                panel.bgrx = panel.render_cache.get_or_render(&key, || {
-                    let t = std::time::Instant::now();
-                    let layout = resolve_layout(&panel.raw_layout);
-                    tracing::debug!(elapsed_us = t.elapsed().as_micros(), "resolve_layout");
-                    render_frame(layout, panel.phys_width, panel.phys_height, self.dm.dpr)
-                });
-                tracing::debug!(panel = %panel.id, win_id = panel.win_id, "put_image");
-                if let Err(e) = self.dm.conn.put_image(ImageFormat::Z_PIXMAP, panel.win_id, panel.gc, panel.phys_width as u16, panel.phys_height as u16, 0, 0, 0, self.dm.depth, &panel.bgrx[..]) {
-                    tracing::error!(error = %e, "put_image failed");
-                }
-            }
-            if let Err(e) = self.dm.conn.flush() {
-                tracing::error!(error = %e, "flush failed");
-            }
-            tracing::debug!("flush ok");
-        }
-    }
-
-    fn handle_layout_reload(&mut self, mod_init_fn: &dyn Fn(&[costae::PanelSpecData]) -> serde_json::Value) -> bool {
-        if self.reload_rx.try_recv().is_err() {
-            return false;
-        }
-        self.handle.set_desired(vec![]);
-        self.stream_values.clear();
-        self.jsx_evaluator = None;
-
-        if self.layout_jsx_path.exists() {
-            match std::fs::read_to_string(&self.layout_jsx_path) {
-                Ok(source) => {
-                    let base_dir = self.layout_jsx_path.parent().unwrap_or(&self.layout_jsx_path);
-                    match costae::jsx::JsxEvaluator::new(&source, self.jsx_ctx.clone(), Some(base_dir)) {
-                        Ok(evaluator) => match evaluator.eval(&self.stream_values) {
-                            Ok(out) => {
-                                apply_eval_result(&out, &self.handle, &mut self.panels, &mut self.dm, mod_init_fn);
-                                self.jsx_evaluator = Some(evaluator);
-                            }
-                            Err(e) => tracing::error!(error = %e, "JSX eval error"),
-                        },
-                        Err(e) => tracing::error!(error = %e, "JSX compile error"),
-                    }
-                },
-                Err(e) => tracing::error!(error = %e, "JSX file error"),
-            }
-        }
-        tracing::info!("layout reloaded");
-        true
-    }
-}
-
-impl<DM: costae::display_manager::DisplayManager + 'static> Drop for App<DM> {
-    fn drop(&mut self) {
-        let panel_errors = self.panels.reconcile(vec![], &mut self.dm, &mut ());
-        log_lifecycle_errors(panel_errors);
-        self.dm.flush();
-    }
-}
-
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_logging();
 
@@ -802,8 +195,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let last_tick = Arc::new(std::sync::atomic::AtomicU64::new(0));
     spawn_freeze_watchdog(Arc::clone(&last_tick), log_path);
 
-    // Shared wake channel: file watchers and bi-streams ping this to interrupt
-    // DataLoop's recv_timeout early.
     let (dl_wake_tx, dl_wake_rx) = mpsc::sync_channel::<()>(1);
 
     let (reload_tx, reload_rx) = mpsc::channel::<()>();
@@ -823,12 +214,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         spawn_binary_watcher(exe_path.clone(), exe_baseline, bin_reload_tx, dl_wake_tx.clone());
     }
 
-    // DataLoop manages all subprocesses (string streams and modules).
     let (mut data_loop, handle) = DataLoop::new();
     data_loop = data_loop.with_extra_rx(dl_wake_rx);
     let module_event_txs = data_loop.event_txs_handle();
 
-    // Cross-closure channel: on_item sends key/value here, on_tick processes them.
     let (item_tx, item_rx) = mpsc::channel::<((String, Option<String>), String)>();
     let stop = Arc::new(AtomicBool::new(false));
     let rx = TickReceivers { item_rx, bin_reload_rx, reload_rx };
@@ -837,8 +226,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if backend == "wayland" {
         tracing::info!("display backend: Wayland");
         let server = WaylandDisplayServer::connect()?;
-        init_global_ctx();
-        let mut wayland_state = App::<WaylandDisplayServer>::new(
+        let mut app = App::new_wayland(
             server, handle, rx, layout_jsx_path,
             Arc::clone(&module_event_txs),
             Arc::clone(&stop), Arc::clone(&last_tick),
@@ -846,23 +234,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         data_loop.run(
             Arc::clone(&stop),
             move |item: StreamItem| { let _ = item_tx.send((item.key, item.line)); },
-            move || wayland_state.tick(),
+            move || app.tick(),
         );
     } else {
         tracing::info!("display backend: X11");
         let x11 = init_x11()?;
-        let mut tick_state = App::<X11PanelContext>::new(
+        let mut app = App::new_x11(
             x11, handle, rx, layout_jsx_path, module_event_txs,
             Arc::clone(&stop), Arc::clone(&last_tick),
         );
         data_loop.run(
             Arc::clone(&stop),
             move |item: StreamItem| { let _ = item_tx.send((item.key, item.line)); },
-            move || tick_state.tick(),
+            move || app.tick(),
         );
     }
 
-    // run() returned because stop was set (binary reload). TickState::drop handles cleanup.
+    // run() returned because stop was set (binary reload). App::drop handles cleanup.
     use std::os::unix::process::CommandExt;
     let mut cmd = std::process::Command::new(&exe_path);
     cmd.env("COSTAE_BACKEND", backend);
@@ -874,87 +262,4 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = cmd.exec();
 
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::stream_calls_to_specs;
-    use super::make_wayland_mod_init;
-    use costae::data::data_loop::StreamSource;
-
-    fn left_spec(width: u32) -> costae::PanelSpecData {
-        costae::PanelSpecData {
-            id: "p".into(),
-            width,
-            height: 30,
-            x: 0,
-            y: 0,
-            outer_gap: 0,
-            above: false,
-            output: None,
-            anchor: Some(costae::PanelAnchor::Left),
-            content: serde_json::Value::Null,
-        }
-    }
-
-    /// Claim: output field must be "" (empty string), NOT "wayland" or any compositor name.
-    /// This test would fail with the buggy implementation that returned "wayland".
-    #[test]
-    fn make_wayland_mod_init_output_is_empty_string() {
-        let specs = vec![left_spec(250)];
-        let result = make_wayland_mod_init(&specs);
-        assert_eq!(
-            result["output"].as_str(),
-            Some(""),
-            "output must be empty string — if it is \"wayland\", fetch_workspaces filters all workspaces",
-        );
-    }
-
-    /// Claim: type field must be "init".
-    #[test]
-    fn make_wayland_mod_init_type_is_init() {
-        let specs = vec![left_spec(250)];
-        let result = make_wayland_mod_init(&specs);
-        assert_eq!(
-            result["type"].as_str(),
-            Some("init"),
-            "type must be \"init\"",
-        );
-    }
-
-    /// Claim: config.width must match the width of the left-anchored spec.
-    #[test]
-    fn make_wayland_mod_init_config_width_matches_left_anchor_spec() {
-        let specs = vec![left_spec(320)];
-        let result = make_wayland_mod_init(&specs);
-        assert_eq!(
-            result["config"]["width"].as_u64(),
-            Some(320),
-            "config.width must match the left-anchored spec width",
-        );
-    }
-
-    #[test]
-    fn stream_calls_to_specs_maps_calls_to_process_sources() {
-        let calls = vec![
-            ("bash".to_string(), None),
-            ("python".to_string(), Some("print('hi')".to_string())),
-        ];
-        let specs = stream_calls_to_specs(&calls);
-        assert_eq!(specs.len(), 2);
-        let StreamSource::Process(ref s0) = specs[0] else { panic!("expected Process") };
-        assert_eq!(s0.identity.bin, "bash");
-        assert_eq!(s0.script, None);
-        let StreamSource::Process(ref s1) = specs[1] else { panic!("expected Process") };
-        assert_eq!(s1.identity.bin, "python");
-        assert_eq!(s1.script, Some("print('hi')".to_string()));
-    }
-
-    #[test]
-    fn stream_calls_to_specs_routes_costae_prefix_to_builtin() {
-        let calls = vec![("costae:outputs".to_string(), None)];
-        let specs = stream_calls_to_specs(&calls);
-        assert_eq!(specs.len(), 1);
-        assert!(matches!(specs[0], StreamSource::BuiltIn(_)), "costae: prefix must map to BuiltIn");
-    }
 }

@@ -11,6 +11,8 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
 use crate::managed_set::{ManagedSet, Reconcile};
+use crate::managed_set::reconcile::ReconcileErrors;
+use costae_lifecycle_derive::Ephemeral;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum StreamKind {
@@ -46,10 +48,47 @@ impl DataLoopHandle {
     }
 }
 
-pub struct DataLoop {
-    process_pool: ManagedSet<ProcessSource>,
-    builtin_pool: ManagedSet<BuiltInSource>,
+#[derive(Ephemeral)]
+struct ProcessPool {
+    #[reconciler(output = stream_tx)]
+    inner: ManagedSet<ProcessSource>,
     stream_tx: mpsc::Sender<StreamItem>,
+}
+
+impl ProcessPool {
+    fn new(stream_tx: mpsc::Sender<StreamItem>) -> Self {
+        Self { inner: ManagedSet::new(), stream_tx }
+    }
+    fn reconcile(&mut self, desired: Vec<ProcessSource>) -> ReconcileErrors<ProcessIdentity, SpawnError> {
+        self.inner.reconcile(desired, &mut (), &mut self.stream_tx)
+    }
+    fn get(&self, identity: &ProcessIdentity) -> Option<&ProcessState> {
+        self.inner.get(identity)
+    }
+    fn iter(&self) -> impl Iterator<Item = (&ProcessIdentity, &ProcessState)> {
+        self.inner.iter()
+    }
+}
+
+#[derive(Ephemeral)]
+struct BuiltInPool {
+    #[reconciler(output = stream_tx)]
+    inner: ManagedSet<BuiltInSource>,
+    stream_tx: mpsc::Sender<StreamItem>,
+}
+
+impl BuiltInPool {
+    fn new(stream_tx: mpsc::Sender<StreamItem>) -> Self {
+        Self { inner: ManagedSet::new(), stream_tx }
+    }
+    fn reconcile(&mut self, desired: Vec<BuiltInSource>) -> ReconcileErrors<String, std::convert::Infallible> {
+        self.inner.reconcile(desired, &mut (), &mut self.stream_tx)
+    }
+}
+
+pub struct DataLoop {
+    process_pool: ProcessPool,
+    builtin_pool: BuiltInPool,
     desired_processes: Vec<ProcessSource>,
     desired_builtins: Vec<BuiltInSource>,
     timeout: Option<Duration>,
@@ -67,9 +106,8 @@ impl DataLoop {
         let (desired_tx, desired_rx) = mpsc::channel();
         let event_txs_snapshot = Arc::new(Mutex::new(HashMap::new()));
         let data_loop = Self {
-            process_pool: ManagedSet::new(),
-            builtin_pool: ManagedSet::new(),
-            stream_tx,
+            process_pool: ProcessPool::new(stream_tx.clone()),
+            builtin_pool: BuiltInPool::new(stream_tx),
             desired_processes: Vec::new(),
             desired_builtins: Vec::new(),
             timeout: None,
@@ -108,7 +146,7 @@ impl DataLoop {
         while let Ok(sources) = self.desired_rx.try_recv() {
             self.set_desired(sources);
         }
-        let errors = self.process_pool.reconcile(self.desired_processes.clone(), &mut (), &mut self.stream_tx);
+        let errors = self.process_pool.reconcile(self.desired_processes.clone());
         log_lifecycle_errors(errors);
         if let Some(state) = self.process_pool.get(identity) {
             let _ = state.event_tx.send(event);
@@ -130,9 +168,9 @@ impl DataLoop {
             .filter(|s| seen.insert(s.identity.clone()))
             .collect();
         self.desired_builtins = builtins;
-        let proc_errors = self.process_pool.reconcile(self.desired_processes.clone(), &mut (), &mut self.stream_tx);
+        let proc_errors = self.process_pool.reconcile(self.desired_processes.clone());
         log_lifecycle_errors(proc_errors);
-        let builtin_errors = self.builtin_pool.reconcile(self.desired_builtins.clone(), &mut (), &mut self.stream_tx);
+        let builtin_errors = self.builtin_pool.reconcile(self.desired_builtins.clone());
         log_lifecycle_errors(builtin_errors);
         self.update_event_txs_snapshot();
     }
@@ -175,9 +213,9 @@ impl DataLoop {
             }
 
             // Reconcile: enter new, exit removed, update existing (restarts crashed processes).
-            let proc_errors = self.process_pool.reconcile(self.desired_processes.clone(), &mut (), &mut self.stream_tx);
+            let proc_errors = self.process_pool.reconcile(self.desired_processes.clone());
             log_lifecycle_errors(proc_errors);
-            let builtin_errors = self.builtin_pool.reconcile(self.desired_builtins.clone(), &mut (), &mut self.stream_tx);
+            let builtin_errors = self.builtin_pool.reconcile(self.desired_builtins.clone());
             log_lifecycle_errors(builtin_errors);
             self.update_event_txs_snapshot();
 

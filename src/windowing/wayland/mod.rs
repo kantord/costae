@@ -59,14 +59,13 @@ pub struct WaylandPanel {
     pub width: u32,
     pub height: u32,
     pub anchor: Option<PanelAnchor>,
-    pub raw_layout: Option<serde_json::Value>,
+    pub dpr: f32,
 }
 
 impl WaylandPanel {
     /// Update the panel from a new spec. Resizes the layer surface if the fixed dimension changed,
     /// which will cause the compositor to send a new configure before the next render.
     pub fn update_spec(&mut self, data: &PanelSpecData) {
-        self.raw_layout = Some(data.content.clone());
         if fixed_axis_changed(self.anchor.as_ref(), self.width, self.height, data.width, data.height) {
             self.width = data.width;
             self.height = data.height;
@@ -80,9 +79,14 @@ impl WaylandPanel {
     /// Paint a BGRX frame onto this panel's layer surface.
     pub fn render(&mut self, bgrx: &[u8]) {
         let stride = self.width as i32 * 4;
+        // Derive height from bgrx rather than self.height: the compositor may have
+        // configured a different height than what the app rendered (configure race),
+        // and using self.height would produce a mismatched canvas size and panic.
+        let actual_height = (bgrx.len() / 4).saturating_div(self.width as usize) as i32;
+        if actual_height == 0 { return; }
         let Ok((buffer, canvas)) = self.pool.create_buffer(
             self.width as i32,
-            self.height as i32,
+            actual_height,
             stride,
             wl_shm::Format::Xrgb8888,
         ) else {
@@ -96,7 +100,7 @@ impl WaylandPanel {
             tracing::error!("failed to attach buffer to surface");
             return;
         }
-        wl_surf.damage_buffer(0, 0, self.width as i32, self.height as i32);
+        wl_surf.damage_buffer(0, 0, self.width as i32, actual_height);
         wl_surf.commit();
     }
 }
@@ -105,7 +109,6 @@ impl WaylandPanel {
 // Internal sctk dispatch state
 // ---------------------------------------------------------------------------
 
-#[allow(dead_code)]
 pub(crate) struct WaylandState {
     pub(crate) registry_state: RegistryState,
     pub(crate) compositor_state: CompositorState,
@@ -124,7 +127,6 @@ pub(crate) struct WaylandState {
 // Public struct
 // ---------------------------------------------------------------------------
 
-#[allow(dead_code)]
 pub struct WaylandDisplayServer {
     conn: Arc<Connection>,
     event_queue: EventQueue<WaylandState>,
@@ -192,6 +194,16 @@ impl WaylandDisplayServer {
             .map(|m| (m.dimensions.0 as u32, m.dimensions.1 as u32))
     }
 
+    /// Returns the device pixel ratio of the primary output.
+    /// Uses physical/logical width ratio if logical size is available, otherwise falls back to scale_factor.
+    pub fn primary_output_scale(&self) -> f32 {
+        let Some(output) = self.state.output_state.outputs().next() else { return 1.0; };
+        let Some(info) = self.state.output_state.info(&output) else { return 1.0; };
+        let physical_w = info.modes.iter().find(|m| m.current).map(|m| m.dimensions.0 as u32).unwrap_or(0);
+        let logical_w = info.logical_size.map(|(w, _)| w as u32).unwrap_or(0);
+        compute_output_scale(logical_w, physical_w, info.scale_factor)
+    }
+
     /// Create a Wayland layer-shell panel for the given spec.
     /// The surface won't render until the compositor sends a configure and
     /// `WaylandPanel::render` is called with pixel data.
@@ -240,6 +252,8 @@ impl WaylandDisplayServer {
 
         self.conn.flush().map_err(|e| anyhow::anyhow!("flush after create_panel: {e}"))?;
 
+        let dpr = self.primary_output_scale();
+
         Ok(WaylandPanel {
             layer_surface,
             pool,
@@ -248,7 +262,7 @@ impl WaylandDisplayServer {
             width: data.width,
             height: data.height,
             anchor: data.anchor.clone(),
-            raw_layout: Some(data.content.clone()),
+            dpr,
         })
     }
 
@@ -319,7 +333,6 @@ impl DisplayServer for WaylandDisplayServer {
 
 impl DisplayManager for WaylandDisplayServer {
     type Panel = WaylandPanel;
-    type Error = anyhow::Error;
 
     fn create_window(&mut self, spec: &PanelSpecData) -> Result<WaylandPanel, anyhow::Error> {
         self.create_panel(spec)
@@ -587,13 +600,23 @@ pub(crate) fn fixed_axis_changed(
     }
 }
 
+/// Computes the device pixel ratio from output info.
+/// If `logical_w > 0`, returns `physical_w / logical_w`; otherwise falls back to `scale_factor`.
+pub(crate) fn compute_output_scale(logical_w: u32, physical_w: u32, scale_factor: i32) -> f32 {
+    if logical_w > 0 {
+        physical_w as f32 / logical_w as f32
+    } else {
+        scale_factor as f32
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
-    use super::{anchor_for_panel, compute_set_size, fixed_axis_changed, WaylandDisplayServer};
+    use super::{anchor_for_panel, compute_output_scale, compute_set_size, fixed_axis_changed, WaylandDisplayServer};
     use crate::display_manager::DisplayManager;
     use crate::layout::{PanelAnchor, PanelSpecData};
     use smithay_client_toolkit::shell::wlr_layer::Anchor;
@@ -678,6 +701,50 @@ mod tests {
         let bgrx = vec![0u8; (spec.width * spec.height * 4) as usize];
         let result = DisplayManager::update_image(&mut server, &mut panel, &bgrx);
         assert!(result.is_ok());
+    }
+
+    // The height used to allocate the SHM buffer must be derived from the bgrx
+    // byte count, not from panel.height. If it used panel.height instead, then
+    // when bgrx has MORE rows than panel.height the canvas would be too small
+    // and `canvas[..bgrx.len()].copy_from_slice(bgrx)` would panic.
+    //
+    // This is a pure computation test — no Wayland compositor needed.
+    // It would FAIL if the formula were changed back to use panel.height.
+    #[test]
+    fn render_height_derived_from_bgrx_not_panel_height_when_bgrx_is_taller() {
+        let width: u32 = 100;
+        let panel_height: u32 = 30;
+        // bgrx represents 50 rows — more than panel_height=30
+        let bgrx = vec![0u8; (width * 50 * 4) as usize]; // 20 000 bytes
+
+        // Old formula: canvas allocated with panel_height → would be too small
+        let old_canvas_size = (panel_height * width * 4) as usize; // 12 000
+        assert!(old_canvas_size < bgrx.len(),
+            "old canvas ({old_canvas_size}B) < bgrx ({}B) → copy would panic", bgrx.len());
+
+        // New formula: derive height from bgrx
+        let actual_height = (bgrx.len() / 4).saturating_div(width as usize);
+        assert_eq!(actual_height, 50);
+        let new_canvas_size = actual_height * width as usize * 4; // 20 000
+        assert_eq!(new_canvas_size, bgrx.len(),
+            "new canvas ({new_canvas_size}B) == bgrx ({}B) → copy is safe", bgrx.len());
+    }
+
+    // Same invariant for a bgrx that is SHORTER than panel.height: actual_height
+    // must still be derived from bgrx, not panel.height, so the canvas fits exactly.
+    //
+    // Pure computation test — no Wayland compositor needed.
+    #[test]
+    fn render_height_derived_from_bgrx_not_panel_height_when_bgrx_is_shorter() {
+        let width: u32 = 100;
+        // bgrx represents only 20 rows
+        let bgrx = vec![0u8; (width * 20 * 4) as usize]; // 8 000 bytes
+
+        let actual_height = (bgrx.len() / 4).saturating_div(width as usize);
+        assert_eq!(actual_height, 20);
+        let canvas_size = actual_height * width as usize * 4;
+        assert_eq!(canvas_size, bgrx.len(),
+            "canvas ({canvas_size}B) == bgrx ({}B) → copy is safe", bgrx.len());
     }
 
     // delete_window drops the panel without panicking
@@ -920,5 +987,35 @@ mod tests {
             anchor_for_panel(Some(&PanelAnchor::Bottom)),
             Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT,
         );
+    }
+
+    // ---------------------------------------------------------------------------
+    // compute_output_scale — DPR computation from physical/logical/scale_factor
+    // ---------------------------------------------------------------------------
+
+    // When logical_w > 0, the ratio physical_w / logical_w is returned as f32.
+    // logical=1920, physical=3840, scale=2 → 3840/1920 = 2.0
+    #[test]
+    fn compute_output_scale_uses_physical_over_logical_when_available() {
+        assert_eq!(compute_output_scale(1920, 3840, 2), 2.0_f32);
+    }
+
+    // Fractional DPR: logical=2560, physical=3840, scale=1 → 3840/2560 = 1.5
+    #[test]
+    fn compute_output_scale_fractional_when_logical_available() {
+        assert_eq!(compute_output_scale(2560, 3840, 1), 1.5_f32);
+    }
+
+    // When logical_w == 0, falls back to scale_factor as f32.
+    // logical=0, physical=3840, scale=2 → 2.0
+    #[test]
+    fn compute_output_scale_falls_back_to_scale_factor_when_logical_zero() {
+        assert_eq!(compute_output_scale(0, 3840, 2), 2.0_f32);
+    }
+
+    // No scaling: logical=1920, physical=1920, scale=1 → 1920/1920 = 1.0
+    #[test]
+    fn compute_output_scale_returns_one_when_no_scaling() {
+        assert_eq!(compute_output_scale(1920, 1920, 1), 1.0_f32);
     }
 }

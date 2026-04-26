@@ -1,13 +1,14 @@
-use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use lru::LruCache;
+use cached::proc_macro::cached;
 use takumi::{
     GlobalContext,
     layout::{Viewport, node::Node},
     rendering::{RenderOptions, render},
     resources::{font::FontResource, image::ImageSource},
 };
+
+use crate::layout::parse_layout;
 
 static GLOBAL_CTX: OnceLock<Mutex<GlobalContext>> = OnceLock::new();
 
@@ -27,51 +28,27 @@ where
     f(&g)
 }
 
-/// LRU cache of rendered frames keyed on the canonical JSON of `module_values`.
+/// Render `content` into a BGRX framebuffer with an internal LRU cache (capacity 6).
 ///
-/// Canonical JSON (RFC 8785 via `json_canon`) normalises object key order so that
-/// `{"a":1,"b":2}` and `{"b":2,"a":1}` resolve to the same cache entry.
-///
-/// Frames are stored as `Arc<Vec<u8>>` so the caller can hold onto the current
-/// frame across loop iterations even after it has been evicted from the cache
-/// (e.g. the bar needs to repaint on Expose while the cache has already moved on).
-pub struct RenderCache {
-    cache: LruCache<String, Arc<Vec<u8>>>,
-}
-
-impl RenderCache {
-    pub fn new(capacity: usize) -> Self {
-        Self {
-            cache: LruCache::new(NonZeroUsize::new(capacity).unwrap()),
-        }
-    }
-
-    /// Returns a cached render if `key` matches a prior call (by canonical JSON form),
-    /// otherwise invokes `render`, caches the result, and returns it.
-    pub fn get_or_render<F>(&mut self, key: &serde_json::Value, render: F) -> Arc<Vec<u8>>
-    where
-        F: FnOnce() -> Vec<u8>,
-    {
-        let t = std::time::Instant::now();
-        let canonical = json_canon::to_string(key).unwrap_or_default();
-        if let Some(cached) = self.cache.get(&canonical) {
-            tracing::debug!(elapsed_us = t.elapsed().as_micros(), bytes = cached.len(), "render cache HIT");
-            return Arc::clone(cached);
-        }
-        let result = Arc::new(render());
-        tracing::debug!(elapsed_ms = t.elapsed().as_millis(), bytes = result.len(), "render cache MISS");
-        self.cache.put(canonical, Arc::clone(&result));
-        result
-    }
-}
-
-/// Render `layout` into a BGRX framebuffer.
-///
-/// `width` and `height` are **physical** pixels — the X11 window dimensions.
-/// `dpr = dpi / 96.0` scales CSS `px` units so that `1px` in the config equals
-/// one logical pixel regardless of display density, matching i3's own scaling.
+/// `width` and `height` are **physical** pixels. `dpr` scales CSS `px` units.
 /// The returned buffer is always `width × height × 4` bytes (BGRX).
-pub fn render_frame(layout: Option<Node>, width: u32, height: u32, dpr: f32) -> Vec<u8> {
+/// Identical calls (same content + dimensions) return a cloned Arc — no re-render.
+pub fn render_frame(content: &serde_json::Value, width: u32, height: u32, dpr: f32) -> Arc<Vec<u8>> {
+    GLOBAL_CTX.get_or_init(|| {
+        let mut ctx = GlobalContext::default();
+        load_fonts_impl(&mut ctx);
+        Mutex::new(ctx)
+    });
+    let canonical = json_canon::to_string(content).unwrap_or_default();
+    render_frame_cached(canonical, width, height, dpr.to_bits())
+}
+
+#[cached(size = 6)]
+fn render_frame_cached(canonical: String, width: u32, height: u32, dpr_bits: u32) -> Arc<Vec<u8>> {
+    let dpr = f32::from_bits(dpr_bits);
+    let layout = serde_json::from_str::<serde_json::Value>(&canonical)
+        .ok()
+        .and_then(|v| parse_layout(&v).map_err(|e| tracing::error!(error = %e, "layout parse error")).ok());
     with_global_ctx(|global| {
         let node = layout.unwrap_or_else(|| Node::container(vec![]));
         let options = RenderOptions::builder()
@@ -84,7 +61,7 @@ pub fn render_frame(layout: Option<Node>, width: u32, height: u32, dpr: f32) -> 
         for px in rgba.chunks_exact(4) {
             bgrx.extend_from_slice(&[px[2], px[1], px[0], 0x00]);
         }
-        bgrx
+        Arc::new(bgrx)
     })
 }
 
@@ -173,9 +150,26 @@ fn preload_layout_images_impl(layout: &serde_json::Value, global: &GlobalContext
 
 #[cfg(test)]
 mod tests {
-    use super::find_font_files;
+    use super::{find_font_files, render_frame};
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::Arc;
+
+    #[test]
+    fn render_frame_cache_hit_returns_same_arc() {
+        let content = serde_json::json!({});
+        let a1 = render_frame(&content, 10, 10, 1.0);
+        let a2 = render_frame(&content, 10, 10, 1.0);
+        assert!(Arc::ptr_eq(&a1, &a2), "second call with identical args must return same Arc (cache hit)");
+    }
+
+    #[test]
+    fn render_frame_different_dims_returns_distinct_arc() {
+        let content = serde_json::json!({});
+        let a1 = render_frame(&content, 10, 10, 1.0);
+        let a2 = render_frame(&content, 20, 20, 1.0);
+        assert!(!Arc::ptr_eq(&a1, &a2), "different dims must return a distinct Arc (cache miss)");
+    }
 
     /// Create a uniquely-named subdirectory inside `std::env::temp_dir()` and
     /// return its path. The caller is responsible for cleanup via `fs::remove_dir_all`.

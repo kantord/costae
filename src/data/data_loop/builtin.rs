@@ -58,7 +58,7 @@ impl Lifecycle for BuiltInSource {
         Ok(())
     }
 
-    fn exit(state: Self::State, _ctx: &mut ()) -> Result<(), Self::Error> {
+    fn exit(state: Self::State, _ctx: &mut (), _output: &mut Self::Output) -> Result<(), Self::Error> {
         state.stop.store(true, Ordering::Relaxed);
         Ok(())
     }
@@ -163,7 +163,8 @@ mod tests {
             "stop flag must be false before exit"
         );
 
-        let _ = BuiltInSource::exit(state, &mut ());
+        let (mut tx, _rx) = std::sync::mpsc::channel();
+        let _ = BuiltInSource::exit(state, &mut (), &mut tx);
 
         assert!(
             stop_clone.load(Ordering::Relaxed),

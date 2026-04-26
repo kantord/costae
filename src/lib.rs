@@ -7,6 +7,7 @@ pub mod render;
 pub mod modules;
 pub mod x11;
 pub mod managed_set;
+pub mod presentation;
 pub mod windowing;
 
 pub use takumi::GlobalContext;
@@ -27,11 +28,10 @@ pub use panel::PanelSpec;
 pub use managed_set::ManagedSet;
 
 // panel module — unified context and lifecycle
-pub use panel::{PanelContext, X11PanelContext, WaylandPanelContext, WaylandPanel};
+pub use panel::X11PanelContext;
 
 // render
 pub use render::{
-    RenderCache,
     render_frame,
     init_global_ctx,
     preload_layout_images,
@@ -44,7 +44,6 @@ pub use modules::hit_test;
 // x11
 pub use x11::{
     x11_bgrx_to_rgba,
-    inject_root_bg,
     solid_color_rgba,
     strut_partial_values_for_anchor,
 };
