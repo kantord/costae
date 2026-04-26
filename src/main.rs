@@ -73,6 +73,7 @@ fn spawn_freeze_watchdog(last_tick: Arc<std::sync::atomic::AtomicU64>, log_path:
 
 fn setup_file_watchers(
     layout_jsx_path: &std::path::Path,
+    config_yaml_path: &std::path::Path,
     exe_path: &std::path::Path,
     reload_tx: mpsc::Sender<()>,
     bin_reload_tx: mpsc::Sender<()>,
@@ -81,6 +82,8 @@ fn setup_file_watchers(
     use notify::{EventKind, RecursiveMode, Watcher};
 
     let exe = exe_path.to_path_buf();
+    let layout_jsx = layout_jsx_path.to_path_buf();
+    let config_yaml = config_yaml_path.to_path_buf();
 
     let watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
         let Ok(event) = res else { return };
@@ -92,7 +95,7 @@ fn setup_file_watchers(
             if *path == exe {
                 let _ = bin_reload_tx.send(());
                 let _ = dl_wake_tx.try_send(());
-            } else {
+            } else if *path == layout_jsx || *path == config_yaml {
                 let _ = reload_tx.send(());
                 let _ = dl_wake_tx.try_send(());
             }
@@ -104,11 +107,14 @@ fn setup_file_watchers(
 
     {
         let mut w = watcher.lock().unwrap();
-        w.watch(layout_jsx_path, RecursiveMode::NonRecursive)
-            .expect("failed to watch layout file");
-        if exe_path.exists() {
-            w.watch(exe_path, RecursiveMode::NonRecursive)
-                .expect("failed to watch binary");
+        for dir in [layout_jsx_path, config_yaml_path, exe_path]
+            .iter()
+            .filter_map(|p| p.parent())
+            .collect::<std::collections::HashSet<_>>()
+        {
+            if dir.exists() {
+                let _ = w.watch(dir, RecursiveMode::NonRecursive);
+            }
         }
     }
 
@@ -205,15 +211,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (bin_reload_tx, bin_reload_rx) = mpsc::channel::<()>();
     let _watcher = setup_file_watchers(
         &layout_jsx_path,
+        &config_yaml_path,
         &exe_path,
         reload_tx,
         bin_reload_tx,
         dl_wake_tx.clone(),
     );
-    {
-        use notify::{RecursiveMode, Watcher};
-        let _ = _watcher.lock().unwrap().watch(&config_yaml_path, RecursiveMode::NonRecursive);
-    }
 
     let (mut data_loop, handle) = DataLoop::new();
     data_loop = data_loop.with_extra_rx(dl_wake_rx);
