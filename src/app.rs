@@ -222,10 +222,22 @@ fn load_theme_from_config(config_path: &std::path::Path) -> (Theme, ThemeMode, O
         .and_then(|s| CostaeConfig::from_yaml(&s).ok())
         .unwrap_or_default();
     let theme_file_path = config.theme.file.as_deref().map(expand_tilde);
-    let theme = theme_file_path.as_ref()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|s| Theme::from_yaml(&s).ok())
-        .unwrap_or_else(Theme::default_theme);
+    let theme = match theme_file_path.as_ref() {
+        None => Theme::default_theme(),
+        Some(p) => match std::fs::read_to_string(p) {
+            Err(e) => {
+                tracing::warn!(path = %p.display(), error = %e, "failed to read theme file, using default");
+                Theme::default_theme()
+            }
+            Ok(s) => match Theme::from_yaml(&s) {
+                Err(e) => {
+                    tracing::warn!(path = %p.display(), error = %e, "invalid theme YAML, using default");
+                    Theme::default_theme()
+                }
+                Ok(t) => t,
+            }
+        }
+    };
     (theme, config.theme.mode, theme_file_path)
 }
 
