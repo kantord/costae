@@ -19,7 +19,6 @@ use app::{App, TickReceivers, X11Init};
 
 const FREEZE_WATCHDOG_POLL_SECS: u64 = 10;
 const FREEZE_STALE_THRESHOLD_SECS: u64 = 10;
-const FILE_WATCHER_POLL_MS: u64 = 500;
 
 fn detect_backend() -> &'static str {
     if let Ok(b) = std::env::var("COSTAE_BACKEND") {
@@ -72,42 +71,48 @@ fn spawn_freeze_watchdog(last_tick: Arc<std::sync::atomic::AtomicU64>, log_path:
     });
 }
 
-fn spawn_file_watcher(
-    path: std::path::PathBuf,
-    baseline: Option<std::time::SystemTime>,
-    on_change_tx: mpsc::Sender<()>,
+fn setup_file_watchers(
+    layout_jsx_path: &std::path::Path,
+    exe_path: &std::path::Path,
+    reload_tx: mpsc::Sender<()>,
+    bin_reload_tx: mpsc::Sender<()>,
     dl_wake_tx: mpsc::SyncSender<()>,
-) {
-    thread::spawn(move || {
-        let mut last_modified = baseline;
-        loop {
-            thread::sleep(Duration::from_millis(FILE_WATCHER_POLL_MS));
-            let modified = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
-            if modified != last_modified {
-                last_modified = modified;
-                let _ = on_change_tx.send(());
+) -> std::sync::Arc<std::sync::Mutex<notify::RecommendedWatcher>> {
+    use notify::{EventKind, RecursiveMode, Watcher};
+
+    let exe = exe_path.to_path_buf();
+
+    let watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+        let Ok(event) = res else { return };
+        match event.kind {
+            EventKind::Modify(_) | EventKind::Create(_) => {}
+            _ => return,
+        }
+        for path in &event.paths {
+            if *path == exe {
+                let _ = bin_reload_tx.send(());
+                let _ = dl_wake_tx.try_send(());
+            } else {
+                let _ = reload_tx.send(());
                 let _ = dl_wake_tx.try_send(());
             }
         }
-    });
-}
+    })
+    .expect("failed to create file watcher");
 
-fn spawn_layout_watcher(
-    path: std::path::PathBuf,
-    reload_tx: mpsc::Sender<()>,
-    dl_wake_tx: mpsc::SyncSender<()>,
-) {
-    let baseline = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
-    spawn_file_watcher(path, baseline, reload_tx, dl_wake_tx);
-}
+    let watcher = std::sync::Arc::new(std::sync::Mutex::new(watcher));
 
-fn spawn_binary_watcher(
-    path: std::path::PathBuf,
-    baseline: Option<std::time::SystemTime>,
-    bin_reload_tx: mpsc::Sender<()>,
-    dl_wake_tx: mpsc::SyncSender<()>,
-) {
-    spawn_file_watcher(path, baseline, bin_reload_tx, dl_wake_tx);
+    {
+        let mut w = watcher.lock().unwrap();
+        w.watch(layout_jsx_path, RecursiveMode::NonRecursive)
+            .expect("failed to watch layout file");
+        if exe_path.exists() {
+            w.watch(exe_path, RecursiveMode::NonRecursive)
+                .expect("failed to watch binary");
+        }
+    }
+
+    watcher
 }
 
 fn init_x11() -> Result<X11Init, Box<dyn std::error::Error>> {
@@ -197,22 +202,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (dl_wake_tx, dl_wake_rx) = mpsc::sync_channel::<()>(1);
 
     let (reload_tx, reload_rx) = mpsc::channel::<()>();
-    spawn_layout_watcher(layout_jsx_path.clone(), reload_tx.clone(), dl_wake_tx.clone());
-    let config_baseline = std::fs::metadata(&config_yaml_path).and_then(|m| m.modified()).ok();
-    spawn_file_watcher(config_yaml_path.clone(), config_baseline, reload_tx, dl_wake_tx.clone());
-
-    let exe_baseline: Option<std::time::SystemTime> =
-        std::env::var("COSTAE_EXE_MTIME_NS")
-            .ok()
-            .and_then(|s| s.parse::<u128>().ok())
-            .and_then(|ns| {
-                std::time::UNIX_EPOCH.checked_add(std::time::Duration::from_nanos(ns as u64))
-            })
-            .or_else(|| std::fs::metadata(&exe_path).and_then(|m| m.modified()).ok());
-
     let (bin_reload_tx, bin_reload_rx) = mpsc::channel::<()>();
-    if exe_path.exists() {
-        spawn_binary_watcher(exe_path.clone(), exe_baseline, bin_reload_tx, dl_wake_tx.clone());
+    let _watcher = setup_file_watchers(
+        &layout_jsx_path,
+        &exe_path,
+        reload_tx,
+        bin_reload_tx,
+        dl_wake_tx.clone(),
+    );
+    {
+        use notify::{RecursiveMode, Watcher};
+        let _ = _watcher.lock().unwrap().watch(&config_yaml_path, RecursiveMode::NonRecursive);
     }
 
     let (mut data_loop, handle) = DataLoop::new();
@@ -231,6 +231,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             server, handle, rx, layout_jsx_path, config_yaml_path,
             Arc::clone(&module_event_txs),
             Arc::clone(&stop), Arc::clone(&last_tick),
+            Arc::clone(&_watcher),
         );
         data_loop.run(
             Arc::clone(&stop),
@@ -243,6 +244,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut app = App::new_x11(
             x11, handle, rx, layout_jsx_path, config_yaml_path, module_event_txs,
             Arc::clone(&stop), Arc::clone(&last_tick),
+            Arc::clone(&_watcher),
         );
         data_loop.run(
             Arc::clone(&stop),

@@ -10,7 +10,8 @@ use costae::theme::resolver::resolve_tw_in_json;
 use costae::data::data_loop::{DataLoopHandle, BuiltInSource, ProcessIdentity, ProcessSource, StreamSource};
 use costae::x11::click::do_hit_test;
 use costae::x11::panel::PanelContext;
-use costae::managed_set::{ManagedSet, Reconcile};
+use costae::managed_set::{Lifecycle, ManagedSet, Reconcile};
+use notify::Watcher;
 use costae::windowing::wayland::WaylandDisplayServer;
 use costae::panel::PanelSpec;
 use costae::presentation::{PanelCommand, PanelFrame, PresentationThread, PresenterEvent};
@@ -19,6 +20,38 @@ use crate::presenter::x11::run_x11_presenter_thread;
 use crate::presenter::wayland::run_wayland_presenter_thread;
 
 pub(crate) type ModuleEventTxs = Arc<std::sync::Mutex<HashMap<String, mpsc::Sender<serde_json::Value>>>>;
+pub(crate) type SharedWatcher = Arc<std::sync::Mutex<notify::RecommendedWatcher>>;
+
+struct WatchedPath(std::path::PathBuf);
+
+impl std::fmt::Display for WatchedPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0.display())
+    }
+}
+
+impl Lifecycle for WatchedPath {
+    type Key = std::path::PathBuf;
+    type State = std::path::PathBuf;
+    type Context = SharedWatcher;
+    type Output = ();
+    type Error = notify::Error;
+
+    fn key(&self) -> std::path::PathBuf { self.0.clone() }
+
+    fn enter(self, ctx: &mut SharedWatcher, _: &mut ()) -> Result<std::path::PathBuf, notify::Error> {
+        ctx.lock().unwrap().watch(&self.0, notify::RecursiveMode::NonRecursive)?;
+        Ok(self.0)
+    }
+
+    fn reconcile_self(self, _: &mut std::path::PathBuf, _: &mut SharedWatcher, _: &mut ()) -> Result<(), notify::Error> {
+        Ok(())
+    }
+
+    fn exit(state: std::path::PathBuf, ctx: &mut SharedWatcher, _: &mut ()) -> Result<(), notify::Error> {
+        ctx.lock().unwrap().unwatch(&state)
+    }
+}
 
 fn log_lifecycle_errors<K: std::fmt::Debug, E: std::fmt::Debug>(errors: costae::managed_set::ReconcileErrors<K, E>) {
     for (key, err) in errors {
@@ -151,6 +184,8 @@ pub(crate) struct App {
     screen_width_logical: u32,
     screen_height_logical: u32,
     panels: ManagedSet<PanelSpec>,
+    import_watches: ManagedSet<WatchedPath>,
+    watcher: SharedWatcher,
     stream_values: HashMap<(String, Option<String>), String>,
     jsx_evaluator: Option<costae::jsx::JsxEvaluator>,
     handle: DataLoopHandle,
@@ -198,6 +233,7 @@ impl App {
         module_event_txs: ModuleEventTxs,
         stop: Arc<AtomicBool>,
         last_tick: Arc<std::sync::atomic::AtomicU64>,
+        watcher: SharedWatcher,
     ) -> Self {
         let X11Init { panel_ctx, jsx_ctx } = x11;
         let dpr = panel_ctx.dpr;
@@ -222,6 +258,8 @@ impl App {
             screen_width_logical,
             screen_height_logical,
             panels: ManagedSet::new(),
+            import_watches: ManagedSet::new(),
+            watcher,
             stream_values: HashMap::new(),
             jsx_evaluator: None,
             handle,
@@ -250,6 +288,7 @@ impl App {
         module_event_txs: ModuleEventTxs,
         stop: Arc<AtomicBool>,
         last_tick: Arc<std::sync::atomic::AtomicU64>,
+        watcher: SharedWatcher,
     ) -> Self {
         let (screen_width, screen_height) = server.primary_output_size().unwrap_or((1920, 1080));
         let initial_dpr = server.primary_output_scale();
@@ -276,6 +315,8 @@ impl App {
             screen_width_logical: screen_width,
             screen_height_logical: screen_height,
             panels: ManagedSet::new(),
+            import_watches: ManagedSet::new(),
+            watcher,
             stream_values: HashMap::new(),
             jsx_evaluator: None,
             handle,
@@ -310,6 +351,15 @@ impl App {
             &move |specs| make_mod_init_value(specs, dpr, &output_name, dpi, sw, sh))
     }
 
+    fn reconcile_import_watches(&mut self, paths: Vec<std::path::PathBuf>) {
+        let errors = self.import_watches.reconcile(
+            paths.into_iter().map(WatchedPath),
+            &mut self.watcher,
+            &mut (),
+        );
+        log_lifecycle_errors(errors);
+    }
+
     fn initial_load(&mut self) {
         if !self.layout_jsx_path.exists() { return; }
         let source = match std::fs::read_to_string(&self.layout_jsx_path) {
@@ -322,12 +372,14 @@ impl App {
             Ok(e) => e,
             Err(e) => { tracing::error!(error = %e, "JSX compile error"); return; }
         };
+        let loaded = evaluator.loaded_paths();
         let eval_out = evaluator.eval(&self.stream_values);
         match eval_out {
             Ok(out) => {
                 tracing::debug!(elapsed_ms = t.elapsed().as_millis(), "jsx eval");
                 self.apply_eval_result_dispatch(&out);
                 self.jsx_evaluator = Some(evaluator);
+                self.reconcile_import_watches(loaded);
                 self.render_panels();
             }
             Err(e) => tracing::error!(error = %e, "JSX eval error"),
@@ -349,13 +401,17 @@ impl App {
                 Ok(source) => {
                     let base_dir = self.layout_jsx_path.parent().unwrap_or(&self.layout_jsx_path);
                     match costae::jsx::JsxEvaluator::new(&source, self.jsx_ctx.clone(), Some(base_dir)) {
-                        Ok(evaluator) => match evaluator.eval(&self.stream_values) {
-                            Ok(out) => {
-                                self.apply_eval_result_dispatch(&out);
-                                self.jsx_evaluator = Some(evaluator);
+                        Ok(evaluator) => {
+                            let loaded = evaluator.loaded_paths();
+                            match evaluator.eval(&self.stream_values) {
+                                Ok(out) => {
+                                    self.apply_eval_result_dispatch(&out);
+                                    self.jsx_evaluator = Some(evaluator);
+                                    self.reconcile_import_watches(loaded);
+                                }
+                                Err(e) => tracing::error!(error = %e, "JSX eval error"),
                             }
-                            Err(e) => tracing::error!(error = %e, "JSX eval error"),
-                        },
+                        }
                         Err(e) => tracing::error!(error = %e, "JSX compile error"),
                     }
                 }
