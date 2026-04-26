@@ -87,6 +87,7 @@ fn apply_modifier(modifier: Option<&str>, resolved: String, mode: ThemeMode) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
 
     fn test_theme() -> Theme {
         Theme::from_yaml(r#"
@@ -106,49 +107,25 @@ radius:
 "#).unwrap()
     }
 
-    #[test]
-    fn resolve_tw_bg_primary_dark_uses_dark_color_value() {
+    #[rstest]
+    #[case::bg_primary_dark_uses_dark_color_value("bg-primary", ThemeMode::Dark, "bg-[oklch(0.922_0_0)]")]
+    #[case::bg_unknown_key_passes_through("bg-unknown", ThemeMode::Dark, "bg-unknown")]
+    #[case::no_prefix_match_passes_through("flex", ThemeMode::Dark, "flex")]
+    #[case::text_foreground_dark_uses_dark_color_value("text-foreground", ThemeMode::Dark, "text-[oklch(0.985_0_0)]")]
+    #[case::text_muted_foreground_matches_longest_key("text-muted-foreground", ThemeMode::Dark, "text-[oklch(0.708_0_0)]")]
+    #[case::border_border_dark_uses_dark_color_value("border-border", ThemeMode::Dark, "border-[oklch(1_0_0_/_10%)]")]
+    #[case::rounded_lg_substitutes_radius_value("rounded-lg", ThemeMode::Dark, "rounded-[0.625rem]")]
+    #[case::breakpoint_prefix_stripped_resolved_and_reattached("md:bg-primary", ThemeMode::Dark, "md:bg-[oklch(0.922_0_0)]")]
+    #[case::dark_modifier_dark_mode_emits_resolved_inner_token("dark:bg-primary", ThemeMode::Dark, "bg-[oklch(0.922_0_0)]")]
+    #[case::dark_modifier_light_mode_drops_token("dark:bg-primary", ThemeMode::Light, "")]
+    #[case::light_modifier_light_mode_emits_resolved_inner_token("light:bg-primary", ThemeMode::Light, "bg-[oklch(0.205_0_0)]")]
+    #[case::light_modifier_dark_mode_drops_token("light:bg-primary", ThemeMode::Dark, "")]
+    #[case::important_prefix_resolves_inner_and_reattaches("!bg-primary", ThemeMode::Dark, "!bg-[oklch(0.922_0_0)]")]
+    #[case::breakpoint_and_important_combined_resolves_inner("md:!bg-primary", ThemeMode::Dark, "md:!bg-[oklch(0.922_0_0)]")]
+    #[case::unknown_modifier_preserved_and_inner_resolved("foobar:bg-primary", ThemeMode::Dark, "foobar:bg-[oklch(0.922_0_0)]")]
+    fn resolve_tw_token_cases(#[case] input: &str, #[case] mode: ThemeMode, #[case] expected: &str) {
         let theme = test_theme();
-        assert_eq!(
-            resolve_tw("bg-primary", &theme, ThemeMode::Dark),
-            "bg-[oklch(0.922_0_0)]"
-        );
-    }
-
-    #[test]
-    fn resolve_tw_bg_unknown_key_passes_through() {
-        let theme = test_theme();
-        assert_eq!(
-            resolve_tw("bg-unknown", &theme, ThemeMode::Dark),
-            "bg-unknown"
-        );
-    }
-
-    #[test]
-    fn resolve_tw_no_prefix_match_passes_through() {
-        let theme = test_theme();
-        assert_eq!(
-            resolve_tw("flex", &theme, ThemeMode::Dark),
-            "flex"
-        );
-    }
-
-    #[test]
-    fn resolve_tw_text_foreground_dark_uses_dark_color_value() {
-        let theme = test_theme();
-        assert_eq!(
-            resolve_tw("text-foreground", &theme, ThemeMode::Dark),
-            "text-[oklch(0.985_0_0)]"
-        );
-    }
-
-    #[test]
-    fn resolve_tw_text_muted_foreground_matches_longest_key() {
-        let theme = test_theme();
-        assert_eq!(
-            resolve_tw("text-muted-foreground", &theme, ThemeMode::Dark),
-            "text-[oklch(0.708_0_0)]"
-        );
+        assert_eq!(resolve_tw(input, &theme, mode), expected);
     }
 
     #[test]
@@ -157,51 +134,6 @@ radius:
         assert_eq!(
             resolve_tw("flex bg-primary", &theme, ThemeMode::Dark),
             "flex bg-[oklch(0.922_0_0)]"
-        );
-    }
-
-    #[test]
-    fn resolve_tw_border_border_dark_uses_dark_color_value() {
-        let theme = test_theme();
-        assert_eq!(
-            resolve_tw("border-border", &theme, ThemeMode::Dark),
-            "border-[oklch(1_0_0_/_10%)]"
-        );
-    }
-
-    #[test]
-    fn resolve_tw_rounded_lg_substitutes_radius_value() {
-        let theme = test_theme();
-        assert_eq!(
-            resolve_tw("rounded-lg", &theme, ThemeMode::Dark),
-            "rounded-[0.625rem]"
-        );
-    }
-
-    #[test]
-    fn resolve_tw_breakpoint_prefix_stripped_resolved_and_reattached() {
-        let theme = test_theme();
-        assert_eq!(
-            resolve_tw("md:bg-primary", &theme, ThemeMode::Dark),
-            "md:bg-[oklch(0.922_0_0)]"
-        );
-    }
-
-    #[test]
-    fn resolve_tw_dark_modifier_dark_mode_emits_resolved_inner_token() {
-        let theme = test_theme();
-        assert_eq!(
-            resolve_tw("dark:bg-primary", &theme, ThemeMode::Dark),
-            "bg-[oklch(0.922_0_0)]"
-        );
-    }
-
-    #[test]
-    fn resolve_tw_dark_modifier_light_mode_drops_token() {
-        let theme = test_theme();
-        assert_eq!(
-            resolve_tw("dark:bg-primary", &theme, ThemeMode::Light),
-            ""
         );
     }
 
@@ -215,47 +147,11 @@ radius:
     }
 
     #[test]
-    fn resolve_tw_light_modifier_light_mode_emits_resolved_inner_token() {
-        let theme = test_theme();
-        assert_eq!(
-            resolve_tw("light:bg-primary", &theme, ThemeMode::Light),
-            "bg-[oklch(0.205_0_0)]"
-        );
-    }
-
-    #[test]
-    fn resolve_tw_light_modifier_dark_mode_drops_token() {
-        let theme = test_theme();
-        assert_eq!(
-            resolve_tw("light:bg-primary", &theme, ThemeMode::Dark),
-            ""
-        );
-    }
-
-    #[test]
     fn resolve_tw_light_modifier_dark_mode_drops_token_from_multi_class_string() {
         let theme = test_theme();
         assert_eq!(
             resolve_tw("flex light:bg-primary", &theme, ThemeMode::Dark),
             "flex"
-        );
-    }
-
-    #[test]
-    fn resolve_tw_important_prefix_resolves_inner_and_reattaches() {
-        let theme = test_theme();
-        assert_eq!(
-            resolve_tw("!bg-primary", &theme, ThemeMode::Dark),
-            "!bg-[oklch(0.922_0_0)]"
-        );
-    }
-
-    #[test]
-    fn resolve_tw_breakpoint_and_important_combined_resolves_inner() {
-        let theme = test_theme();
-        assert_eq!(
-            resolve_tw("md:!bg-primary", &theme, ThemeMode::Dark),
-            "md:!bg-[oklch(0.922_0_0)]"
         );
     }
 }

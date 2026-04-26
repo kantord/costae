@@ -45,3 +45,4 @@ cached = { version = "0.59.0", features = ["proc_macro"] }
 [dev-dependencies]
 image = "0.25"
 tracing-test = "0.2"
+rstest = "0.23"
