@@ -29,6 +29,7 @@ use wayland_client::{
 
 use crate::display_manager::DisplayManager;
 use crate::layout::{PanelAnchor, PanelSpecData};
+use crate::presentation::PanelFrame;
 use super::{DispatchError, DisplayServer, WindowEvent};
 
 // ---------------------------------------------------------------------------
@@ -334,8 +335,10 @@ impl DisplayServer for WaylandDisplayServer {
 impl DisplayManager for WaylandDisplayServer {
     type Panel = WaylandPanel;
 
-    fn create_window(&mut self, spec: &PanelSpecData) -> Result<WaylandPanel, anyhow::Error> {
-        self.create_panel(spec)
+    fn create_window(&mut self, spec: &PanelSpecData, frame: &PanelFrame) -> Result<WaylandPanel, anyhow::Error> {
+        let mut panel = self.create_panel(spec)?;
+        self.update_image(&mut panel, &frame.pixels)?;
+        Ok(panel)
     }
 
     fn update_position(&mut self, _panel: &mut WaylandPanel, _spec: &PanelSpecData) -> Result<(), anyhow::Error> {
@@ -634,6 +637,16 @@ mod tests {
             output: None,
             above: false,
             content: serde_json::Value::Null,
+            dpr: 1.0,
+        }
+    }
+
+    fn blank_frame(w: u32, h: u32) -> crate::presentation::PanelFrame {
+        use std::sync::Arc;
+        crate::presentation::PanelFrame {
+            pixels: Arc::new(vec![0u8; (w * h * 4) as usize]),
+            width: w,
+            height: h,
         }
     }
 
@@ -652,7 +665,7 @@ mod tests {
             }
         };
         let spec = minimal_spec();
-        let mut panel = DisplayManager::create_window(&mut server, &spec).unwrap();
+        let mut panel = DisplayManager::create_window(&mut server, &spec, &blank_frame(100, 30)).unwrap();
         let new_spec = PanelSpecData {
             x: 50,
             y: 50,
@@ -673,7 +686,7 @@ mod tests {
             }
         };
         let spec = minimal_spec();
-        let mut panel = DisplayManager::create_window(&mut server, &spec).unwrap();
+        let mut panel = DisplayManager::create_window(&mut server, &spec, &blank_frame(100, 30)).unwrap();
         let new_spec = PanelSpecData {
             width: 200,
             height: 60,
@@ -696,7 +709,7 @@ mod tests {
             }
         };
         let spec = minimal_spec();
-        let mut panel = DisplayManager::create_window(&mut server, &spec).unwrap();
+        let mut panel = DisplayManager::create_window(&mut server, &spec, &blank_frame(100, 30)).unwrap();
         // Provide a correctly-sized BGRX buffer (width * height * 4 bytes)
         let bgrx = vec![0u8; (spec.width * spec.height * 4) as usize];
         let result = DisplayManager::update_image(&mut server, &mut panel, &bgrx);
@@ -758,7 +771,7 @@ mod tests {
             }
         };
         let spec = minimal_spec();
-        let panel = DisplayManager::create_window(&mut server, &spec).unwrap();
+        let panel = DisplayManager::create_window(&mut server, &spec, &blank_frame(100, 30)).unwrap();
         let result = DisplayManager::delete_window(&mut server, panel);
         assert!(result.is_ok());
     }

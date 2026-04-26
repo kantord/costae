@@ -43,6 +43,8 @@ pub struct PanelSpecData {
     pub above: bool,
     /// The layout subtree that lives inside this panel (first child of the panel node).
     pub content: serde_json::Value,
+    /// Device pixel ratio for this panel's output. Set by the app after parsing.
+    pub dpr: f32,
 }
 
 impl std::fmt::Display for PanelSpecData {
@@ -123,6 +125,7 @@ fn parse_panel_spec(i: usize, panel: &serde_json::Value) -> Result<PanelSpecData
         output:    optional_str(panel, "output").map(str::to_string),
         above:     optional_bool(panel, "above", false),
         content:   first_child(panel),
+        dpr:       1.0,
     })
 }
 

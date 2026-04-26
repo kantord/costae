@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread;
 
-use costae::{init_global_ctx, render_frame};
+use costae::init_global_ctx;
 use costae::config::CostaeConfig;
 use costae::theme::{Theme, ThemeMode};
 use costae::theme::resolver::resolve_tw_in_json;
@@ -14,7 +14,7 @@ use costae::managed_set::{Lifecycle, ManagedSet, Reconcile};
 use notify::Watcher;
 use costae::windowing::wayland::WaylandDisplayServer;
 use costae::panel::PanelSpec;
-use costae::presentation::{PanelCommand, PanelFrame, PresentationThread, PresenterEvent};
+use costae::presentation::{PanelCommand, PresentationThread, PresenterEvent};
 
 use crate::presenter::x11::run_x11_presenter_thread;
 use crate::presenter::wayland::run_wayland_presenter_thread;
@@ -95,18 +95,20 @@ pub(crate) fn stream_calls_to_specs(calls: &[(String, Option<String>)]) -> Vec<S
 
 fn apply_eval_result(
     out: &costae::jsx::EvalOutput,
+    dpr: f32,
     handle: &DataLoopHandle,
     panel_set: &mut ManagedSet<PanelSpec>,
     command_tx: &mut mpsc::Sender<PanelCommand>,
     mod_init_fn: &dyn Fn(&[costae::PanelSpecData]) -> serde_json::Value,
 ) -> bool {
-    let specs = match costae::parse_root_node(&out.layout) {
+    let mut specs = match costae::parse_root_node(&out.layout) {
         Ok(s) => s,
         Err(e) => {
             tracing::error!(error = %e, "root node parse error");
             return false;
         }
     };
+    for spec in &mut specs { spec.dpr = dpr; }
     let mod_init = mod_init_fn(&specs);
 
     let module_bins: std::collections::HashSet<String> =
@@ -369,7 +371,7 @@ impl App {
         };
         let (dpr, dpi, sw, sh) = (self.dpr, self.dpi, self.screen_width_logical, self.screen_height_logical);
         let output_name = self.output_name.clone();
-        apply_eval_result(&resolved_out, &self.handle, &mut self.panels, &mut self.command_tx,
+        apply_eval_result(&resolved_out, dpr, &self.handle, &mut self.panels, &mut self.command_tx,
             &move |specs| make_mod_init_value(specs, dpr, &output_name, dpi, sw, sh))
     }
 
@@ -417,7 +419,6 @@ impl App {
                 self.apply_eval_result_dispatch(&out);
                 self.jsx_evaluator = Some(evaluator);
                 self.reconcile_import_watches(loaded);
-                self.render_panels();
             }
             Err(e) => tracing::error!(error = %e, "JSX eval error"),
         }
@@ -466,7 +467,6 @@ impl App {
             Ordering::Relaxed,
         );
 
-        let mut needs_render = false;
         let mut changed = false;
 
         while let Ok((key, value)) = self.item_rx.try_recv() {
@@ -485,7 +485,7 @@ impl App {
             });
             if let Some(eval_result) = eval_out {
                 match eval_result {
-                    Ok(out) => { if self.apply_eval_result_dispatch(&out) { needs_render = true; } }
+                    Ok(out) => { self.apply_eval_result_dispatch(&out); }
                     Err(e) => tracing::error!(error = %e, "JSX re-eval error"),
                 }
             }
@@ -497,11 +497,11 @@ impl App {
             return;
         }
 
-        if self.handle_layout_reload() { needs_render = true; }
+        self.handle_layout_reload();
 
         while let Ok(event) = self.event_rx.try_recv() {
             match event {
-                PresenterEvent::NeedsRender => needs_render = true,
+                PresenterEvent::NeedsRender => {} // no-op: reconciler handles rendering
                 PresenterEvent::OutputsChanged { screen_width, screen_height, dpr } => {
                     self.jsx_ctx["screen_width"] = serde_json::json!(screen_width);
                     self.jsx_ctx["screen_height"] = serde_json::json!(screen_height);
@@ -510,7 +510,7 @@ impl App {
                     let eval_out = self.jsx_evaluator.as_ref().map(|e| e.eval(&self.stream_values));
                     if let Some(eval_result) = eval_out {
                         match eval_result {
-                            Ok(out) => { self.apply_eval_result_dispatch(&out); needs_render = true; }
+                            Ok(out) => { self.apply_eval_result_dispatch(&out); }
                             Err(e) => tracing::error!(error = %e, "JSX re-eval error on output change"),
                         }
                     }
@@ -524,23 +524,8 @@ impl App {
                 }
             }
         }
-
-        if needs_render {
-            self.render_panels();
-        }
     }
 
-    fn render_panels(&self) {
-        let dpr = self.dpr;
-        for (_, spec) in self.panels.iter() {
-            if spec.content.is_null() { continue; }
-            let phys_width = (spec.width as f32 * dpr).round() as u32;
-            let phys_height = (spec.height as f32 * dpr).round() as u32;
-            let pixels = render_frame(&spec.content, phys_width, phys_height, dpr);
-            let frame = PanelFrame { pixels, width: phys_width, height: phys_height };
-            let _ = self.command_tx.send(PanelCommand::UpdatePicture { id: spec.id.clone(), frame });
-        }
-    }
 }
 
 impl Drop for App {
@@ -571,6 +556,7 @@ mod tests {
             output: None,
             anchor: Some(costae::PanelAnchor::Left),
             content: serde_json::Value::Null,
+            dpr: 1.0,
         }
     }
 

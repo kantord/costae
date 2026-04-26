@@ -10,11 +10,12 @@ use x11rb::{
 
 use crate::layout::{PanelSpecData, PanelAnchor};
 use crate::display_manager::DisplayManager;
+use crate::presentation::PanelFrame;
 
 const XRESOURCES_PROP_MAX_LEN: u32 = 65536;
 const MM_PER_INCH: f32 = 25.4;
 const FALLBACK_DPI: f32 = 96.0;
-use crate::render::{render_frame, init_global_ctx};
+use crate::render::init_global_ctx;
 use crate::x11::strut_partial_values_for_anchor;
 
 /// A live X11 panel window, created from a `PanelSpec` at runtime.
@@ -61,10 +62,11 @@ pub fn i3_dpi(conn: &RustConnection, root: Window, screen: &Screen) -> f32 {
 
 fn create_panel(
     spec: &PanelSpecData,
+    frame: &PanelFrame,
     ctx: &PanelContext,
 ) -> anyhow::Result<Panel> {
-    let phys_width = (spec.width as f32 * ctx.dpr).round() as u32;
-    let phys_height = (spec.height as f32 * ctx.dpr).round() as u32;
+    let phys_width = (spec.width as f32 * spec.dpr).round() as u32;
+    let phys_height = (spec.height as f32 * spec.dpr).round() as u32;
 
     let (mon_x, mon_y, mon_width, mon_height) = spec.output.as_ref()
         .and_then(|name| ctx.output_map.get(name).copied())
@@ -75,8 +77,8 @@ fn create_panel(
         Some(PanelAnchor::Right) => (mon_x + mon_width as i16 - phys_width as i16, mon_y),
         Some(PanelAnchor::Bottom) => (mon_x, mon_y + mon_height as i16 - phys_height as i16),
         None => (
-            mon_x + (spec.x as f32 * ctx.dpr).round() as i16,
-            mon_y + (spec.y as f32 * ctx.dpr).round() as i16,
+            mon_x + (spec.x as f32 * spec.dpr).round() as i16,
+            mon_y + (spec.y as f32 * spec.dpr).round() as i16,
         ),
     };
 
@@ -98,7 +100,6 @@ fn create_panel(
             .event_mask(EventMask::EXPOSURE | EventMask::BUTTON_PRESS),
     )?;
 
-    ctx.conn.map_window(win_id)?;
     let stack_mode = if spec.above { StackMode::ABOVE } else { StackMode::BELOW };
     ctx.conn.configure_window(win_id, &ConfigureWindowAux::new().stack_mode(stack_mode))?;
 
@@ -115,8 +116,9 @@ fn create_panel(
 
     ctx.conn.flush()?;
 
-    let bgrx = render_frame(&serde_json::Value::Null, phys_width, phys_height, ctx.dpr);
+    let bgrx = frame.pixels.clone();
     ctx.conn.put_image(ImageFormat::Z_PIXMAP, win_id, gc, phys_width as u16, phys_height as u16, 0, 0, 0, ctx.depth, &bgrx[..])?;
+    ctx.conn.map_window(win_id)?;
     ctx.conn.flush()?;
 
     Ok(Panel {
@@ -158,9 +160,9 @@ pub type PanelContext = X11PanelContext;
 impl DisplayManager for X11PanelContext {
     type Panel = Panel;
 
-    fn create_window(&mut self, spec: &PanelSpecData) -> Result<Panel, anyhow::Error> {
+    fn create_window(&mut self, spec: &PanelSpecData, frame: &PanelFrame) -> Result<Panel, anyhow::Error> {
         init_global_ctx();
-        let panel = create_panel(spec, self)?;
+        let panel = create_panel(spec, frame, self)?;
         Ok(panel)
     }
 
@@ -318,6 +320,16 @@ mod tests {
             output: None,
             above: false,
             content: serde_json::Value::Null,
+            dpr: 1.0,
+        }
+    }
+
+    fn blank_frame(w: u32, h: u32) -> crate::presentation::PanelFrame {
+        use std::sync::Arc;
+        crate::presentation::PanelFrame {
+            pixels: Arc::new(vec![0u8; (w * h * 4) as usize]),
+            width: w,
+            height: h,
         }
     }
 
@@ -338,7 +350,7 @@ mod tests {
         };
 
         let spec = make_spec("dm-create", 200, 30);
-        let panel = <super::X11PanelContext as DisplayManager>::create_window(&mut ctx, &spec)
+        let panel = <super::X11PanelContext as DisplayManager>::create_window(&mut ctx, &spec, &blank_frame(200, 30))
             .expect("create_window should succeed when X11 is available");
 
         assert!(panel.phys_width > 0, "phys_width must be > 0");
@@ -367,7 +379,7 @@ mod tests {
         };
 
         let spec = make_spec("dm-delete", 200, 30);
-        let panel = <super::X11PanelContext as DisplayManager>::create_window(&mut ctx, &spec)
+        let panel = <super::X11PanelContext as DisplayManager>::create_window(&mut ctx, &spec, &blank_frame(200, 30))
             .expect("create_window must succeed for delete_window test");
 
         let win_id = panel.win_id;
@@ -407,7 +419,7 @@ mod tests {
         };
 
         let spec = make_spec("dm-update-image", 10, 10);
-        let mut panel = <super::X11PanelContext as DisplayManager>::create_window(&mut ctx, &spec)
+        let mut panel = <super::X11PanelContext as DisplayManager>::create_window(&mut ctx, &spec, &blank_frame(10, 10))
             .expect("create_window must succeed for update_image test");
 
         // Build a minimal BGRX buffer: 10 * 10 * 4 bytes, all zeros.
@@ -439,6 +451,7 @@ mod tests {
         let mut panel = <super::X11PanelContext as DisplayManager>::create_window(
             &mut ctx,
             &make_spec("test-dm-dims", 200, 30),
+            &blank_frame(200, 30),
         )
         .expect("create_window should succeed when X11 is available");
 
@@ -463,6 +476,64 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
+    // Claim I: create_window stores the pre-rendered frame pixels in panel.bgrx.
+    // The frame is now passed in by the reconciler layer (not computed inside DM).
+    // ---------------------------------------------------------------------------
+    #[test]
+    fn create_window_with_non_null_content_renders_spec_content_not_null() {
+        use crate::display_manager::DisplayManager;
+        use crate::presentation::PanelFrame;
+        use crate::render::render_frame;
+
+        let mut ctx = match make_panel_ctx() {
+            Some(c) => c,
+            None => {
+                println!("SKIP: no X11 display available");
+                return;
+            }
+        };
+
+        // This content renders a solid red background — visually distinct from the
+        // null/empty-container fallback that the old create_panel used.
+        let content = serde_json::json!({
+            "type": "container",
+            "tw": "w-full h-full",
+            "style": {"backgroundColor": "red"},
+            "children": []
+        });
+        let spec = crate::layout::PanelSpecData {
+            id: "test-content-render".to_string(),
+            anchor: None,
+            width: 100,
+            height: 30,
+            x: 0,
+            y: 0,
+            outer_gap: 0,
+            output: None,
+            above: false,
+            content: content.clone(),
+            dpr: 1.0,
+        };
+
+        let phys_width = (spec.width as f32 * spec.dpr).round() as u32;
+        let phys_height = (spec.height as f32 * spec.dpr).round() as u32;
+        let pixels = render_frame(&content, phys_width, phys_height, spec.dpr);
+        let expected = pixels.clone();
+        let frame = PanelFrame { pixels: pixels.clone(), width: phys_width, height: phys_height };
+
+        let panel = <super::X11PanelContext as DisplayManager>::create_window(&mut ctx, &spec, &frame)
+            .expect("create_window should succeed when X11 is available");
+
+        assert_eq!(
+            panel.bgrx, expected,
+            "panel.bgrx should equal the pre-rendered frame pixels passed to create_window"
+        );
+
+        // Cleanup
+        let _ = <super::X11PanelContext as DisplayManager>::delete_window(&mut ctx, panel);
+    }
+
+    // ---------------------------------------------------------------------------
     // R2: DisplayManager::update_position moves the window and updates state.
     // ---------------------------------------------------------------------------
     #[test]
@@ -480,6 +551,7 @@ mod tests {
         let mut panel = <super::X11PanelContext as DisplayManager>::create_window(
             &mut ctx,
             &make_spec("test-dm-pos", 100, 30),
+            &blank_frame(100, 30),
         )
         .expect("create_window should succeed when X11 is available");
 
@@ -494,6 +566,7 @@ mod tests {
             output: None,
             above: false,
             content: serde_json::Value::Null,
+            dpr: 1.0,
         };
 
         <super::X11PanelContext as DisplayManager>::update_position(&mut ctx, &mut panel, &new_spec)
