@@ -30,7 +30,9 @@ pub fn resolve_tw(classes: &str, theme: &Theme, mode: ThemeMode) -> String {
         .filter_map(|token| {
             let (modifier, inner) = split_modifier(token);
             let (important, inner) = strip_important(inner);
+            let (inner, opacity) = strip_opacity(inner);
             let resolved = resolve_inner(inner, colors, &theme.radius);
+            let resolved = if let Some(op) = opacity { format!("{}{}", resolved, op) } else { resolved };
             let resolved = if important { format!("!{}", resolved) } else { resolved };
             apply_modifier(modifier, resolved, mode)
         })
@@ -44,6 +46,16 @@ fn strip_important(inner: &str) -> (bool, &str) {
     } else {
         (false, inner)
     }
+}
+
+fn strip_opacity(inner: &str) -> (&str, Option<&str>) {
+    if let Some(pos) = inner.rfind('/') {
+        let suffix = &inner[pos + 1..];
+        if !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()) {
+            return (&inner[..pos], Some(&inner[pos..]));
+        }
+    }
+    (inner, None)
 }
 
 fn split_modifier(token: &str) -> (Option<&str>, &str) {
@@ -123,6 +135,7 @@ radius:
     #[case::important_prefix_resolves_inner_and_reattaches("!bg-primary", ThemeMode::Dark, "!bg-[oklch(0.922_0_0)]")]
     #[case::breakpoint_and_important_combined_resolves_inner("md:!bg-primary", ThemeMode::Dark, "md:!bg-[oklch(0.922_0_0)]")]
     #[case::unknown_modifier_preserved_and_inner_resolved("foobar:bg-primary", ThemeMode::Dark, "foobar:bg-[oklch(0.922_0_0)]")]
+    #[case::bg_primary_opacity_50("bg-primary/50", ThemeMode::Dark, "bg-[oklch(0.922_0_0)]/50")]
     fn resolve_tw_token_cases(#[case] input: &str, #[case] mode: ThemeMode, #[case] expected: &str) {
         let theme = test_theme();
         assert_eq!(resolve_tw(input, &theme, mode), expected);
