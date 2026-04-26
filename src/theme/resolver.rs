@@ -29,11 +29,21 @@ pub fn resolve_tw(classes: &str, theme: &Theme, mode: ThemeMode) -> String {
         .split_whitespace()
         .filter_map(|token| {
             let (modifier, inner) = split_modifier(token);
+            let (important, inner) = strip_important(inner);
             let resolved = resolve_inner(inner, colors, &theme.radius);
+            let resolved = if important { format!("!{}", resolved) } else { resolved };
             apply_modifier(modifier, resolved, mode)
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn strip_important(inner: &str) -> (bool, &str) {
+    if let Some(rest) = inner.strip_prefix('!') {
+        (true, rest)
+    } else {
+        (false, inner)
+    }
 }
 
 fn split_modifier(token: &str) -> (Option<&str>, &str) {
@@ -228,6 +238,15 @@ radius:
         assert_eq!(
             resolve_tw("flex light:bg-primary", &theme, ThemeMode::Dark),
             "flex"
+        );
+    }
+
+    #[test]
+    fn resolve_tw_important_prefix_resolves_inner_and_reattaches() {
+        let theme = test_theme();
+        assert_eq!(
+            resolve_tw("!bg-primary", &theme, ThemeMode::Dark),
+            "!bg-[oklch(0.922_0_0)]"
         );
     }
 }
