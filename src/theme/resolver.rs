@@ -249,4 +249,13 @@ radius:
             "!bg-[oklch(0.922_0_0)]"
         );
     }
+
+    #[test]
+    fn resolve_tw_breakpoint_and_important_combined_resolves_inner() {
+        let theme = test_theme();
+        assert_eq!(
+            resolve_tw("md:!bg-primary", &theme, ThemeMode::Dark),
+            "md:!bg-[oklch(0.922_0_0)]"
+        );
+    }
 }
