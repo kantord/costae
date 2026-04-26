@@ -4,6 +4,8 @@ use std::sync::{mpsc, Arc};
 use std::thread;
 
 use costae::{init_global_ctx, render_frame};
+use costae::theme::{Theme, ThemeMode};
+use costae::theme::resolver::resolve_tw_in_json;
 use costae::data::data_loop::{DataLoopHandle, BuiltInSource, ProcessIdentity, ProcessSource, StreamSource};
 use costae::x11::click::do_hit_test;
 use costae::x11::panel::PanelContext;
@@ -139,6 +141,8 @@ pub(crate) struct X11Init {
 }
 
 pub(crate) struct App {
+    theme: Theme,
+    theme_mode: ThemeMode,
     dpr: f32,
     dpi: f32,
     output_name: String,
@@ -184,6 +188,8 @@ impl App {
             run_x11_presenter_thread(pt, command_rx, event_tx);
         });
         let mut state = Self {
+            theme: Theme::default_theme(),
+            theme_mode: ThemeMode::Dark,
             dpr,
             dpi,
             output_name,
@@ -233,6 +239,8 @@ impl App {
             run_wayland_presenter_thread(pt, command_rx, event_tx);
         });
         let mut state = Self {
+            theme: Theme::default_theme(),
+            theme_mode: ThemeMode::Dark,
             dpr: initial_dpr,
             dpi: 96.0,
             output_name: String::new(),
@@ -260,9 +268,16 @@ impl App {
     }
 
     fn apply_eval_result_dispatch(&mut self, out: &costae::jsx::EvalOutput) -> bool {
+        let mut layout = out.layout.clone();
+        resolve_tw_in_json(&mut layout, &self.theme, self.theme_mode);
+        let resolved_out = costae::jsx::EvalOutput {
+            layout,
+            stream_calls: out.stream_calls.clone(),
+            module_calls: out.module_calls.clone(),
+        };
         let (dpr, dpi, sw, sh) = (self.dpr, self.dpi, self.screen_width_logical, self.screen_height_logical);
         let output_name = self.output_name.clone();
-        apply_eval_result(out, &self.handle, &mut self.panels, &mut self.command_tx,
+        apply_eval_result(&resolved_out, &self.handle, &mut self.panels, &mut self.command_tx,
             &move |specs| make_mod_init_value(specs, dpr, &output_name, dpi, sw, sh))
     }
 

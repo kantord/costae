@@ -1,5 +1,27 @@
 use super::{Theme, ThemeMode};
 
+pub fn resolve_tw_in_json(value: &mut serde_json::Value, theme: &Theme, mode: ThemeMode) {
+    match value {
+        serde_json::Value::Object(map) => {
+            if let Some(tw) = map.get_mut("tw") {
+                if let Some(s) = tw.as_str() {
+                    let resolved = resolve_tw(s, theme, mode);
+                    *tw = serde_json::Value::String(resolved);
+                }
+            }
+            for v in map.values_mut() {
+                resolve_tw_in_json(v, theme, mode);
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for v in arr {
+                resolve_tw_in_json(v, theme, mode);
+            }
+        }
+        _ => {}
+    }
+}
+
 pub fn resolve_tw(classes: &str, theme: &Theme, mode: ThemeMode) -> String {
     let colors = theme.colors_for_mode(mode);
     classes
