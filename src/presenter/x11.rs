@@ -1,4 +1,4 @@
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc};
 
 use costae::presentation::{PanelCommand, PresentationThread, PresenterEvent};
 use costae::x11::outputs::build_output_map;
@@ -33,7 +33,6 @@ pub(crate) fn run_x11_presenter_thread(
         while let Some(event) = pt.dm.conn.poll_for_event().unwrap_or(None) {
             match event {
                 x11rb::protocol::Event::RandrScreenChangeNotify(_) => {
-                    use std::sync::Arc;
                     pt.dm.output_map = Arc::new(build_output_map(&pt.dm.conn, pt.dm.root));
                 }
                 x11rb::protocol::Event::Expose(e) => {

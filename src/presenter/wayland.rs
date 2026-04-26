@@ -51,12 +51,15 @@ pub(crate) fn run_wayland_presenter_thread(
                             if let Some((id, panel)) = pt.presenter.panels.iter()
                                 .find(|(_, p)| p.surface_id.to_string() == panel_id)
                             {
+                                let (x, y, phys_width, phys_height) = scale_click_to_physical(
+                                    x_logical, y_logical, panel.width, panel.height, panel.dpr,
+                                );
                                 let _ = event_tx.send(PresenterEvent::Click {
                                     panel_id: id.clone(),
-                                    x: x_logical,
-                                    y: y_logical,
-                                    phys_width: panel.width,
-                                    phys_height: panel.height,
+                                    x,
+                                    y,
+                                    phys_width,
+                                    phys_height,
                                     dpr: panel.dpr,
                                 });
                             }
@@ -69,5 +72,37 @@ pub(crate) fn run_wayland_presenter_thread(
                 return;
             }
         }
+    }
+}
+
+fn scale_click_to_physical(x_logical: f32, y_logical: f32, logical_width: u32, logical_height: u32, dpr: f32) -> (f32, f32, u32, u32) {
+    (
+        x_logical * dpr,
+        y_logical * dpr,
+        (logical_width as f32 * dpr).round() as u32,
+        (logical_height as f32 * dpr).round() as u32,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::scale_click_to_physical;
+
+    #[test]
+    fn scale_click_to_physical_at_dpr_1_is_identity() {
+        let result = scale_click_to_physical(50.0, 20.0, 200, 30, 1.0);
+        assert_eq!(result, (50.0, 20.0, 200, 30));
+    }
+
+    #[test]
+    fn scale_click_to_physical_at_dpr_2_doubles_all() {
+        let result = scale_click_to_physical(50.0, 20.0, 200, 30, 2.0);
+        assert_eq!(result, (100.0, 40.0, 400, 60));
+    }
+
+    #[test]
+    fn scale_click_to_physical_fractional_dpr_rounds_dims() {
+        let result = scale_click_to_physical(40.0, 10.0, 100, 30, 1.5);
+        assert_eq!(result, (60.0, 15.0, 150, 45));
     }
 }
