@@ -596,6 +596,7 @@ dependencies = [
  "serde_yaml",
  "smithay-client-toolkit",
  "takumi",
+ "tempfile",
  "thiserror 1.0.69",
  "tiny-skia",
  "tracing",
