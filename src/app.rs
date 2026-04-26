@@ -4,6 +4,9 @@ use std::sync::{mpsc, Arc};
 use std::thread;
 
 use costae::{init_global_ctx, render_frame};
+use costae::config::CostaeConfig;
+use costae::theme::{Theme, ThemeMode};
+use costae::theme::resolver::resolve_tw_in_json;
 use costae::data::data_loop::{DataLoopHandle, BuiltInSource, ProcessIdentity, ProcessSource, StreamSource};
 use costae::x11::click::do_hit_test;
 use costae::x11::panel::PanelContext;
@@ -139,6 +142,9 @@ pub(crate) struct X11Init {
 }
 
 pub(crate) struct App {
+    theme: Theme,
+    theme_mode: ThemeMode,
+    config_path: std::path::PathBuf,
     dpr: f32,
     dpi: f32,
     output_name: String,
@@ -161,12 +167,34 @@ pub(crate) struct App {
     presenter_thread: Option<thread::JoinHandle<()>>,
 }
 
+fn expand_tilde(path: &str) -> std::path::PathBuf {
+    if let Some(rest) = path.strip_prefix("~/") {
+        let home = std::env::var("HOME").unwrap_or_default();
+        std::path::PathBuf::from(home).join(rest)
+    } else {
+        std::path::PathBuf::from(path)
+    }
+}
+
+fn load_theme_from_config(config_path: &std::path::Path) -> (Theme, ThemeMode) {
+    let config = std::fs::read_to_string(config_path)
+        .ok()
+        .and_then(|s| CostaeConfig::from_yaml(&s).ok())
+        .unwrap_or_default();
+    let theme = config.theme.file.as_deref()
+        .and_then(|f| std::fs::read_to_string(expand_tilde(f)).ok())
+        .and_then(|s| Theme::from_yaml(&s).ok())
+        .unwrap_or_else(Theme::default_theme);
+    (theme, config.theme.mode)
+}
+
 impl App {
     pub(crate) fn new_x11(
         x11: X11Init,
         handle: DataLoopHandle,
         rx: TickReceivers,
         layout_jsx_path: std::path::PathBuf,
+        config_path: std::path::PathBuf,
         module_event_txs: ModuleEventTxs,
         stop: Arc<AtomicBool>,
         last_tick: Arc<std::sync::atomic::AtomicU64>,
@@ -183,7 +211,11 @@ impl App {
         let presenter_thread = thread::spawn(move || {
             run_x11_presenter_thread(pt, command_rx, event_tx);
         });
+        let (theme, theme_mode) = load_theme_from_config(&config_path);
         let mut state = Self {
+            theme,
+            theme_mode,
+            config_path,
             dpr,
             dpi,
             output_name,
@@ -214,6 +246,7 @@ impl App {
         handle: DataLoopHandle,
         rx: TickReceivers,
         layout_jsx_path: std::path::PathBuf,
+        config_path: std::path::PathBuf,
         module_event_txs: ModuleEventTxs,
         stop: Arc<AtomicBool>,
         last_tick: Arc<std::sync::atomic::AtomicU64>,
@@ -232,7 +265,11 @@ impl App {
         let presenter_thread = thread::spawn(move || {
             run_wayland_presenter_thread(pt, command_rx, event_tx);
         });
+        let (theme, theme_mode) = load_theme_from_config(&config_path);
         let mut state = Self {
+            theme,
+            theme_mode,
+            config_path,
             dpr: initial_dpr,
             dpi: 96.0,
             output_name: String::new(),
@@ -260,9 +297,16 @@ impl App {
     }
 
     fn apply_eval_result_dispatch(&mut self, out: &costae::jsx::EvalOutput) -> bool {
+        let mut layout = out.layout.clone();
+        resolve_tw_in_json(&mut layout, &self.theme, self.theme_mode);
+        let resolved_out = costae::jsx::EvalOutput {
+            layout,
+            stream_calls: out.stream_calls.clone(),
+            module_calls: out.module_calls.clone(),
+        };
         let (dpr, dpi, sw, sh) = (self.dpr, self.dpi, self.screen_width_logical, self.screen_height_logical);
         let output_name = self.output_name.clone();
-        apply_eval_result(out, &self.handle, &mut self.panels, &mut self.command_tx,
+        apply_eval_result(&resolved_out, &self.handle, &mut self.panels, &mut self.command_tx,
             &move |specs| make_mod_init_value(specs, dpr, &output_name, dpi, sw, sh))
     }
 
@@ -292,6 +336,9 @@ impl App {
 
     fn handle_layout_reload(&mut self) -> bool {
         if self.reload_rx.try_recv().is_err() { return false; }
+        let (theme, mode) = load_theme_from_config(&self.config_path);
+        self.theme = theme;
+        self.theme_mode = mode;
 
         self.handle.set_desired(vec![]);
         self.stream_values.clear();

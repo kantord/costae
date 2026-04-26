@@ -187,10 +187,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let exe_path = std::env::current_exe().unwrap_or_default();
 
-    let layout_jsx_path = {
-        let home = std::env::var("HOME").unwrap_or_default();
-        std::path::PathBuf::from(home).join(".config/costae/layout.jsx")
-    };
+    let home = std::env::var("HOME").unwrap_or_default();
+    let layout_jsx_path = std::path::PathBuf::from(&home).join(".config/costae/layout.jsx");
+    let config_yaml_path = std::path::PathBuf::from(&home).join(".config/costae/config.yaml");
 
     let last_tick = Arc::new(std::sync::atomic::AtomicU64::new(0));
     spawn_freeze_watchdog(Arc::clone(&last_tick), log_path);
@@ -198,7 +197,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (dl_wake_tx, dl_wake_rx) = mpsc::sync_channel::<()>(1);
 
     let (reload_tx, reload_rx) = mpsc::channel::<()>();
-    spawn_layout_watcher(layout_jsx_path.clone(), reload_tx, dl_wake_tx.clone());
+    spawn_layout_watcher(layout_jsx_path.clone(), reload_tx.clone(), dl_wake_tx.clone());
+    let config_baseline = std::fs::metadata(&config_yaml_path).and_then(|m| m.modified()).ok();
+    spawn_file_watcher(config_yaml_path.clone(), config_baseline, reload_tx, dl_wake_tx.clone());
 
     let exe_baseline: Option<std::time::SystemTime> =
         std::env::var("COSTAE_EXE_MTIME_NS")
@@ -227,7 +228,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!("display backend: Wayland");
         let server = WaylandDisplayServer::connect()?;
         let mut app = App::new_wayland(
-            server, handle, rx, layout_jsx_path,
+            server, handle, rx, layout_jsx_path, config_yaml_path,
             Arc::clone(&module_event_txs),
             Arc::clone(&stop), Arc::clone(&last_tick),
         );
@@ -240,7 +241,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!("display backend: X11");
         let x11 = init_x11()?;
         let mut app = App::new_x11(
-            x11, handle, rx, layout_jsx_path, module_event_txs,
+            x11, handle, rx, layout_jsx_path, config_yaml_path, module_event_txs,
             Arc::clone(&stop), Arc::clone(&last_tick),
         );
         data_loop.run(
